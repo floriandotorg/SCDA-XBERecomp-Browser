@@ -103,8 +103,19 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     paths.push('src/browser/dpc-provider.cpp', 'src/browser/dpc-provider.h');
     paths.push('src/browser/timer-provider.cpp', 'src/browser/timer-provider.h');
     paths.push('src/browser/sdk-provider.cpp', 'src/browser/sdk-provider.h',
-      'src/browser/diagnostic-graphics.cpp', 'src/browser/diagnostic-graphics.h', 'src/gpu/backend.h', 'src/gpu/state.h',
+      'src/browser/diagnostic-graphics.cpp', 'src/browser/diagnostic-graphics.h', 'src/browser/push-state.cpp', 'src/browser/push-state.h', 'src/gpu/backend.h', 'src/gpu/state.h',
       'src/browser/silent-audio.cpp', 'src/browser/silent-audio.h', 'src/audio/output.h');
+    if (configuration.includes('menu=ON') || configuration.includes('menu-capture=ON')) {
+      paths.push('src/browser/menu-input.h', 'src/browser/menu-input.cpp', 'src/browser/menu-launch.h', 'src/browser/menu-launch.cpp',
+        'src/browser/menu-route.h', 'src/browser/menu-route.cpp');
+    }
+    if (configuration.includes('menu=ON')) {
+      paths.push('src/browser/render-snapshot.h', 'src/browser/render-snapshot.cpp', 'src/browser/menu-backend.h', 'src/browser/menu-backend.cpp',
+        'src/browser/menu-shaders.h', 'src/browser/menu-shaders.cpp', 'src/browser/menu-texture.h', 'src/browser/menu-texture.cpp',
+        'src/browser/menu-input.mjs', 'src/browser/webgpu-transport.h', 'src/browser/webgpu-transport.cpp', 'src/browser/webgpu-transport.mjs',
+        'src/browser/webgpu-service.cpp', 'src/browser/webgpu-service.mjs', 'src/browser/menu-runtime.mjs', 'src/browser/menu-shell.mjs',
+        'src/browser/menu.html', 'src/gpu/shaders.h', 'src/gpu/shaders.cpp', 'src/gpu/vertex.h');
+    }
     paths.push('src/browser/virtual-memory.cpp', 'src/browser/virtual-memory.h');
     paths.push('src/browser/contiguous-memory.cpp', 'src/browser/contiguous-memory.h');
     paths.push('src/browser/string-provider.cpp', 'src/browser/string-provider.h');

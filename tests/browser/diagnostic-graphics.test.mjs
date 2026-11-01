@@ -16,7 +16,17 @@ writeFileSync(`${directory}/image_symbols.h`, `#pragma once
 #define SYM_D3DDevice_Clear 0049CE00
 #define SYM_Lock2DSurface 0049DE60
 #define SYM_D3D_BlockOnResource 004A17C0
-#define SYM_D3DDevice_Swap 004A1C00
+#define SYM_D3DDevice_Swap 0049CC50
+#define SYM_D3DDevice_SetGammaRamp 0049A3D0
+#define SYM_D3DDevice_SetRenderStateNotInline 0049EFF0
+#define SYM_D3DDevice_SetVertexShaderConstant1Fast 0049E8B0
+#define SYM_D3DDevice_DrawVertices 004A61A0
+#define SYM_D3DDevice_DrawIndexedVertices 004A6240
+#define SYM_D3D_SimpleRenderStateEncode 004A8000
+#define SYM_D3D_RenderState 004AB3D0
+#define SYM_D3D_DeferredTextureState 004AB1D0
+#define SYM_D3D_Streams 004ADB10
+#define SYM_D3D_IndexData 004AB1CC
 `);
 writeFileSync(`${directory}/original.cpp`, `#include "browser/cpu_runtime.h"
 #include "cpu/x86_ops.h"
@@ -31,8 +41,8 @@ X86_FUNC(__imp__sub_0049CE00) { throw browser::Fault(ctx, 0xfd001804, 4, "retain
 X86_WEAK_FUNC(sub_0049CE00, __imp__sub_0049CE00)
 X86_FUNC(__imp__sub_004A17C0) { throw browser::Fault(ctx, 0xfd001804, 4, "retained resource fence hardware"); }
 X86_WEAK_FUNC(sub_004A17C0, __imp__sub_004A17C0)
-X86_FUNC(__imp__sub_004A1C00) { throw browser::Fault(ctx, 0xfd001804, 4, "retained swap hardware"); }
-X86_WEAK_FUNC(sub_004A1C00, __imp__sub_004A1C00)
+X86_FUNC(__imp__sub_0049CC50) { throw browser::Fault(ctx, 0xfd001804, 4, "retained swap hardware"); }
+X86_WEAK_FUNC(sub_0049CC50, __imp__sub_0049CC50)
 `);
 const retained = readFileSync('generated/game/x86_recomp.119.cpp', 'utf8');
 const body = (symbol) => {
@@ -57,7 +67,7 @@ for (const platform of ['native', 'wasm']) {
       : ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'];
     const output = `${directory}/${wasm ? 'graphics.mjs' : 'native'}`;
     const env = { ...process.env, TMPDIR: directory };
-    const build = spawnSync(wasm ? 'em++' : 'clang++', ['-std=c++20', '-O1', '-g', '-pthread', '-DX86_PORTABLE_RUNTIME', '-DX86_COMPACT_MEMORY', `-I${directory}`, '-Isrc', 'tests/browser/diagnostic-graphics.cpp', `${directory}/original.cpp`, `${directory}/retained.cpp`, 'src/browser/diagnostic-graphics.cpp', 'src/browser/sdk-provider.cpp', 'src/browser/contiguous-memory.cpp', 'src/browser/image.cpp', 'src/browser/cpu_runtime.cpp', ...flags, '-o', output], { encoding: 'utf8', timeout: 120000, env });
+    const build = spawnSync(wasm ? 'em++' : 'clang++', ['-std=c++20', '-O1', '-g', '-pthread', '-DX86_PORTABLE_RUNTIME', '-DX86_COMPACT_MEMORY', `-I${directory}`, '-Isrc', 'tests/browser/diagnostic-graphics.cpp', `${directory}/original.cpp`, `${directory}/retained.cpp`, 'src/browser/diagnostic-graphics.cpp', 'src/browser/push-state.cpp', 'src/browser/sdk-provider.cpp', 'src/browser/contiguous-memory.cpp', 'src/browser/image.cpp', 'src/browser/cpu_runtime.cpp', ...flags, '-o', output], { encoding: 'utf8', timeout: 120000, env });
     assert.equal(build.status, 0, build.stderr);
     const run = spawnSync(wasm ? process.execPath : output, wasm ? [`${directory}/run.mjs`] : [], { encoding: 'utf8', timeout: 30000, env });
     assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);

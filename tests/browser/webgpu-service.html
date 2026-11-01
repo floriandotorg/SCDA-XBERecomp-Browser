@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>WebGPU service topology test</title></head>
+<body><canvas id="canvas" width="4" height="4"></canvas><pre id="result">running</pre>
+<script type="module">
+import { createMailbox } from '../../src/browser/webgpu-transport.mjs';
+import { startGPUWorker } from '../../src/browser/webgpu-service.mjs';
+const diagnostics = [];
+const presentations = [];
+let adapter;
+const mailbox = createMailbox();
+const gpu = startGPUWorker({ canvas: document.querySelector('canvas').transferControlToOffscreen(), mailbox, moduleURL: '../../out/browser-webgpu-tests/webgpu-service.mjs', onDiagnostic: diagnostic => diagnostics.push(diagnostic), onPresented: details => presentations.push(details), onAdapter: details => { adapter = details; } });
+const show = result => {
+  window.webgpuResult = result;
+  document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
+};
+try {
+  await gpu.ready;
+  const guest = new Worker('./webgpu-service-guest.mjs', { type: 'module' });
+  guest.onmessage = event => {
+    show({ ...event.data, diagnostics, presentations, adapter, isolated: crossOriginIsolated });
+    guest.terminate();
+    gpu.shutdown();
+  };
+  guest.onerror = event => { show({ ok: false, error: event.message, diagnostics }); gpu.shutdown(); };
+  gpu.worker.addEventListener('message', event => {
+    if (event.data.type === 'stopped' && window.webgpuResult) { show({ ...window.webgpuResult, finalResources: event.data.resources }); }
+  });
+  guest.postMessage({ mailbox });
+} catch (error) { show({ ok: false, error: String(error), diagnostics }); gpu.shutdown(); }
+</script></body></html>

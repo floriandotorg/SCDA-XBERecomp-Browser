@@ -121,7 +121,21 @@ export const readGraphicsDiagnostic = (module) => {
     if (!header || !data || !bytes || bytes > 0x4000000 || unavailable > 1) { reject(); }
     return { header, data, bytes, format, size, unavailable: unavailable === 1 };
   });
-  return { mode: 'diagnostic-cpu', initialized: initialized === 1, renderedFrames: 0, totalEvents: total.toString(),
+  const rendering = module._image_graphics_rendering?.() ?? 0;
+  if (rendering !== 0 && rendering !== 1) { reject(); }
+  let renderer;
+  if (rendering) {
+    if (typeof module._image_renderer_info !== 'function') { reject(); }
+    const words = Array.from({ length: 10 }, (_, field) => word(module._image_renderer_info(field)));
+    const submitted = wide(words[4], words[5]);
+    const completed = wide(words[6], words[7]);
+    const presented = wide(words[8], words[9]);
+    const resident = wide(words[2], words[3]);
+    if (words[0] > 256 || words[1] > 4096 || resident > 0x4000000n || completed > submitted || presented > completed) { reject(); }
+    renderer = { pipelineCount: words[0], resourceCount: words[1], residentBytes: resident.toString(),
+      submittedCommands: submitted.toString(), completedCommands: completed.toString(), renderedFrames: presented.toString() };
+  }
+  return { mode: rendering ? 'webgpu' : 'diagnostic-cpu', initialized: initialized === 1, renderedFrames: 0, ...renderer, totalEvents: total.toString(),
     droppedEvents: (total - BigInt(count)).toString(), commandWords, resources, events };
 };
 
@@ -140,9 +154,43 @@ const discReads = (module) => {
     .map((name, n) => [name, (BigInt(words[n * 2]) | (BigInt(words[n * 2 + 1]) << 32n)).toString()]));
 };
 
+const readInputDescriptor = (module) => {
+  if (!module._image_input_address && !module._image_input_words) { return undefined; }
+  const reject = () => { throw Object.assign(new Error('Invalid shared menu input storage.'), { code: 'INPUT_PROTOCOL' }); };
+  if (typeof module._image_input_address !== 'function' || typeof module._image_input_words !== 'function') { reject(); }
+  const byteOffset = module._image_input_address();
+  const words = module._image_input_words();
+  if (byteOffset === 0 && words === 0) { return undefined; }
+  const buffer = module.HEAPU8?.buffer;
+  const progress = module._image_progress_address?.();
+  if (!(buffer instanceof SharedArrayBuffer) || !Number.isInteger(byteOffset) || byteOffset <= 0 || byteOffset % 4 !== 0 ||
+      words !== 2 || byteOffset + words * 4 > buffer.byteLength ||
+      (Number.isInteger(progress) && byteOffset < progress + 4 && progress < byteOffset + words * 4)) { reject(); }
+  return { buffer, byteOffset, words };
+};
+
+const readLaunchRequest = (module) => {
+  if (typeof module._image_launch_word !== 'function') { return undefined; }
+  const word = (field, index = 0) => module._image_launch_word(field, index);
+  const size = word(0);
+  if (size === 0) { return undefined; }
+  const reject = () => { throw Object.assign(new Error('Invalid owned runtime launch request.'), { code: 'LAUNCH_PROTOCOL' }); };
+  if (!Number.isInteger(size) || size < 1 || size > 260 || ![0, 1].includes(word(2))) { reject(); }
+  const byte = (field, index) => {
+    const value = word(field, index);
+    if (!Number.isInteger(value) || value < 0 || value > 255) { reject(); }
+    return value;
+  };
+  const pathBytes = Uint8Array.from({ length: size }, (_, n) => byte(1, n));
+  if (pathBytes.some((value) => value < 32 || value > 126)) { reject(); }
+  const hasData = word(2) === 1;
+  return { path: new TextDecoder().decode(pathBytes), hasData,
+    data: hasData ? Uint8Array.from({ length: 3072 }, (_, n) => byte(3, n)) : undefined };
+};
+
 export const createBootSession = ({ create, manifest, postMessage, prepare = prepareDiscImage, onProgress = () => {} }) => {
   let started = false;
-  return async ({ data: { port, mailbox, generation, ownership, size } }) => {
+  return async ({ data: { port, mailbox, generation, ownership, size, webgpuMailbox } }) => {
     if (started) {
       port?.close();
       postMessage({ ok: false, generation, code: 'SESSION', message: 'A boot worker owns one session only.' });
@@ -161,7 +209,7 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
       const read = createWasmIsoReader({ port, mailbox, generation, ownership, getHeap: () => module.HEAPU8 });
       ownershipChecked = true;
       signal.throwIfAborted();
-      module = await create({ readIsoBytes: read });
+      module = await create({ readIsoBytes: read, ...(webgpuMailbox ? { webgpuMailbox } : {}) });
       signal.throwIfAborted();
       requireBuildIdentity(module, manifest);
       signal.throwIfAborted();
@@ -219,6 +267,10 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
         signal.throwIfAborted();
         onProgress({ generation, phase: 'progress', buffer, address: address >>> 0 });
         signal.throwIfAborted();
+        const input = readInputDescriptor(module);
+        signal.throwIfAborted();
+        if (input) { onProgress({ generation, phase: 'input', ...input }); }
+        signal.throwIfAborted();
         const completed = module._image_execute() === 1;
         signal.throwIfAborted();
         const start = module._image_fault_message() >>> 0;
@@ -227,9 +279,12 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
         if ((checkpoint !== 0 && checkpoint !== 1) || (checkpoint === 1 && completed)) {
           throw Object.assign(new Error('Invalid graphics checkpoint state.'), { code: 'GRAPHICS_PROTOCOL' });
         }
+        const launchRequest = readLaunchRequest(module);
         execution = {
-          code: completed ? 'ENTRY_RETURNED' : checkpoint ? 'GRAPHICS_CHECKPOINT' : module._image_fault_ordinal() ? 'UNSUPPORTED_EXPORT' : 'GUEST_FAULT',
-          message: completed ? 'The initial guest entry returned.' : checkpoint ?
+          ...(launchRequest ? { launchRequest } : {}),
+          code: launchRequest ? 'LAUNCH_BOUNDARY_UNCLASSIFIED' : completed ? 'ENTRY_RETURNED' : checkpoint ? 'GRAPHICS_CHECKPOINT' : module._image_fault_ordinal() ? 'UNSUPPORTED_EXPORT' : 'GUEST_FAULT',
+          message: launchRequest ? 'The guest requested a new runtime. Its launch data is unclassified; no mission or multiplayer runtime was started.'
+            : completed ? 'The initial guest entry returned.' : checkpoint ?
             'Diagnostic graphics initialization requested; no device completion or rendered frame is claimed.' :
             new TextDecoder().decode(module.HEAPU8.slice(start, start + length)),
           entryEntered: module._image_entered() === 1, entryReturned: module._image_returned() === 1,

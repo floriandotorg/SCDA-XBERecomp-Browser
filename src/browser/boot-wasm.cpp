@@ -16,8 +16,24 @@
 #include "build_identity.h"
 #include <emscripten.h>
 #include <array>
+#include <optional>
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+#include "browser/menu-input.h"
+#include "browser/menu-launch.h"
+#include "browser/menu-route.h"
+#endif
+#ifdef BROWSER_MENU
+#include "browser/menu-backend.h"
+#endif
 
 namespace {
+#ifdef BROWSER_MENU
+constexpr auto graphics_mode = browser::GraphicsMode::Rendering;
+#elif defined(BROWSER_MENU_CAPTURE)
+constexpr auto graphics_mode = browser::GraphicsMode::StateCapture;
+#else
+constexpr auto graphics_mode = browser::GraphicsMode::Checkpoint;
+#endif
 struct Session {
   browser::Runtime runtime;
   std::unique_ptr<browser::PreparedImage> image;
@@ -31,6 +47,15 @@ struct Session {
   browser::DiagnosticGraphics::SnapshotData graphicsTrace;
   std::shared_ptr<browser::SilentAudioSink> silentAudio;
   browser::SilentAudioSnapshot audioTrace;
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+  std::shared_ptr<browser::MenuInput> input;
+  std::shared_ptr<browser::MenuLaunch> launcher;
+  std::shared_ptr<browser::MenuRoute> route;
+  std::optional<browser::MenuLaunchRequested> launchRequest;
+#endif
+#ifdef BROWSER_MENU
+  browser::MenuBackend* renderer = nullptr;
+#endif
   std::function<browser::DiscReadSnapshot()> snapshotDiscReads;
   browser::DiscReadSnapshot discReads;
   bool graphicsCheckpoint = false;
@@ -44,7 +69,13 @@ struct Session {
     browser::QueryContiguousMemoryUsage contiguousUsage;
     browser::ContiguousMemoryAccess contiguousAccess;
     browser::InstallContiguousMemory(runtime, *image->memory, &contiguousUsage, &contiguousAccess);
-    graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), browser::GraphicsMode::Checkpoint);
+#ifdef BROWSER_MENU
+    auto backend = std::make_unique<browser::MenuBackend>(runtime, *image, std::make_shared<browser::webgpu::Transport>());
+    renderer = backend.get();
+    graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), graphics_mode, std::move(backend));
+#else
+    graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), graphics_mode);
+#endif
     browser::InstallVirtualMemory(runtime, *image, std::move(contiguousUsage));
     browser::InstallStringProvider(runtime, *image);
     auto fileCloser = browser::InstallFileProvider(runtime, *image, browser::MountedIsoDisc(), {}, &dataExports, &snapshotDiscReads);
@@ -59,12 +90,25 @@ struct Session {
     dataExports.push_back(browser::InstallVirtualDriveKey(runtime, *image));
     const auto platform = browser::InstallPlatformProfile(runtime, *image);
     dataExports.insert(dataExports.end(), platform.begin(), platform.end());
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+    input = std::make_shared<browser::MenuInput>(runtime, *image);
+    launcher = std::make_shared<browser::MenuLaunch>(runtime, *image);
+    route = std::make_shared<browser::MenuRoute>(runtime, *image);
+    sdkObserver = browser::InstallSdkProvider(runtime, *image, browser::SdkPolicy::UnavailableXNet, graphics, input, launcher, route);
+#else
     sdkObserver = browser::InstallSdkProvider(runtime, *image, browser::SdkPolicy::UnavailableXNet, graphics);
+#endif
   }
-  ~Session() { runtime.Stop(); }
+  ~Session() {
+    runtime.Stop();
+    if (graphics) { graphics->Shutdown(); }
+  }
 };
 std::vector<uint8_t> input;
 std::unique_ptr<Session> session;
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+std::shared_ptr<browser::MenuInput> publishedInputStorage;
+#endif
 uint32_t faultOrdinal = 0;
 }
 
@@ -127,6 +171,11 @@ EMSCRIPTEN_KEEPALIVE int image_execute() {
     session->graphicsTrace = session->graphics->Snapshot();
     session->audioTrace = session->silentAudio->Snapshot();
     return 1;
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+  } catch (const browser::MenuLaunchRequested& request) {
+    session->launchRequest = request;
+    session->faultMessage = "Guest requested a new story runtime. Mission execution is not enabled in this menu build.";
+#endif
   } catch (const browser::GraphicsCheckpoint& checkpoint) {
     session->graphicsCheckpoint = true;
     session->faultMessage = checkpoint.what();
@@ -207,13 +256,74 @@ EMSCRIPTEN_KEEPALIVE uint32_t image_audio_info(uint32_t field) {
     default: return 0;
   }
 }
+EMSCRIPTEN_KEEPALIVE uintptr_t image_input_address() {
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+  if (!session || !session->input || (publishedInputStorage && publishedInputStorage != session->input)) { return 0; }
+  publishedInputStorage = session->input;
+  return reinterpret_cast<uintptr_t>(publishedInputStorage->SharedAddress());
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_input_words() {
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+  return session && session->input ? session->input->SharedWords() : 0;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_launch_word(uint32_t field, uint32_t index) {
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+  if (!session || !session->launchRequest) { return 0; }
+  const auto& request = *session->launchRequest;
+  if (field == 0) { return request.path.size(); }
+  if (field == 1) { return index < request.path.size() ? static_cast<uint8_t>(request.path[index]) : 0; }
+  if (field == 2) { return request.hasData; }
+  if (field == 3) { return request.hasData && index < request.data.size() ? request.data[index] : 0; }
+#endif
+  return 0;
+}
 EMSCRIPTEN_KEEPALIVE uint32_t image_graphics_checkpoint() { return session && session->graphicsCheckpoint ? 1 : 0; }
+EMSCRIPTEN_KEEPALIVE uint32_t image_graphics_rendering() {
+#ifdef BROWSER_MENU
+  return 1;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_renderer_info(uint32_t field) {
+#ifdef BROWSER_MENU
+  if (!session || !session->renderer) { return 0; }
+  const auto snapshot = session->renderer->Snapshot();
+  const std::array<uint32_t, 10> words = {snapshot.pipelineCount, snapshot.resourceCount,
+    uint32_t(snapshot.residentBytes), uint32_t(snapshot.residentBytes >> 32),
+    uint32_t(snapshot.submittedCommands), uint32_t(snapshot.submittedCommands >> 32),
+    uint32_t(snapshot.completedCommands), uint32_t(snapshot.completedCommands >> 32),
+    uint32_t(snapshot.presentedFrames), uint32_t(snapshot.presentedFrames >> 32)};
+  return field < words.size() ? words[field] : 0;
+#else
+  return 0;
+#endif
+}
 EMSCRIPTEN_KEEPALIVE uint32_t image_graphics_info(uint32_t field) {
   if (!session) { return 0; }
   const auto& trace = session->graphicsTrace;
   const std::array<uint32_t, 6> words = {uint32_t(trace.initialized), uint32_t(trace.total), uint32_t(trace.total >> 32),
     uint32_t(trace.count), uint32_t(trace.resources.size()), trace.commandWords};
   return field < words.size() ? words[field] : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_graphics_capture_word(uint32_t group, uint32_t index) {
+  if (!session || session->runtime.ActiveWorkers()) { return 0; }
+  if (group == 0) {
+    const auto snapshot = session->graphics->Snapshot();
+    return index == UINT32_MAX ? snapshot.commands.size() : index < snapshot.commands.size() ? snapshot.commands[index] : 0;
+  }
+  const auto state = session->graphics->SnapshotState();
+  if (group == 1) { return index == UINT32_MAX ? state.rs.size() : index < state.rs.size() ? state.rs[index] : 0; }
+  if (group == 2) { return index == UINT32_MAX ? state.simple.size() : index < state.simple.size() ? state.simple[index] : 0; }
+  if (group == 3) { return index == UINT32_MAX ? state.tss.size() * gpu::kTssCount : index < state.tss.size() * gpu::kTssCount ? state.tss[index / gpu::kTssCount][index % gpu::kTssCount] : 0; }
+  if (group == 4) { return index == 0 ? state.vs_handle : index == 1 && state.ps ? state.ps->handle : 0; }
+  return 0;
 }
 EMSCRIPTEN_KEEPALIVE uint32_t image_graphics_event_word(uint32_t index, uint32_t field) {
   if (!session || index >= session->graphicsTrace.count) { return 0; }

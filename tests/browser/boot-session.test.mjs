@@ -65,6 +65,63 @@ const executedFixture = () => {
   return result;
 };
 
+test('input shared storage is published before genuine entry execution and the GPU mailbox reaches module initialization', async () => {
+  const { options, data, module, messages, calls } = executedFixture();
+  const mailbox = new SharedArrayBuffer(64);
+  data.webgpuMailbox = mailbox;
+  options.create = async (config) => { assert.equal(config.webgpuMailbox, mailbox); return module; };
+  module._image_input_address = () => 112;
+  module._image_input_words = () => 2;
+  options.onProgress = (message) => { messages.push(message); calls.push(message.phase); };
+  module._image_execute = () => { assert.equal(calls.at(-1), 'input'); return 1; };
+  await createBootSession(options)({ data });
+  const input = messages.find((message) => message.phase === 'input');
+  assert.equal(input.buffer, module.HEAPU8.buffer);
+  assert.equal(input.byteOffset, 112);
+  assert.equal(input.words, 2);
+});
+
+test('malformed input shared storage is rejected before entry', async () => {
+  for (const [address, words] of [[113, 2], [124, 2], [112, 3], [0, 2], [4, 2]]) {
+    const { options, data, module, messages } = executedFixture();
+    module._image_input_address = () => address;
+    module._image_input_words = () => words;
+    module._image_execute = () => { throw new Error('entry must not run'); };
+    await createBootSession(options)({ data });
+    assert.equal(messages[0].code, 'INPUT_PROTOCOL');
+  }
+});
+
+test('a copied launch request is reported only as an unclassified runtime boundary', async () => {
+  const { options, data, module, messages } = executedFixture();
+  const path = new TextEncoder().encode('default.xbe');
+  module._image_execute = () => 0;
+  module._image_launch_word = (field, index) => field === 0 ? path.length : field === 1 ? path[index] : field === 2 ? 1 : index & 255;
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'LAUNCH_BOUNDARY_UNCLASSIFIED');
+  assert.deepEqual(messages[0].launchRequest, { path: 'default.xbe', hasData: true, data: Uint8Array.from({ length: 3072 }, (_, n) => n & 255) });
+  assert.equal(messages[0].ok, false);
+});
+
+test('WebGPU snapshots report only completed genuine presents rather than diagnostic zero frames', async () => {
+  const { options, data, module, messages } = executedFixture();
+  module._image_graphics_rendering = () => 1;
+  module._image_renderer_info = (field) => [2, 3, 1228800, 0, 12, 0, 11, 0, 7, 0][field];
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].graphics.mode, 'webgpu');
+  assert.equal(messages[0].graphics.renderedFrames, '7');
+  assert.equal(messages[0].graphics.pipelineCount, 2);
+  assert.equal(messages[0].graphics.completedCommands, '11');
+});
+
+test('malformed WebGPU completion snapshots fail closed', async () => {
+  const { options, data, module, messages } = executedFixture();
+  module._image_graphics_rendering = () => 1;
+  module._image_renderer_info = (field) => [2, 3, 1228800, 0, 12, 0, 13, 0, 7, 0][field];
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'GRAPHICS_PROTOCOL');
+});
+
 test('genuine graphics request stops diagnostically without reporting device or game success', async () => {
   const { options, data, module, messages } = executedFixture();
   module._image_execute = () => 0;

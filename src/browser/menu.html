@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Story menu development</title>
+  <style>
+    :root { color-scheme: light dark; font: 1rem/1.5 system-ui, sans-serif; }
+    body { max-width: 64rem; margin: 2rem auto; padding: 0 1rem; }
+    label, button, input { font: inherit; }
+    button { padding: .5rem 1.25rem; margin-right: .5rem; }
+    canvas { display: block; width: 100%; height: auto; aspect-ratio: 4/3; background: black; }
+    canvas:focus-visible { outline: 2px solid Highlight; outline-offset: 4px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #detail { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Story menu development</h1>
+    <p>This host page starts the original guest code. Only the canvas below contains game output. An empty canvas or a diagnostic is not a working menu.</p>
+    <label for="iso">Select ISO</label>
+    <input id="iso" type="file" accept=".iso,application/x-iso9660-image" aria-describedby="selected privacy">
+    <p id="selected">No ISO selected.</p>
+    <p id="privacy">Your ISO stays on this device and is read only. Stop keeps the selection for another attempt.</p>
+    <p>Cache, profiles and saves are temporary. Stop, restart and refresh discard them. Durable saves are not available.</p>
+    <div role="group" aria-label="Host controls">
+      <button id="boot" type="button" disabled>Start</button>
+      <button id="stop" type="button" disabled>Stop</button>
+    </div>
+    <p id="status" role="status" aria-live="polite" aria-atomic="true">Select an ISO to begin.</p>
+    <p id="detail" role="alert" aria-atomic="true"></p>
+    <p id="keys">Game keys: arrows navigate, Enter is Start, Space or Z confirms, Escape or Backspace returns. Focus the canvas to play. Switching windows releases held buttons.</p>
+    <canvas id="game" width="640" height="480" tabindex="0" aria-label="Original game output" aria-describedby="keys"></canvas>
+    <details>
+      <summary>WebGPU diagnostics</summary>
+      <pre id="gpu">No GPU service is active.</pre>
+    </details>
+    <noscript>JavaScript is required to run a selected ISO.</noscript>
+  </main>
+  <script type="module">
+    import { mountMenuShell } from './menu-shell.mjs';
+    const shell = mountMenuShell();
+    globalThis.menuShell = shell;
+    addEventListener('pagehide', () => { void shell.dispose(); }, { once: true });
+  </script>
+</body>
+</html>

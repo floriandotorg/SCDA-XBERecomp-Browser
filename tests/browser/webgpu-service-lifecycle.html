@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>WebGPU service lifecycle test</title></head><body><pre id="result">running</pre>
+<script type="module">
+import { createMailbox, closeMailbox } from '../../src/browser/webgpu-transport.mjs';
+const show = result => { window.webgpuResult = result; document.querySelector('#result').textContent = JSON.stringify(result, null, 2); };
+const runWorker = (path, payload) => new Promise((resolve, reject) => {
+  const worker = new Worker(path, { type: 'module' });
+  const timer = setTimeout(() => { worker.terminate(); reject(new Error('lifecycle test timeout')); }, 10000);
+  worker.onmessage = event => { clearTimeout(timer); worker.terminate(); resolve(event.data); };
+  worker.onerror = event => { clearTimeout(timer); worker.terminate(); reject(new Error(event.message)); };
+  worker.postMessage(payload);
+});
+try {
+  const loss = await runWorker('./webgpu-service-loss.mjs', {});
+  const mailbox = createMailbox();
+  const header = new Int32Array(mailbox, 0, 16);
+  const blocked = runWorker('./webgpu-service-guest.mjs', { mailbox, blockOnly: true });
+  const deadline = Date.now() + 10000;
+  while (Atomics.load(header, 0) !== 1) {
+    if (Date.now() > deadline) { throw new Error('guest did not block'); }
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  const observedPendingState = Atomics.load(header, 0);
+  closeMailbox(mailbox);
+  const shutdown = await blocked;
+  show({ ok: loss.ok && shutdown.ok, loss, shutdown, observedPendingState, isolated: crossOriginIsolated });
+} catch (error) { show({ ok: false, error: String(error) }); }
+</script></body></html>

@@ -2,10 +2,11 @@
 #include "browser/contiguous-memory.h"
 #include "browser/sdk-provider.h"
 #include "gpu/backend.h"
+#include <unordered_set>
 
 namespace browser {
 
-enum class GraphicsMode { CpuDevice, Checkpoint };
+enum class GraphicsMode { CpuDevice, Checkpoint, StateCapture, Rendering };
 
 struct GraphicsCheckpoint : Fault {
   explicit GraphicsCheckpoint(const X86Context& ctx) : Fault(ctx, 0, 0, "diagnostic graphics initialization requested; no device completion or rendered frame") {}
@@ -39,14 +40,16 @@ public:
     uint32_t commandWords = 0;
     std::vector<uint32_t> commands;
   };
-  DiagnosticGraphics(Runtime& runtime, PreparedImage& image, ContiguousMemoryAccess allocations, GraphicsMode mode = GraphicsMode::CpuDevice);
+  DiagnosticGraphics(Runtime& runtime, PreparedImage& image, ContiguousMemoryAccess allocations, GraphicsMode mode = GraphicsMode::CpuDevice, std::unique_ptr<gpu::Backend> backend = {});
   ~DiagnosticGraphics() override;
+  void Shutdown();
   bool BelongsTo(Runtime& runtime, PreparedImage& image) const override;
   bool Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) override;
   void CreateDevice(X86Context& ctx, uint8_t* base);
   SnapshotData Snapshot() const;
   gpu::Backend& Backend();
   gpu::State State() const;
+  gpu::State SnapshotState() const;
 private:
   class Recorder;
   Runtime& runtime_;
@@ -56,26 +59,33 @@ private:
   GraphicsMode mode_;
   mutable std::recursive_mutex lock_;
   std::unique_ptr<Recorder> backend_;
+  std::unique_ptr<gpu::Backend> renderer_;
   gpu::State state_;
   std::vector<Resource> resources_;
   std::vector<uint32_t> allocationsOwned_;
+  std::unordered_set<uint32_t> gpuWritten_;
   std::array<Event, 64> events_{};
   uint64_t total_ = 0;
   uint32_t push_ = 0;
   uint32_t pushBytes_ = 0;
   uint32_t capturedWords_ = 0;
+  uint32_t decodedWords_ = 0;
   std::vector<uint32_t> commands_;
   bool initialized_ = false;
   bool creating_ = false;
+  bool unsubmitted_ = false;
+  bool failed_ = false;
   uint32_t fence_ = 0;
   void Require(const X86Context& ctx, uint8_t* base) const;
   void CheckRecorder() const;
   void Record(Request request, std::array<uint32_t, 6> arguments = {});
   void Invalidate(uint32_t header = 0);
   void Capture(const X86Context& ctx);
+  void CaptureState(const X86Context& ctx, bool forceViewport = false);
+  void ApplyCommands(const X86Context& ctx);
   uint32_t Allocate(const X86Context& ctx, uint32_t bytes);
   gpu::Surface NewSurface(const X86Context& ctx, uint32_t width, uint32_t height, uint32_t format, uint32_t bpp);
-  [[noreturn]] void Unavailable(Request request, uint32_t address, const char* reason);
+  [[noreturn]] void Unavailable(Request request, uint32_t address, const char* reason, std::array<uint32_t, 6> arguments = {});
 };
 
 }

@@ -1,6 +1,6 @@
 # M4: The real menu works
 
-Status: not started.
+Status: **active, incomplete, not accepted**. The opt-in WebGPU service, owned transport, portable state capture, fixed-function shader/texture subset, backend bridge and keyboard/route foundations have focused synthetic coverage. The actual title still stops at the explicit unsupported `D3DDevice_SetRenderState_Simple` frontend boundary before a game frame. No real menu, navigation or single-player mission boundary is accepted. See [M4 evidence and remaining work](m4-evidence.md).
 
 Previous: [M3: Game boot](03-game-boots.md). Next: [M5: First 3D mission](05-first-3d.md).
 

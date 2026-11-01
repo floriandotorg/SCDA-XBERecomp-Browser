@@ -1,7 +1,7 @@
 import { createWorkerBroker } from './boot-worker-broker.mjs';
 import { createIsoMailbox, finishIsoRead, isoMailboxHeader } from './iso-mailbox.mjs';
 
-export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createWorkerBroker } = {}) => {
+export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createWorkerBroker, createServices } = {}) => {
   const broker = createBroker({ WorkerClass });
   const pending = new Map();
   const ports = new Set();
@@ -14,6 +14,17 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
   let sample;
   let ioBytes = 0;
   let statsPending = false;
+  let services;
+  let initialization;
+  let serviceCancelled = false;
+  let cancellationError;
+  let termination;
+  const cancelServices = () => {
+    if (!services || serviceCancelled) { return; }
+    serviceCancelled = true;
+    try { services.cancel?.(); }
+    catch (error) { cancellationError = error; }
+  };
   const cancellation = () => Object.assign(new Error('Boot generation was cancelled.'), { code: 'CANCELLED' });
   const checkpoint = (signal) => {
     if (retired || signal.aborted) { throw cancellation(); }
@@ -27,6 +38,7 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
   });
   const cancelIo = () => {
     retired = true;
+    cancelServices();
     progress = undefined;
     sample = undefined;
     for (const entry of pending.values()) { entry.reject(cancellation()); }
@@ -57,6 +69,7 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
           progress = new Uint32Array(data.buffer, data.address, 1);
           return;
         }
+        if (services?.handle?.(data)) { return; }
         if (data.phase === 'running') {
           report({ generation, ok: false, code: 'BOOT_PROTOCOL', message: 'Guest callbacks cannot establish a running game.' });
           return;
@@ -99,14 +112,39 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
       mailbox = createIsoMailbox();
       await request({ type: 'connect', port: channel.port1, mailbox, generation }, [channel.port1]);
       checkpoint(signal);
+      if (createServices) {
+        initialization = Promise.resolve().then(() => createServices({ generation, signal, owned, report: (data) => {
+          if (!owned() || data.generation !== generation) { return; }
+          if (data.phase === 'running') { report(data); }
+          else { publish(data); }
+        } })).then((value) => {
+          services = value;
+          if (retired) { cancelServices(); }
+          return value;
+        });
+        await initialization;
+        checkpoint(signal);
+      }
       const guest = broker.create(new URL('./boot-worker.mjs', import.meta.url), { type: 'module', name: 'story-boot' }, publish, workerError);
-      guest.postMessage({ port: channel.port2, mailbox, generation, ownership, size: source.size }, [channel.port2]);
+      guest.postMessage({ port: channel.port2, mailbox, generation, ownership, size: source.size,
+        ...(services?.webgpuMailbox ? { webgpuMailbox: services.webgpuMailbox } : {}) }, [channel.port2]);
     },
     cancelIo,
     sampleProgress: () => sample?.(),
-    terminateAll: async () => {
-      try { cancelIo(); }
-      finally { await broker.terminateAll(); }
+    terminateAll: () => {
+      termination ??= (async () => {
+        cancelIo();
+        let failure;
+        try { await broker.terminateAll(); }
+        catch (error) { failure = error; }
+        await initialization?.catch(() => {});
+        cancelServices();
+        try { await services?.dispose?.(); }
+        catch (error) { failure ??= error; }
+        failure ??= cancellationError;
+        if (failure) { throw failure; }
+      })();
+      return termination;
     },
   });
 };

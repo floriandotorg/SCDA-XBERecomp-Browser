@@ -54,8 +54,8 @@ SdkTrace::SnapshotData SdkTrace::Snapshot() const {
 }
 
 std::shared_ptr<const SdkTrace> InstallSdkProvider(Runtime& runtime, PreparedImage& image, SdkPolicy policy,
-  std::shared_ptr<SdkGraphics> graphics) {
-  if ((graphics && !graphics->BelongsTo(runtime, image)) || !image.memory || image.importsBound || image.boundRuntime || Memory::HasBorrow() ||
+  std::shared_ptr<SdkGraphics> graphics, std::shared_ptr<SdkGraphics> input, std::shared_ptr<SdkGraphics> launch, std::shared_ptr<SdkGraphics> route) {
+  if ((route && !route->BelongsTo(runtime, image)) || (launch && !launch->BelongsTo(runtime, image)) || (input && !input->BelongsTo(runtime, image)) || (graphics && !graphics->BelongsTo(runtime, image)) || !image.memory || image.importsBound || image.boundRuntime || Memory::HasBorrow() ||
       (image.diagnosticRuntime && image.diagnosticRuntime != &runtime) ||
       image.image.entry == SDK_ADDRESS(XNetStartup) || image.image.entry == SDK_ADDRESS(WSAStartup) ||
       image.image.entry == SDK_ADDRESS(Direct3D_CreateDevice) ||
@@ -66,9 +66,14 @@ std::shared_ptr<const SdkTrace> InstallSdkProvider(Runtime& runtime, PreparedIma
   }
   auto trace = std::make_shared<SdkTrace>();
   auto* memory = image.memory.get();
-  runtime.InstallSdkObserver(*memory, [trace, memory, &image, &runtime, policy, graphics](X86Context& ctx, uint32_t id, uint64_t workerId) {
-    if (image.memory.get() != memory || !image.importsBound || image.boundRuntime != &runtime || id == 0 || id > 64) {
+  runtime.InstallSdkObserver(*memory, [trace, memory, &image, &runtime, policy, graphics, input, launch, route](X86Context& ctx, uint32_t id, uint64_t workerId) {
+    if (image.memory.get() != memory || !image.importsBound || image.boundRuntime != &runtime || id == 0 || id > 65) {
       throw Fault(ctx, ctx.esp, 0, "SDK observer belongs to a stale or unpublished image");
+    }
+    if (id == 65) { return route ? route->Dispatch(ctx, memory->Base(), id) : true; }
+    if (id == 64) { return launch ? launch->Dispatch(ctx, memory->Base(), id) : true; }
+    if (id >= 40 && id <= 44) {
+      return input ? input->Dispatch(ctx, memory->Base(), id) : true;
     }
     if (id > 3) {
       if (!graphics) { return true; }

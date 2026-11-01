@@ -1,0 +1,77 @@
+#include "browser/menu-launch.h"
+#include "cpu/x86_ops.h"
+#include "image_symbols.h"
+
+#define ML_CAT_(left, right) left##right
+#define ML_CAT(left, right) ML_CAT_(left, right)
+#define ML_GUEST(name) ML_CAT(sub_, SYM_##name)
+#define ML_ORIGINAL(name) ML_CAT(__imp__sub_, SYM_##name)
+#define ML_ADDRESS(name) ML_CAT(0x, SYM_##name)
+
+X86_FUNC(ML_ORIGINAL(XLaunchNewImageA));
+X86_FUNC(ML_GUEST(XLaunchNewImageA)) {
+  if (browser::Runtime::ObserveSdkEntry(ctx, base, 64)) { ML_ORIGINAL(XLaunchNewImageA)(ctx, base); }
+}
+
+namespace browser {
+
+MenuLaunch::MenuLaunch(Runtime& runtime, PreparedImage& image) : runtime_(runtime), image_(image), memory_(image.memory.get()) {
+  runtime.Checkpoint({});
+  if (!memory_ || image.importsBound || image.boundRuntime || runtime.HasPublishedImage() || runtime.ActiveWorkers() ||
+      Memory::HasBorrow() || (image.diagnosticRuntime && image.diagnosticRuntime != &runtime) ||
+      runtime.Find(ML_ADDRESS(XLaunchNewImageA)) != ML_GUEST(XLaunchNewImageA)) {
+    throw Fault({}, 0, 0, "menu launch requires its cold owned generated image");
+  }
+  image.diagnosticRuntime = &runtime;
+}
+
+bool MenuLaunch::BelongsTo(Runtime& runtime, PreparedImage& image) const {
+  return &runtime == &runtime_ && &image == &image_ && image.memory.get() == memory_;
+}
+
+bool MenuLaunch::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
+  if (!BelongsTo(runtime_, image_) || !image_.importsBound || image_.boundRuntime != &runtime_ ||
+      base != memory_->Base() || !runtime_.OwnsCurrentContext(ctx) || Memory::HasBorrow()) {
+    throw Fault(ctx, ctx.esp, 0, "menu launch requires its bound current image worker without a lease");
+  }
+  if (id != 64) { return true; }
+  if (uint64_t(ctx.esp) + 12 > UINT32_MAX) { throw Fault(ctx, ctx.esp, 12, "menu launch frame overflow"); }
+  runtime_.Checkpoint(ctx);
+  std::array<uint32_t, 3> frame{};
+  MenuLaunchRequested request;
+  {
+    auto lease = memory_->Borrow();
+    memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+    if (frame[1]) {
+      for (uint32_t n = 0; n < 520; ++n) {
+        if (uint64_t(frame[1]) + n > UINT32_MAX) { throw Fault(ctx, frame[1], n, "menu launch path overflow"); }
+        char value = 0;
+        memory_->Read(ctx, frame[1] + n, &value, 1);
+        if (!value) { break; }
+        request.path.push_back(value);
+      }
+      if (request.path.size() == 520) { throw Fault(ctx, frame[1], 520, "menu launch path is unterminated"); }
+    }
+    std::string lower = request.path;
+    for (char& value : lower) {
+      if (value >= 'A' && value <= 'Z') { value = char(value + ('a' - 'A')); }
+    }
+    constexpr std::string_view executable = "default.xbe";
+    const size_t offset = lower.size() >= executable.size() ? lower.size() - executable.size() : std::string::npos;
+    const bool supported = offset != std::string::npos && lower.compare(offset, executable.size(), executable) == 0 &&
+      (offset == 0 || lower[offset - 1] == '\\' || lower[offset - 1] == ';');
+    if (!supported) {
+      ctx.eax = 2;
+      ctx.esp += 12;
+      return false;
+    }
+    if (frame[2]) {
+      memory_->Read(ctx, frame[2], request.data.data(), request.data.size());
+      request.hasData = true;
+    }
+  }
+  runtime_.Checkpoint(ctx);
+  throw request;
+}
+
+}

@@ -8,6 +8,8 @@ const mimeTypes = new Map([
   ['.mjs', 'text/javascript; charset=utf-8'],
   ['.js', 'text/javascript; charset=utf-8'],
   ['.wasm', 'application/wasm'],
+  ['.wgsl', 'text/plain; charset=utf-8'],
+  ['.bin', 'application/octet-stream'],
   ['.css', 'text/css; charset=utf-8'],
 ]);
 const isInside = (root, path) => {

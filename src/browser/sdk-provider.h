@@ -39,10 +39,10 @@ private:
   std::array<Event, 64> events_{};
   uint64_t total_ = 0;
   void Record(Event event);
-  friend std::shared_ptr<const SdkTrace> InstallSdkProvider(Runtime&, PreparedImage&, SdkPolicy, std::shared_ptr<SdkGraphics>);
+  friend std::shared_ptr<const SdkTrace> InstallSdkProvider(Runtime&, PreparedImage&, SdkPolicy, std::shared_ptr<SdkGraphics>, std::shared_ptr<SdkGraphics>, std::shared_ptr<SdkGraphics>, std::shared_ptr<SdkGraphics>);
 };
 
 std::shared_ptr<const SdkTrace> InstallSdkProvider(Runtime& runtime, PreparedImage& image, SdkPolicy policy = SdkPolicy::Observer,
-  std::shared_ptr<SdkGraphics> graphics = {});
+  std::shared_ptr<SdkGraphics> graphics = {}, std::shared_ptr<SdkGraphics> input = {}, std::shared_ptr<SdkGraphics> launch = {}, std::shared_ptr<SdkGraphics> route = {});
 
 }

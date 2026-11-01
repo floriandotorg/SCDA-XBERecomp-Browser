@@ -12,6 +12,14 @@ endif()
 option(BROWSER_STORY "Compile and retain every generated story function" ON)
 option(BROWSER_FULL_CPU "Build CPU contracts with all compact story functions and metadata" OFF)
 option(BROWSER_BOOT "Build integrated story boot preflight" OFF)
+option(BROWSER_MENU_CAPTURE "Capture real menu initialization without rendering" OFF)
+option(BROWSER_MENU "Build the WebGPU menu integration" OFF)
+if((BROWSER_MENU_CAPTURE OR BROWSER_MENU) AND NOT BROWSER_BOOT)
+    message(FATAL_ERROR "Browser menu modes require BROWSER_BOOT")
+endif()
+if(BROWSER_MENU_CAPTURE AND BROWSER_MENU)
+    message(FATAL_ERROR "Choose rendering or state capture, not both")
+endif()
 set(BROWSER_GENERATION_RECORD "" CACHE FILEPATH "Trusted local generation reproduction record")
 if(BROWSER_BOOT AND NOT BROWSER_GENERATION_RECORD)
     message(FATAL_ERROR "BROWSER_BOOT requires BROWSER_GENERATION_RECORD from verified generation reproduction")
@@ -81,7 +89,7 @@ if(BROWSER_BOOT)
 endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${identity_inputs})
 execute_process(COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/inventory.mjs
-    ${root} ${CMAKE_CURRENT_BINARY_DIR} "${compiler_identity}" "${CMAKE_BUILD_TYPE};story=${BROWSER_STORY};full-cpu=${BROWSER_FULL_CPU};boot=${BROWSER_BOOT}" "${BROWSER_GENERATION_RECORD}"
+    ${root} ${CMAKE_CURRENT_BINARY_DIR} "${compiler_identity}" "${CMAKE_BUILD_TYPE};story=${BROWSER_STORY};full-cpu=${BROWSER_FULL_CPU};boot=${BROWSER_BOOT};menu-capture=${BROWSER_MENU_CAPTURE};menu=${BROWSER_MENU}" "${BROWSER_GENERATION_RECORD}"
     COMMAND_ERROR_IS_FATAL ANY)
 
 add_library(browser_flags INTERFACE)
@@ -121,17 +129,47 @@ endif()
 if(BROWSER_BOOT)
     add_executable(story_boot ${root}/src/browser/boot-wasm.cpp ${root}/src/browser/disc-wasm.cpp
         ${root}/src/browser/cpu_runtime.cpp ${root}/src/browser/kernel-provider.cpp ${root}/src/browser/virtual-memory.cpp ${root}/src/browser/contiguous-memory.cpp ${root}/src/browser/string-provider.cpp ${root}/src/browser/section-provider.cpp ${root}/src/browser/file-provider.cpp ${root}/src/browser/temporary-filesystem.cpp ${root}/src/browser/raw-cache.cpp ${root}/src/browser/cache-fatx.cpp ${root}/src/browser/thread-provider.cpp ${root}/src/kernel/crypto.cpp
-        ${root}/src/browser/image.cpp ${root}/src/browser/platform-profile.cpp ${root}/src/browser/shutdown-provider.cpp ${root}/src/browser/dpc-provider.cpp ${root}/src/browser/timer-provider.cpp ${root}/src/browser/sdk-provider.cpp ${root}/src/browser/diagnostic-graphics.cpp ${root}/src/browser/silent-audio.cpp ${root}/src/kernel/disc_index.cpp ${compact_sources})
+        ${root}/src/browser/image.cpp ${root}/src/browser/platform-profile.cpp ${root}/src/browser/shutdown-provider.cpp ${root}/src/browser/dpc-provider.cpp ${root}/src/browser/timer-provider.cpp ${root}/src/browser/sdk-provider.cpp ${root}/src/browser/diagnostic-graphics.cpp ${root}/src/browser/push-state.cpp ${root}/src/browser/silent-audio.cpp ${root}/src/kernel/disc_index.cpp ${compact_sources})
     target_link_libraries(story_boot PRIVATE browser_flags)
     target_include_directories(story_boot PRIVATE ${root}/generated/game)
     target_compile_definitions(story_boot PRIVATE X86_COMPACT_MEMORY)
+    if(BROWSER_MENU_CAPTURE)
+        set_property(SOURCE ${root}/src/browser/boot-wasm.cpp PROPERTY COMPILE_DEFINITIONS BROWSER_MENU_CAPTURE=1)
+    endif()
+    if(BROWSER_MENU OR BROWSER_MENU_CAPTURE)
+        target_sources(story_boot PRIVATE ${root}/src/browser/menu-input.cpp ${root}/src/browser/menu-launch.cpp ${root}/src/browser/menu-route.cpp)
+    endif()
+    if(BROWSER_MENU)
+        set_property(SOURCE ${root}/src/browser/boot-wasm.cpp PROPERTY COMPILE_DEFINITIONS BROWSER_MENU=1)
+        target_sources(story_boot PRIVATE ${root}/src/browser/menu-backend.cpp ${root}/src/browser/menu-shaders.cpp
+            ${root}/src/browser/menu-texture.cpp ${root}/src/browser/render-snapshot.cpp ${root}/src/browser/webgpu-transport.cpp
+            ${root}/src/gpu/shaders.cpp)
+        add_executable(menu_gpu ${root}/src/browser/webgpu-service.cpp)
+        target_include_directories(menu_gpu PRIVATE ${root}/src)
+        target_compile_features(menu_gpu PRIVATE cxx_std_20)
+        target_compile_options(menu_gpu PRIVATE --use-port=emdawnwebgpu -fexceptions)
+        target_link_options(menu_gpu PRIVATE --use-port=emdawnwebgpu -fexceptions -sMODULARIZE=1 -sEXPORT_ES6=1
+            -sENVIRONMENT=worker,web -sALLOW_MEMORY_GROWTH=1 -sNO_EXIT_RUNTIME=1
+            "-sEXPORTED_FUNCTIONS=['_webgpu_start','_webgpu_submit','_webgpu_resources','_webgpu_shutdown','_malloc','_free']"
+            "-sEXPORTED_RUNTIME_METHODS=['HEAPU8']")
+        set_target_properties(menu_gpu PROPERTIES OUTPUT_NAME "menu_gpu" SUFFIX ".mjs"
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/boot-web)
+        add_dependencies(story_boot menu_gpu)
+    endif()
     target_compile_options(story_boot PRIVATE -O3)
     target_link_options(story_boot PRIVATE --no-entry -sPTHREAD_POOL_SIZE=3 -sPTHREAD_POOL_SIZE_STRICT=2
         -sSTACK_SIZE=1048576 -sDEFAULT_PTHREAD_STACK_SIZE=262144 -sSTACK_OVERFLOW_CHECK=2
         -sEXPORTED_RUNTIME_METHODS=HEAPU8)
     set_target_properties(story_boot PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/boot-web SUFFIX .mjs)
     configure_file(${CMAKE_CURRENT_BINARY_DIR}/boot-manifest.mjs ${CMAKE_BINARY_DIR}/boot-web/boot-manifest.mjs COPYONLY)
-    configure_file(${root}/src/browser/boot.html ${CMAKE_BINARY_DIR}/boot-web/index.html COPYONLY)
+    if(BROWSER_MENU)
+        configure_file(${root}/src/browser/menu.html ${CMAKE_BINARY_DIR}/boot-web/index.html COPYONLY)
+        foreach(module menu-shell menu-runtime menu-input webgpu-service webgpu-transport)
+            configure_file(${root}/src/browser/${module}.mjs ${CMAKE_BINARY_DIR}/boot-web/${module}.mjs COPYONLY)
+        endforeach()
+    else()
+        configure_file(${root}/src/browser/boot.html ${CMAKE_BINARY_DIR}/boot-web/index.html COPYONLY)
+    endif()
     foreach(module IN LISTS boot_modules)
         configure_file(${root}/src/browser/${module} ${CMAKE_BINARY_DIR}/boot-web/${module} COPYONLY)
     endforeach()

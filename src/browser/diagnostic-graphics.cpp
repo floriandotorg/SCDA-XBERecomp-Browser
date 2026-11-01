@@ -1,4 +1,5 @@
 #include "browser/diagnostic-graphics.h"
+#include "browser/push-state.h"
 #include "cpu/x86_ops.h"
 #include "image_symbols.h"
 #include <algorithm>
@@ -91,6 +92,97 @@ DG_BOUNDARY(D3DDevice_Release, 27)
 DG_BOUNDARY(D3DDevice_SetGammaRamp, 28)
 #endif
 
+#ifdef SYM_D3DDevice_SetRenderState_Simple
+DG_BOUNDARY(D3DDevice_SetRenderState_Simple, 29)
+#endif
+#ifdef SYM_D3DDevice_SetVertexShaderConstant1Fast
+DG_BOUNDARY(D3DDevice_SetVertexShaderConstant1Fast, 30)
+#endif
+#ifdef SYM_D3DDevice_SetVertexShaderConstantNotInlineFast
+DG_BOUNDARY(D3DDevice_SetVertexShaderConstantNotInlineFast, 31)
+#endif
+#ifdef SYM_D3DDevice_SetPixelShader
+DG_BOUNDARY(D3DDevice_SetPixelShader, 32)
+#endif
+#ifdef SYM_D3DDevice_SetPixelShaderConstant
+DG_BOUNDARY(D3DDevice_SetPixelShaderConstant, 33)
+#endif
+#ifdef SYM_D3DDevice_SetViewport
+DG_BOUNDARY(D3DDevice_SetViewport, 34)
+#endif
+#ifdef SYM_D3DDevice_SetScissors
+DG_BOUNDARY(D3DDevice_SetScissors, 35)
+#endif
+#ifdef SYM_D3DDevice_SetScreenSpaceOffset
+DG_BOUNDARY(D3DDevice_SetScreenSpaceOffset, 36)
+#endif
+#ifdef SYM_D3DDevice_SetTransform
+DG_BOUNDARY(D3DDevice_SetTransform, 37)
+#endif
+#ifdef SYM_D3DDevice_SetMaterial
+DG_BOUNDARY(D3DDevice_SetMaterial, 38)
+#endif
+#ifdef SYM_D3DDevice_SetVertexShader
+DG_BOUNDARY(D3DDevice_SetVertexShader, 39)
+#endif
+#ifdef SYM_D3DDevice_SetRenderTarget
+DG_BOUNDARY(D3DDevice_SetRenderTarget, 45)
+#endif
+#ifdef SYM_D3DDevice_SetTexture
+DG_BOUNDARY(D3DDevice_SetTexture, 46)
+#endif
+#ifdef SYM_D3DDevice_SetStreamSource
+DG_BOUNDARY(D3DDevice_SetStreamSource, 47)
+#endif
+#ifdef SYM_D3DDevice_SetIndices
+DG_BOUNDARY(D3DDevice_SetIndices, 48)
+#endif
+#ifdef SYM_D3DDevice_CreateVertexShader
+DG_BOUNDARY(D3DDevice_CreateVertexShader, 49)
+#endif
+#ifdef SYM_D3DDevice_DeleteVertexShader
+DG_BOUNDARY(D3DDevice_DeleteVertexShader, 50)
+#endif
+#ifdef SYM_D3DDevice_CreatePixelShader
+DG_BOUNDARY(D3DDevice_CreatePixelShader, 51)
+#endif
+#ifdef SYM_D3DDevice_DeletePixelShader
+DG_BOUNDARY(D3DDevice_DeletePixelShader, 52)
+#endif
+#ifdef SYM_D3DDevice_SwitchTexture
+DG_BOUNDARY(D3DDevice_SwitchTexture, 53)
+#endif
+#ifdef SYM_D3DDevice_SetVertexShaderConstant1
+DG_BOUNDARY(D3DDevice_SetVertexShaderConstant1, 54)
+#endif
+#ifdef SYM_D3DDevice_SetVertexShaderConstant4
+DG_BOUNDARY(D3DDevice_SetVertexShaderConstant4, 55)
+#endif
+#ifdef SYM_D3DDevice_SetTextureState_BumpEnv
+DG_BOUNDARY(D3DDevice_SetTextureState_BumpEnv, 56)
+#endif
+#ifdef SYM_D3DDevice_SetTextureState_BorderColor
+DG_BOUNDARY(D3DDevice_SetTextureState_BorderColor, 57)
+#endif
+#ifdef SYM_D3DDevice_SetTextureState_ColorKeyColor
+DG_BOUNDARY(D3DDevice_SetTextureState_ColorKeyColor, 58)
+#endif
+#ifdef SYM_D3DDevice_SetTextureState_TexCoordIndex
+DG_BOUNDARY(D3DDevice_SetTextureState_TexCoordIndex, 59)
+#endif
+#ifdef SYM_D3DDevice_SetTextureStageStateNotInline
+DG_BOUNDARY(D3DDevice_SetTextureStageStateNotInline, 60)
+#endif
+#ifdef SYM_D3DDevice_SetLight
+DG_BOUNDARY(D3DDevice_SetLight, 61)
+#endif
+#ifdef SYM_D3DDevice_LightEnable
+DG_BOUNDARY(D3DDevice_LightEnable, 62)
+#endif
+#ifdef SYM_D3DDevice_SetShaderConstantMode
+DG_BOUNDARY(D3DDevice_SetShaderConstantMode, 63)
+#endif
+
 namespace browser {
 namespace {
 constexpr uint32_t device = DG_ADDRESS(D3D_Device);
@@ -121,6 +213,7 @@ public:
   }
   void Clear(const gpu::State& state, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z, uint32_t stencil) override {
     std::lock_guard lock(owner_.lock_);
+    if (owner_.mode_ != GraphicsMode::CpuDevice) { owner_.Unavailable(Request::Unsupported, flags, "state capture cannot clear GPU targets"); }
     if (count || rects) { owner_.Unavailable(Request::Unsupported, count, "diagnostic graphics clear rectangles are not recorded"); }
     owner_.Record(Request::Clear, {count, flags, color, std::bit_cast<uint32_t>(z), stencil, state.rt.header});
     if (flags == gpu::kClearTarget) {
@@ -150,6 +243,7 @@ public:
   }
   void Draw(const gpu::State& state, uint32_t primitive, uint32_t start, uint32_t count, const uint8_t* indices) override {
     std::lock_guard lock(owner_.lock_);
+    if (owner_.mode_ != GraphicsMode::CpuDevice) { owner_.Unavailable(Request::Unsupported, count, "state capture cannot draw GPU targets"); }
     if (indices) { owner_.Unavailable(Request::Unsupported, count, "diagnostic graphics indexed draws are not recorded"); }
     owner_.Record(Request::Draw, {primitive, start, count, state.rt.header, state.zs.header});
     owner_.Invalidate(state.rt.header);
@@ -157,11 +251,13 @@ public:
   }
   void Copy(const gpu::Surface& source, const gpu::Surface& destination, uint32_t count, uint32_t rects, uint32_t points) override {
     std::lock_guard lock(owner_.lock_);
+    if (owner_.mode_ != GraphicsMode::CpuDevice) { owner_.Unavailable(Request::Unsupported, destination.header, "state capture cannot copy GPU targets"); }
     owner_.Record(Request::Copy, {source.header, destination.header, count, rects, points});
     owner_.Invalidate(destination.header);
   }
   void Present(const gpu::Surface& surface, bool pillarbox) override {
     std::lock_guard lock(owner_.lock_);
+    if (owner_.mode_ != GraphicsMode::CpuDevice) { owner_.Unavailable(Request::Unsupported, surface.header, "state capture cannot present GPU targets"); }
     owner_.Record(Request::Present, {surface.header, uint32_t(pillarbox)});
   }
   void Sync(uint32_t address, uint32_t bytes) override {
@@ -240,13 +336,23 @@ public:
   }
 };
 
-DiagnosticGraphics::DiagnosticGraphics(Runtime& runtime, PreparedImage& image, ContiguousMemoryAccess allocations, GraphicsMode mode)
-  : runtime_(runtime), image_(image), memory_(image.memory.get()), allocations_(std::move(allocations)), mode_(mode), backend_(std::make_unique<Recorder>(*this)) {
+DiagnosticGraphics::DiagnosticGraphics(Runtime& runtime, PreparedImage& image, ContiguousMemoryAccess allocations, GraphicsMode mode, std::unique_ptr<gpu::Backend> backend)
+  : runtime_(runtime), image_(image), memory_(image.memory.get()), allocations_(std::move(allocations)), mode_(mode), backend_(std::make_unique<Recorder>(*this)), renderer_(std::move(backend)) {
+  if ((mode_ == GraphicsMode::Rendering) != bool(renderer_)) {
+    throw Fault({}, device, 0, "rendering mode requires an injected backend exclusively");
+  }
   if (!memory_ || !allocations_.allocate || !allocations_.release || image.importsBound || image.boundRuntime || runtime.HasPublishedImage() || runtime.ActiveWorkers() || Memory::HasBorrow()) {
     throw Fault({}, device, 0, "diagnostic graphics requires its cold owned image and allocator");
   }
 }
 DiagnosticGraphics::~DiagnosticGraphics() = default;
+void DiagnosticGraphics::Shutdown() {
+  if (runtime_.OwnsCurrentWorker() || Memory::HasBorrow()) { throw Fault({}, 0, 0, "graphics shutdown requires its host owner without a borrowed lease"); }
+  runtime_.Stop();
+  std::lock_guard lock(lock_);
+  renderer_.reset();
+  initialized_ = false;
+}
 
 bool DiagnosticGraphics::BelongsTo(Runtime& runtime, PreparedImage& image) const {
   return &runtime == &runtime_ && &image == &image_ && image.memory.get() == memory_;
@@ -280,8 +386,8 @@ void DiagnosticGraphics::Invalidate(uint32_t header) {
     if (!header || resource.data == data) { resource.unavailable = true; }
   }
 }
-[[noreturn]] void DiagnosticGraphics::Unavailable(Request request, uint32_t address, const char* reason) {
-  Record(request, {address});
+[[noreturn]] void DiagnosticGraphics::Unavailable(Request request, uint32_t address, const char* reason, std::array<uint32_t, 6> arguments) {
+  Record(request, arguments == std::array<uint32_t, 6>{} ? std::array<uint32_t, 6>{address} : arguments);
   throw Fault({}, address, 0, reason);
 }
 uint32_t DiagnosticGraphics::Allocate(const X86Context& ctx, uint32_t bytes) {
@@ -311,17 +417,91 @@ void DiagnosticGraphics::Capture(const X86Context& ctx) {
     throw Fault(ctx, cursor, 0, "diagnostic graphics command capture cursor escaped owned storage");
   }
   const uint32_t words = (cursor - push_) / 4;
+  if (unsubmitted_) { Unavailable(Request::ReadUnavailable, push_, "unsubmitted guest commands have no available GPU results"); }
   if (words == capturedWords_) { return; }
   const size_t oldSize = commands_.size();
   commands_.resize(words);
   memory_->Read(ctx, push_ + capturedWords_ * 4, commands_.data() + oldSize, (words - capturedWords_) * 4);
   Record(Request::Commands, {push_ + capturedWords_ * 4, words - capturedWords_});
   capturedWords_ = words;
-  if (!creating_) { Invalidate(); }
+  if (!creating_) {
+    if (mode_ == GraphicsMode::Rendering || mode_ == GraphicsMode::StateCapture) {
+      ApplyCommands(ctx);
+    } else {
+      Invalidate();
+    }
+  }
+}
+void DiagnosticGraphics::ApplyCommands(const X86Context& ctx) {
+  const auto words = std::span<const uint32_t>(commands_).subspan(decodedWords_);
+  const auto result = ApplyPushState(state_, words);
+  if (result.status != PushStateStatus::StateOnly) {
+    unsubmitted_ = true;
+    Invalidate();
+    Record(Request::Unsupported, {uint32_t(result.status), result.method, uint32_t(result.wordOffset) + decodedWords_, uint32_t(words.size())});
+    throw Fault(ctx, result.method, uint32_t(result.wordOffset) + decodedWords_, "guest command stream is not verified frontend state only");
+  }
+  decodedWords_ = capturedWords_;
+}
+void DiagnosticGraphics::CaptureState(const X86Context& ctx, bool forceViewport) {
+  const auto surface = [&](uint32_t offset) {
+    gpu::Surface result;
+    memory_->Read(ctx, device + offset, &result.header, 4);
+    if (result.header) {
+      std::array<uint32_t, 5> header;
+      memory_->Read(ctx, result.header, header.data(), sizeof(header));
+      result.data = header[1];
+      result.format = header[3];
+      result.size = header[4];
+    }
+    return result;
+  };
+  state_.rt = surface(0x1a04);
+  state_.zs = surface(0x1a08);
+#ifdef SYM_D3D_RenderState
+  memory_->Read(ctx, DG_ADDRESS(D3D_RenderState), state_.rs.data(), state_.rs.size() * sizeof(uint32_t));
+#endif
+#ifdef SYM_D3D_DeferredTextureState
+  for (uint32_t n = 0; n < state_.tss.size(); ++n) {
+    memory_->Read(ctx, DG_ADDRESS(D3D_DeferredTextureState) + n * 128, state_.tss[n].data(), gpu::kTssBumpEnvMat00 * sizeof(uint32_t));
+  }
+#endif
+  memory_->Read(ctx, device + 0x798, &state_.vs_handle, 4);
+  memory_->Read(ctx, device + 0xf88, state_.textures.data(), sizeof(state_.textures));
+  memory_->Read(ctx, device + 0x7a0, &state_.index_buffer, 4);
+  memory_->Read(ctx, device + 0x1c, &state_.base_vertex, 4);
+#ifdef SYM_D3D_IndexData
+  memory_->Read(ctx, DG_ADDRESS(D3D_IndexData), &state_.index_data, 4);
+#endif
+#ifdef SYM_D3D_Streams
+  for (uint32_t n = 0; n < state_.streams.size(); ++n) {
+    std::array<uint32_t, 3> stream;
+    memory_->Read(ctx, DG_ADDRESS(D3D_Streams) + n * 12, stream.data(), sizeof(stream));
+    state_.streams[n] = {stream[2], stream[0]};
+  }
+#endif
+  std::array<uint32_t, 6> viewport;
+  memory_->Read(ctx, device + 0xee0, viewport.data(), sizeof(viewport));
+  const auto previous = state_.viewport;
+  state_.viewport = {viewport[0], viewport[1], viewport[2], viewport[3], std::bit_cast<float>(viewport[4]), std::bit_cast<float>(viewport[5])};
+  const auto& current = state_.viewport;
+  const bool changedViewport = previous.x != current.x || previous.y != current.y || previous.w != current.w || previous.h != current.h ||
+    std::bit_cast<uint32_t>(previous.min_z) != viewport[4] || std::bit_cast<uint32_t>(previous.max_z) != viewport[5];
+  for (uint32_t n = 0; n < 10; ++n) {
+    const uint32_t target = n < 2 ? n + 2 : n < 6 ? n + 14 : n + 250;
+    memory_->Read(ctx, device + 0xc60 + n * 64, state_.transforms[target].data(), 64);
+  }
+  state_.zscale = state_.zs.header && (((state_.zs.format >> 8) & 255) == 44 || ((state_.zs.format >> 8) & 255) == 48) ? 65535.0f : 16777215.0f;
+  const auto& v = state_.viewport;
+  if (forceViewport || changedViewport) {
+    state_.vsc[58] = {v.w * 0.5f, -float(v.h) * 0.5f, (v.max_z - v.min_z) * state_.zscale, 0};
+    state_.vsc[59] = {v.x + state_.ss_offset_x + v.w * 0.5f, v.y + state_.ss_offset_y + v.h * 0.5f, v.min_z * state_.zscale, 0};
+  }
 }
 void DiagnosticGraphics::CreateDevice(X86Context& ctx, uint8_t* base) {
   Require(ctx, base);
   std::lock_guard lock(lock_);
+  if (failed_) { throw Fault(ctx, device, 0, "genuine renderer initialization failure is terminal"); }
   if (initialized_ || creating_) { throw Fault(ctx, device, 0, "diagnostic graphics device already exists"); }
   if (ctx.esp > UINT32_MAX - 28) { throw Fault(ctx, ctx.esp, 28, "diagnostic graphics stdcall cleanup overflow"); }
   std::array<uint32_t, 7> frame;
@@ -343,9 +523,12 @@ void DiagnosticGraphics::CreateDevice(X86Context& ctx, uint8_t* base) {
     memory_->Read(ctx, rollbackBase, saved.data(), saved.size());
     memory_->Read(ctx, devicePointer, &savedPointer, 4);
   }
-  if (frame[1] != 0 || frame[2] != 1 || frame[3] != 0 || frame[4] != 0x40 || !frame[6] ||
-      pp[0] == 0 || pp[0] > 2048 || pp[1] == 0 || pp[1] > 2048 || pp[2] != 18 || pp[3] != 1 ||
-      pp[4] || pp[5] || pp[6] || pp[7] || pp[8] || pp[9] || pp[10] || pp[11] || pp[12]) {
+  const bool capture = mode_ == GraphicsMode::StateCapture || mode_ == GraphicsMode::Rendering;
+  const bool presentation = capture
+    ? frame[4] == 0x50 && pp == std::array<uint32_t, 13>{640, 480, 18, 1, 0, 1, 0, 0, 1, 46, 320, 0, 0x80000002}
+    : frame[4] == 0x40 && pp[0] && pp[0] <= 2048 && pp[1] && pp[1] <= 2048 && pp[2] == 18 && pp[3] == 1 &&
+      !pp[4] && !pp[5] && !pp[6] && !pp[7] && !pp[8] && !pp[9] && !pp[10] && !pp[11] && !pp[12];
+  if (frame[1] != 0 || frame[2] != 1 || frame[3] != 0 || !frame[6] || !presentation) {
     throw Fault(ctx, frame[5], sizeof(pp), "diagnostic graphics unsupported CreateDevice presentation contract");
   }
   const auto overlaps = [](uint32_t left, uint32_t leftBytes, uint32_t right, uint32_t rightBytes) {
@@ -393,7 +576,7 @@ void DiagnosticGraphics::CreateDevice(X86Context& ctx, uint8_t* base) {
     put(0xef4, std::bit_cast<uint32_t>(1.0f));
     memory_->Write(ctx, device, metadata.data(), metadata.size());
     memory_->Write(ctx, devicePointer, &device, 4);
-    if (!backend_->Init(pp[0], pp[1])) { throw Fault(ctx, device, 0, "diagnostic graphics recorder initialization failed"); }
+    if (!Backend().Init(pp[0], pp[1])) { throw Fault(ctx, device, 0, "graphics backend initialization failed"); }
     state_ = gpu::State{};
     state_.viewport = {0, 0, pp[0], pp[1], 0, 1};
     state_.rt = back;
@@ -407,12 +590,16 @@ void DiagnosticGraphics::CreateDevice(X86Context& ctx, uint8_t* base) {
 #endif
     runtime_.Call(ctx, base, DG_ADDRESS(D3D_InitDefaultState), {});
     Capture(ctx);
+    if (capture) {
+      ApplyCommands(ctx);
+      CaptureState(ctx, true);
+    }
 #ifdef SYM_D3D_RenderState
     memory_->Read(ctx, DG_ADDRESS(D3D_RenderState), state_.rs.data(), state_.rs.size() * sizeof(uint32_t));
 #endif
 #ifdef SYM_D3D_DeferredTextureState
     for (uint32_t n = 0; n < 4; ++n) {
-      memory_->Read(ctx, DG_ADDRESS(D3D_DeferredTextureState) + n * 128, state_.tss[n].data(), 32 * sizeof(uint32_t));
+      memory_->Read(ctx, DG_ADDRESS(D3D_DeferredTextureState) + n * 128, state_.tss[n].data(), gpu::kTssBumpEnvMat00 * sizeof(uint32_t));
     }
 #endif
     {
@@ -439,7 +626,9 @@ void DiagnosticGraphics::CreateDevice(X86Context& ctx, uint8_t* base) {
     }
     allocationsOwned_.clear();
     resources_.clear();
-    push_ = pushBytes_ = capturedWords_ = 0;
+    push_ = pushBytes_ = capturedWords_ = decodedWords_ = 0;
+    unsubmitted_ = false;
+    failed_ = bool(renderer_);
     commands_.clear();
     backend_->Reset();
     initialized_ = false;
@@ -452,8 +641,176 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
   Require(ctx, base);
   if (id == 3) { CreateDevice(ctx, base); return false; }
   std::lock_guard lock(lock_);
-  if (creating_ && id == 18) { return true; }
+  if ((creating_ || initialized_) && (mode_ == GraphicsMode::StateCapture || mode_ == GraphicsMode::Rendering) && id == 18) {
+    if (!creating_) { Capture(ctx); }
+    if (ctx.esp > UINT32_MAX - 12) { throw Fault(ctx, ctx.esp, 12, "graphics state setter cleanup overflow"); }
+    std::array<uint32_t, 3> frame;
+    memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+    if (frame[1] < gpu::kRsDeferredFirst) {
+#ifdef SYM_D3D_SimpleRenderStateEncode
+      uint32_t method;
+      memory_->Read(ctx, DG_ADDRESS(D3D_SimpleRenderStateEncode) + frame[1] * 4, &method, 4);
+      state_.simple[(method & 0x1ffc) >> 2] = frame[2];
+#else
+      Unavailable(Request::Unsupported, frame[1], "graphics simple state encoding table is unavailable");
+#endif
+    } else if (frame[1] < gpu::kRsMax) {
+#ifdef SYM_D3D_RenderState
+      memory_->Write(ctx, DG_ADDRESS(D3D_RenderState) + frame[1] * 4, &frame[2], 4);
+#endif
+      state_.rs[frame[1]] = frame[2];
+    }
+    ctx.eax = 0;
+    ctx.esp += 12;
+    return false;
+  }
+  if (creating_ && (id == 18 || id >= 29)) { return true; }
+  if (id >= 29 && mode_ != GraphicsMode::Rendering && mode_ != GraphicsMode::StateCapture) { return true; }
   Capture(ctx);
+  if (initialized_ && id >= 29) {
+    Unavailable(Request::Unsupported, id, "graphics typed frontend state operation is not implemented");
+  }
+  if (initialized_ && (mode_ == GraphicsMode::Rendering || mode_ == GraphicsMode::StateCapture) && (id == 8 || id == 10 || id == 11)) {
+    if (ctx.esp > UINT32_MAX - 8) { throw Fault(ctx, ctx.esp, 8, "graphics resource cleanup overflow"); }
+    std::array<uint32_t, 2> frame;
+    memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+    uint32_t result = 0;
+    if (frame[1]) {
+      std::array<uint32_t, 2> header;
+      memory_->Read(ctx, frame[1], header.data(), sizeof(header));
+      const uint32_t type = header[0] & 0x70000;
+      const uint32_t data = 0x80000000 | (header[1] & 0x3ffffff);
+      const bool written = gpuWritten_.contains(data);
+      if (id == 11) {
+        uint32_t parent = 0;
+        if (type == 0x50000) {
+          memory_->Read(ctx, frame[1] + 20, &parent, 4);
+          if (parent) { memory_->Read(ctx, parent, &parent, 4); }
+        }
+        result = (header[0] & 0x780000) || (parent & 0x780000) || (written && renderer_ && renderer_->Busy(frame[1]));
+      } else if (written) {
+        if (!renderer_) { Unavailable(Request::ReadUnavailable, frame[1], "resource requires unavailable GPU results"); }
+        if (id == 8 && (type == 0x40000 || type == 0x50000)) {
+          memory_->CheckRange(ctx, data, 1);
+          renderer_->Sync(data, 0);
+        } else {
+          renderer_->WaitResource(frame[1]);
+        }
+      }
+    }
+    ctx.eax = result;
+    ctx.esp += 8;
+    return false;
+  }
+  if (initialized_ && (mode_ == GraphicsMode::Rendering || mode_ == GraphicsMode::StateCapture) && id == 9) {
+    std::array<uint32_t, 7> frame;
+    memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+    std::array<uint32_t, 6> header;
+    memory_->Read(ctx, frame[1], header.data(), sizeof(header));
+    std::array<uint32_t, 2> output;
+    memory_->Read(ctx, frame[4], output.data(), sizeof(output));
+    if (frame[5]) {
+      std::array<uint32_t, 4> rect;
+      memory_->Read(ctx, frame[5], rect.data(), sizeof(rect));
+    }
+    const uint32_t data = 0x80000000 | (header[1] & 0x3ffffff);
+    memory_->CheckRange(ctx, data, 1);
+    if ((frame[6] & 0x20) && gpuWritten_.contains(data)) {
+      if (!renderer_) { Unavailable(Request::ReadUnavailable, frame[1], "CPU lock requires unavailable GPU results"); }
+      renderer_->SyncLate(data);
+    }
+    return true;
+  }
+  const auto stopSdk = [&](const char* reason) {
+    constexpr std::array<uint32_t, 29> counts{0, 1, 2, 6, 0, 2, 0, 0, 1, 6, 1, 1, 0, 1, 1, 0, 1, 6, 2, 3, 3, 5, 1, 0, 1, 2, 0, 0, 2};
+    const uint32_t count = id < counts.size() ? std::min(counts[id], 5u) : 0;
+    std::array<uint32_t, 6> frame{};
+    memory_->Read(ctx, ctx.esp, frame.data(), size_t(count + 1) * 4);
+    frame[0] = id;
+    Unavailable(Request::Unsupported, id, reason, frame);
+  };
+  if (initialized_ && mode_ == GraphicsMode::Rendering) {
+    CaptureState(ctx);
+    if (id == 17) {
+      if (ctx.esp > UINT32_MAX - 28) { throw Fault(ctx, ctx.esp, 28, "graphics Clear cleanup overflow"); }
+      std::array<uint32_t, 7> frame;
+      memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+      if (frame[1] > 4096 || (frame[1] && !frame[2])) { throw Fault(ctx, frame[2], frame[1], "graphics Clear rectangle limit or pointer invalid"); }
+      std::vector<uint8_t> rects(size_t(frame[1]) * 16);
+      if (!rects.empty()) { memory_->Read(ctx, frame[2], rects.data(), rects.size()); }
+      renderer_->Clear(state_, frame[1], rects.empty() ? nullptr : rects.data(), frame[3], frame[4], std::bit_cast<float>(frame[5]), frame[6]);
+      if ((frame[3] & gpu::kClearTarget) && state_.rt.header) { gpuWritten_.insert(0x80000000 | (state_.rt.data & 0x3ffffff)); }
+      if ((frame[3] & (gpu::kClearZ | gpu::kClearStencil)) && state_.zs.header) { gpuWritten_.insert(0x80000000 | (state_.zs.data & 0x3ffffff)); }
+      Record(Request::Clear, {frame[1], frame[3], frame[4], frame[5], frame[6], state_.rt.header});
+      ctx.eax = 0;
+      ctx.esp += 28;
+      return false;
+    }
+    if (id == 19 || id == 20) {
+      if (ctx.esp > UINT32_MAX - 16) { throw Fault(ctx, ctx.esp, 16, "graphics draw cleanup overflow"); }
+      std::array<uint32_t, 4> frame;
+      memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+      const uint32_t count = id == 20 ? frame[2] : frame[3];
+      if (count > 0x100000) { throw Fault(ctx, ctx.esp, count, "graphics draw count limit exceeded"); }
+      std::vector<uint8_t> indices;
+      if (id == 20 && frame[3]) {
+        indices.resize(size_t(count) * 2);
+        memory_->Read(ctx, frame[3], indices.data(), indices.size());
+      }
+      renderer_->Draw(state_, frame[1], id == 20 ? 0 : frame[2], count, indices.empty() ? nullptr : indices.data());
+      if (state_.rt.header) { gpuWritten_.insert(0x80000000 | (state_.rt.data & 0x3ffffff)); }
+      if (state_.zs.header) { gpuWritten_.insert(0x80000000 | (state_.zs.data & 0x3ffffff)); }
+      Record(Request::Draw, {frame[1], id == 20 ? 0 : frame[2], count, state_.rt.header, state_.zs.header, id == 20 ? frame[3] : 0});
+      ctx.eax = 0;
+      ctx.esp += 16;
+      return false;
+    }
+    if (id == 28) {
+      if (ctx.esp > UINT32_MAX - 12) { throw Fault(ctx, ctx.esp, 12, "graphics Gamma cleanup overflow"); }
+      std::array<uint32_t, 3> frame;
+      memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+      std::array<uint8_t, 768> ramp;
+      memory_->Read(ctx, frame[2], ramp.data(), ramp.size());
+      renderer_->SetGamma(ramp.data());
+      Record(Request::Gamma, {frame[1], frame[2]});
+      ctx.eax = 0;
+      ctx.esp += 12;
+      return false;
+    }
+    if (id == 16) {
+      if (ctx.esp > UINT32_MAX - 8) { throw Fault(ctx, ctx.esp, 8, "graphics Swap cleanup overflow"); }
+      std::array<uint32_t, 2> frame;
+      memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+      if (resources_.size() < 2) { throw Fault(ctx, device, 0, "graphics Swap requires its color surface ring"); }
+      std::array<std::array<uint32_t, 2>, 2> payload;
+      for (uint32_t n = 0; n < payload.size(); ++n) {
+        memory_->Read(ctx, resources_[n].header + 4, payload[n].data(), sizeof(payload[n]));
+      }
+      std::array<uint32_t, 5> header;
+      memory_->Read(ctx, resources_[1].header, header.data(), sizeof(header));
+      const gpu::Surface front{resources_[1].header, header[1], header[3], header[4]};
+      uint32_t count;
+      memory_->Read(ctx, device + 0x2478, &count, 4);
+      renderer_->Present(front, false);
+      for (uint32_t n = 0; n < payload.size(); ++n) {
+        const auto& next = payload[1 - n];
+        memory_->Write(ctx, resources_[n].header + 4, next.data(), sizeof(next));
+        resources_[n].data = 0x80000000 | (next[0] & 0x3ffffff);
+      }
+      ++count;
+      memory_->Write(ctx, device + 0x2478, &count, 4);
+      CaptureState(ctx);
+      Record(Request::Present, {front.header, 0, count, front.data});
+      ctx.eax = count;
+      ctx.esp += 8;
+      return false;
+    }
+    stopSdk("rendering SDK operation is not implemented");
+  }
+  if (initialized_ && mode_ == GraphicsMode::StateCapture) {
+    CaptureState(ctx);
+    stopSdk("state capture stopped before an unrendered SDK operation");
+  }
   if (initialized_ && (id == 8 || id == 9 || id == 10)) {
     std::array<uint32_t, 2> frame;
     memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
@@ -550,6 +907,8 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
 } catch (const Fault& error) {
   if (error.context->host) { throw; }
   throw Fault(ctx, error.address, error.size, error.what());
+} catch (const std::exception& error) {
+  throw Fault(ctx, 0, 0, error.what());
 }
 DiagnosticGraphics::SnapshotData DiagnosticGraphics::Snapshot() const {
   std::lock_guard lock(lock_);
@@ -563,10 +922,17 @@ DiagnosticGraphics::SnapshotData DiagnosticGraphics::Snapshot() const {
   for (size_t n = 0; n < result.count; ++n) { result.events[n] = events_[(total_ - result.count + n) % events_.size()]; }
   return result;
 }
-gpu::Backend& DiagnosticGraphics::Backend() { return *backend_; }
+gpu::Backend& DiagnosticGraphics::Backend() { return renderer_ ? *renderer_ : *backend_; }
 gpu::State DiagnosticGraphics::State() const {
   std::lock_guard lock(lock_);
   return state_;
+}
+gpu::State DiagnosticGraphics::SnapshotState() const {
+  std::lock_guard lock(lock_);
+  auto result = state_;
+  if (result.vs) { result.vs = std::make_shared<gpu::VertexShader>(*result.vs); }
+  if (result.ps) { result.ps = std::make_shared<gpu::PixelShader>(*result.ps); }
+  return result;
 }
 
 }
