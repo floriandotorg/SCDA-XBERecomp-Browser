@@ -44,7 +44,8 @@ void Block(Sha& s, const uint8_t* p) {
 }  // namespace
 
 void ShaInit(void* ctx) {
-    Sha s{};
+    Sha s;
+    std::memset(&s, 0, sizeof(s));
     s.h[0] = 0x67452301;
     s.h[1] = 0xEFCDAB89;
     s.h[2] = 0x98BADCFE;

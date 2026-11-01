@@ -1,14 +1,19 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 #include "core/log.h"
 
-#ifdef _WIN32
+#ifdef X86_COMPACT_MEMORY
+#include "browser/cpu_runtime.h"
+#include <array>
+#elif defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
@@ -20,6 +25,13 @@ namespace mem {
 static uint8_t* g_base = nullptr;
 static std::recursive_mutex g_lock;
 
+static auto LockAllocator() {
+#ifdef X86_COMPACT_MEMORY
+    if (browser::Memory::HasBorrow()) { throw browser::Fault({}, 0, 0, "allocator lock during host backing lease"); }
+#endif
+    return std::unique_lock<std::recursive_mutex>(g_lock);
+}
+
 uint8_t* Base() { return g_base; }
 
 // physical memory shows at 0x80000000 and again at 0xF0000000 (write combined view)
@@ -28,7 +40,16 @@ static bool InPhysical(uint32_t va) {
            (va >= kWriteCombineBase && va < kWriteCombineBase + kPhysicalSize);
 }
 
+#ifdef X86_COMPACT_MEMORY
+static std::unique_ptr<browser::Memory> g_memory;
+#endif
+
 bool Init() {
+#ifdef X86_COMPACT_MEMORY
+    if (!g_memory) { g_memory = std::make_unique<browser::Memory>(); }
+    g_base = g_memory->Base();
+    return true;
+#else
     const uint64_t size = 1ull << 32;
 #ifdef _WIN32
     HANDLE ram = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, kPhysicalSize, nullptr);
@@ -69,17 +90,26 @@ bool Init() {
     }
     LOGI("memory: guest space at %p", static_cast<void*>(g_base));
     return true;
+#endif
 }
 
 // page commit map, one byte per 4 KB page
+#ifndef X86_COMPACT_MEMORY
 static std::vector<uint8_t> g_committed(0x100000, 0);
+#endif
 
 bool Commit(uint32_t va, uint32_t size) {
-    if (!size || InPhysical(va)) return true;
+    if (uint64_t(va) + size > (1ull << 32)) { return false; }
+    if (!size) { return true; }
+    if (InPhysical(va)) { return size <= kPhysicalSize - (va & (kPhysicalSize - 1)); }
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
-#ifdef _WIN32
+    auto lock = LockAllocator();
+#ifdef X86_COMPACT_MEMORY
+    try { g_memory->Ensure(first, uint32_t(end - first)); }
+    catch (const browser::Fault&) { return false; }
+    catch (const std::bad_alloc&) { return false; }
+#elif defined(_WIN32)
     if (!VirtualAlloc(g_base + first, size_t(end - first), MEM_COMMIT, PAGE_READWRITE)) {
         LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
         return false;
@@ -90,25 +120,57 @@ bool Commit(uint32_t va, uint32_t size) {
         return false;
     }
 #endif
-    for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 1;
+#ifndef X86_COMPACT_MEMORY
+    for (uint64_t p = first; p < end; p += kPage) { g_committed[size_t(p >> 12)] = 1; }
+#endif
     return true;
 }
 
 void Decommit(uint32_t va, uint32_t size) {
-    if (InPhysical(va)) return;
+    if (!size || uint64_t(va) + size > (1ull << 32) || InPhysical(va)) { return; }
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
-#ifdef _WIN32
+    auto lock = LockAllocator();
+#ifdef X86_COMPACT_MEMORY
+    g_memory->DecommitMapped(first, uint32_t(end - first));
+#elif defined(_WIN32)
     VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT);
 #else
     madvise(g_base + first, size_t(end - first), MADV_DONTNEED);
     mprotect(g_base + first, size_t(end - first), PROT_NONE);
 #endif
-    for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 0;
+#ifndef X86_COMPACT_MEMORY
+    for (uint64_t p = first; p < end; p += kPage) { g_committed[size_t(p >> 12)] = 0; }
+#endif
 }
 
-bool IsCommitted(uint32_t va) { return InPhysical(va) || g_committed[va >> 12] != 0; }
+bool IsCommitted(uint32_t va) {
+#ifdef X86_COMPACT_MEMORY
+    return g_memory && g_memory->IsCommitted(va);
+#else
+    return InPhysical(va) || g_committed[va >> 12] != 0;
+#endif
+}
+
+static void DiscardBacking(uint32_t address, uint32_t size) {
+#ifdef X86_COMPACT_MEMORY
+    g_memory->Discard(address, size);
+#endif
+}
+
+static void Zero(uint32_t address, uint32_t size) {
+#ifdef X86_COMPACT_MEMORY
+    const std::array<uint8_t, kPage> zeros{};
+    while (size) {
+        const uint32_t count = std::min(size, kPage);
+        g_memory->Write({}, address, zeros.data(), count);
+        address += count;
+        size -= count;
+    }
+#else
+    std::memset(g_base + address, 0, size);
+#endif
+}
 
 // first fit allocator over a guest range
 class Ranges {
@@ -231,14 +293,18 @@ static void EnsureRanges() {
 }
 
 void ReserveImage(uint32_t base, uint32_t size) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     EnsureRanges();
-    uint32_t b = base & ~0xFFFFu;
-    uint32_t e = (base + size + 0xFFFF) & ~0xFFFFu;
-    g_user.Remove(b, e - b);
-    Reservation r{e - b, 4, std::vector<uint8_t>((e - b) / kPage, 1)};  // 4 is PAGE_READWRITE
-    g_reserved[b] = std::move(r);
-    Commit(b, e - b);
+    const uint32_t start = base & ~0xFFFFu;
+    const uint64_t end = (uint64_t(base) + size + 0xFFFF) & ~uint64_t(0xFFFF);
+    if (!size || end > kUserHigh || !g_user.IsFree(start, uint32_t(end - start))) {
+        throw std::runtime_error("invalid or overlapping image reservation");
+    }
+    const uint32_t length = uint32_t(end - start);
+    Reservation reservation{length, 4, std::vector<uint8_t>(length / kPage, 1)};
+    if (!Commit(start, length)) { throw std::runtime_error("image backing allocation failed"); }
+    g_reserved.emplace(start, std::move(reservation));
+    g_user.Remove(start, length);
 }
 
 static Reservation* FindReservation(uint32_t addr, uint32_t* start) {
@@ -251,52 +317,55 @@ static Reservation* FindReservation(uint32_t addr, uint32_t* start) {
 }
 
 uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t protect) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     EnsureRanges();
-    if (!size) return 0xC000000D;  // STATUS_INVALID_PARAMETER
-    bool reserve = type & kMemReserve;
-    bool commit = type & kMemCommit;
-    if (!base && commit) reserve = true;
+    if (!size || uint64_t(base) + size > (1ull << 32)) { return 0xC000000D; }
+    const bool commit = type & kMemCommit;
+    const bool reserve = (type & kMemReserve) || (!base && commit);
+    if (!reserve && !commit) { return 0xC000000D; }
+    uint32_t address = base, length = size;
     if (reserve) {
-        uint32_t sz = (size + 0xFFFF) & ~0xFFFFu;
-        uint32_t a;
+        const uint64_t end = (uint64_t(base) + size + 0xFFFF) & ~uint64_t(0xFFFF);
+        address = base & ~0xFFFFu;
+        if (end - address > UINT32_MAX) { return 0xC000000D; }
+        length = uint32_t(end - address);
         if (base) {
-            a = base & ~0xFFFFu;
-            sz = ((base + size + 0xFFFF) & ~0xFFFFu) - a;
-            if (!g_user.IsFree(a, sz)) return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
-            g_user.Remove(a, sz);
+            if (!g_user.IsFree(address, length)) { return 0xC0000018; }
         } else {
-            a = g_user.Alloc(sz, 0x10000, kUserLow, kUserHigh - 1, type & kMemTopDown);
-            if (!a) return 0xC0000017;  // STATUS_NO_MEMORY
-            g_user.Forget(a);
+            address = g_user.Alloc(length, 0x10000, kUserLow, kUserHigh - 1, type & kMemTopDown);
+            if (!address) { return 0xC0000017; }
+            g_user.Free(address);
         }
-        g_reserved[a] = Reservation{sz, protect, std::vector<uint8_t>(sz / kPage, 0)};
-        base = a;
-        size = sz;
-    }
-    if (commit) {
+        Reservation reservation{length, protect, std::vector<uint8_t>(length / kPage, 0)};
+        if (commit && !Commit(address, length)) { return 0xC0000017; }
+        if (commit) { std::fill(reservation.commit.begin(), reservation.commit.end(), 1); }
+        g_reserved.emplace(address, std::move(reservation));
+        g_user.Remove(address, length);
+    } else {
         uint32_t start;
-        Reservation* r = FindReservation(base, &start);
-        if (!r) return 0xC0000045;  // STATUS_INVALID_PAGE_PROTECTION stands in for not reserved
-        uint32_t first = base & ~(kPage - 1);
-        uint32_t end = (base + size + kPage - 1) & ~(kPage - 1);
-        if (end > start + r->size) return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
-        Commit(first, end - first);
-        for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 1;
-        base = first;
-        size = end - first;
+        Reservation* reservation = FindReservation(address, &start);
+        if (!reservation) { return 0xC0000045; }
+        const uint64_t end = (uint64_t(address) + length + kPage - 1) & ~uint64_t(kPage - 1);
+        address &= ~(kPage - 1);
+        if (end > uint64_t(start) + reservation->size) { return 0xC0000018; }
+        length = uint32_t(end - address);
+        if (!Commit(address, length)) { return 0xC0000017; }
+        for (uint32_t n = address; n < end; n += kPage) { reservation->commit[(n - start) / kPage] = 1; }
     }
+    base = address;
+    size = length;
     return 0;
 }
 
 uint32_t FreeVirtual(uint32_t& base, uint32_t& size, uint32_t type) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     uint32_t start;
     Reservation* r = FindReservation(base, &start);
     if (!r) return 0xC000009F;  // STATUS_MEMORY_NOT_ALLOCATED
     if (type & kMemRelease) {
         uint32_t sz = r->size;
         Decommit(start, sz);
+        DiscardBacking(start, sz);
         g_reserved.erase(start);
         g_user.Release(start, sz);
         base = start;
@@ -304,16 +373,17 @@ uint32_t FreeVirtual(uint32_t& base, uint32_t& size, uint32_t type) {
         return 0;
     }
     uint32_t first = base & ~(kPage - 1);
-    uint32_t end = size ? (base + size + kPage - 1) & ~(kPage - 1) : start + r->size;
-    Decommit(first, end - first);
+    const uint64_t end = size ? (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1) : uint64_t(start) + r->size;
+    if (end > uint64_t(start) + r->size) { return 0xC0000018; }
+    Decommit(first, uint32_t(end - first));
     for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 0;
     base = first;
-    size = end - first;
+    size = uint32_t(end - first);
     return 0;
 }
 
 bool QueryVirtual(uint32_t addr, RegionInfo& out) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     uint32_t start;
     Reservation* r = FindReservation(addr, &start);
     std::memset(&out, 0, sizeof(out));
@@ -341,10 +411,11 @@ bool QueryVirtual(uint32_t addr, RegionInfo& out) {
 }
 
 uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint32_t align) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     EnsureRanges();
+    if (size > kPhysicalSize || (align && !std::has_single_bit(align))) { return 0; }
     size = (size + kPage - 1) & ~(kPage - 1);
-    if (!size) size = kPage;
+    if (!size) { size = kPage; }
     align = std::max<uint32_t>(align, kPage);
     uint32_t lo = kContiguousBase | (lowest & (kPhysicalSize - 1));
     uint32_t hi = highest >= kPhysicalSize - 1 ? kContiguousBase + kPhysicalSize - 1 : kContiguousBase | highest;
@@ -354,57 +425,62 @@ uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint3
              (unsigned long long)(g_contig.Used() >> 10));
         return 0;
     }
-    Commit(a, size);
-    std::memset(g_base + a, 0, size);
+    if (!Commit(a, size)) { g_contig.Free(a); return 0; }
+    Zero(a, size);
     return a;
 }
 
 void FreeContiguous(uint32_t va) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     uint32_t size;
     if (g_contig.Free(va, &size)) Decommit(va, size);
 }
 
 uint32_t AllocSystem(uint32_t size, uint32_t align) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     EnsureRanges();
+    if (size > kSystemSize || (align && !std::has_single_bit(align))) { return 0; }
     size = (size + 15) & ~15u;
-    if (!size) size = 16;
+    if (!size) { size = 16; }
     uint32_t a = g_system.Alloc(size, std::max<uint32_t>(align, 16), kSystemBase, kSystemBase + kSystemSize - 1, false);
     if (!a) return 0;
-    Commit(a, size);
-    std::memset(g_base + a, 0, size);
+    if (!Commit(a, size)) { g_system.Free(a); return 0; }
+    Zero(a, size);
     return a;
 }
 
 void FreeSystem(uint32_t va) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     g_system.Free(va);
 }
 
 uint32_t AllocStack(uint32_t size) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     EnsureRanges();
+    if (size > kStackSize - 0x10000) { return 0; }
     size = (size + 0xFFFF) & ~0xFFFFu;
     // one uncommitted guard page below the stack
     uint32_t a = g_stacks.Alloc(size + 0x10000, 0x10000, kStackBase, kStackBase + kStackSize - 1, false);
     if (!a) return 0;
-    Commit(a + 0x10000, size);
+    if (!Commit(a + 0x10000, size)) { g_stacks.Free(a); return 0; }
     g_stack_tops[a + 0x10000 + size] = a;
     return a + 0x10000 + size;
 }
 
 void FreeStack(uint32_t top) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     auto it = g_stack_tops.find(top);
     if (it == g_stack_tops.end()) return;
     uint32_t size;
-    if (g_stacks.Free(it->second, &size)) Decommit(it->second, size);
+    if (g_stacks.Free(it->second, &size)) {
+        Decommit(it->second, size);
+        DiscardBacking(it->second, size);
+    }
     g_stack_tops.erase(it);
 }
 
 uint32_t AllocationSize(uint32_t va) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     if (uint32_t s = g_contig.SizeOf(va)) return s;
     if (uint32_t s = g_system.SizeOf(va)) return s;
     uint32_t start;
@@ -423,7 +499,7 @@ uint32_t VirtualFromPhysical(uint32_t pa) {
 }
 
 Stats Query() {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto lock = LockAllocator();
     Stats s{};
     s.total_pages = kPhysicalSize / kPage;
     uint64_t vc = 0;

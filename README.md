@@ -211,3 +211,30 @@ Install [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) and 
 ### 4. Build the Project
 - Run `build.bat`. The first build recompiles the entire game and can take 30 to 90 minutes on weaker systems.
 - When it finishes, run `out\build\release\SCDA.exe`.
+
+### Build Only the Recompiler
+To build `xbe_recomp` on macOS or Linux without the Windows game runtime, enable `RECOMP_ONLY`. This needs CMake 3.25 or newer, Ninja, Git, and a C++20 compiler. On macOS, install the Xcode Command Line Tools and use `brew install cmake ninja` for the build tools.
+
+From the repository root:
+
+```sh
+cmake -S . -B out/build/recomp -G Ninja \
+  -DRECOMP_ONLY=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build out/build/recomp --target xbe_recomp --parallel
+```
+
+No game assets are needed to build the tool. To generate C++ from your extracted game executables, place them in `assets/` and run:
+
+```sh
+./out/build/recomp/compiler/xbe_recomp config/scda_v2.toml
+./out/build/recomp/compiler/xbe_recomp config/sc4_adv.toml
+```
+
+These write to `generated/game/` and `generated/versus/`, respectively. To override the input and output paths:
+
+```sh
+./out/build/recomp/compiler/xbe_recomp config/scda_v2.toml /path/to/default.xbe /path/to/output
+```
+
+This builds the translation tool only, not a playable macOS, Linux, or browser version of the game. `RECOMP_ONLY` defaults to `OFF`, preserving the full Windows build.

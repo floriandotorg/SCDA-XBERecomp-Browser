@@ -13,6 +13,16 @@ typedef uint64_t __attribute__((aligned(1), may_alias)) x86_u64u;
 typedef float __attribute__((aligned(1), may_alias)) x86_f32u;
 typedef double __attribute__((aligned(1), may_alias)) x86_f64u;
 
+#if defined(X86_COMPACT_MEMORY)
+#include "browser/cpu_runtime.h"
+#define X86_MEM8(a) browser::Access<uint8_t>(ctx, base, uint32_t(a))
+#define X86_MEM16(a) browser::Access<uint16_t>(ctx, base, uint32_t(a))
+#define X86_MEM32(a) browser::Access<uint32_t>(ctx, base, uint32_t(a))
+#define X86_MEM64(a) browser::Access<uint64_t>(ctx, base, uint32_t(a))
+#define X86_MEMF32(a) browser::Access<float>(ctx, base, uint32_t(a))
+#define X86_MEMF64(a) browser::Access<double>(ctx, base, uint32_t(a))
+#define X86_PTR(T, a) browser::Pointer<T>(ctx, base, uint32_t(a))
+#else
 #define X86_MEM8(a) (*(uint8_t*)(base + (uint32_t)(a)))
 #define X86_MEM16(a) (*(x86_u16u*)(base + (uint32_t)(a)))
 #define X86_MEM32(a) (*(x86_u32u*)(base + (uint32_t)(a)))
@@ -20,10 +30,19 @@ typedef double __attribute__((aligned(1), may_alias)) x86_f64u;
 #define X86_MEMF32(a) (*(x86_f32u*)(base + (uint32_t)(a)))
 #define X86_MEMF64(a) (*(x86_f64u*)(base + (uint32_t)(a)))
 #define X86_PTR(T, a) ((T*)(base + (uint32_t)(a)))
+#endif
 
 // The recompiled code is built on the player's PC into a DLL beside the executable (app/game_code.cpp). The executable
 // exports the runtime and its overrides, which the DLL imports; a function with no override links to its body.
-#ifdef X86_GAME_CODE
+#if defined(__EMSCRIPTEN__)
+#define X86_HOST_API
+#define X86_HOST_EXPORT
+#define X86_WEAK_FUNC(name, impl) extern "C" void name(X86Context& __restrict, uint8_t*) __attribute__((weak, alias(#impl)));
+#elif defined(X86_PORTABLE_RUNTIME)
+#define X86_HOST_API
+#define X86_HOST_EXPORT
+#define X86_WEAK_FUNC(name, impl) extern "C" __attribute__((weak, noinline)) void name(X86Context& ctx, uint8_t* base) { impl(ctx, base); }
+#elif defined(X86_GAME_CODE)
 #define X86_HOST_API __declspec(dllimport)
 #define X86_HOST_EXPORT
 #define X86_WEAK_FUNC(name, impl) __pragma(comment(linker, "/alternatename:" #name "=" #impl))
@@ -47,7 +66,11 @@ extern "C" __attribute__((used)) inline int _fltused = 0;
 
 #define X86_SAVE_FLAGS() (ctx.cf = cf, ctx.zf = zf, ctx.sf = sf, ctx.of = of, ctx.pf = pf)
 #define X86_LOAD_FLAGS() uint32_t cf = ctx.cf, zf = ctx.zf, sf = ctx.sf, of = ctx.of, pf = ctx.pf
+#ifdef X86_COMPACT_MEMORY
+#define X86_BARRIER() do { if (ctx.host) { browser::Runtime::From(ctx).Poll(ctx, base); } __asm__ volatile("" ::: "memory"); } while (false)
+#else
 #define X86_BARRIER() __asm__ volatile("" ::: "memory")
+#endif
 #define X86_PARITY(r) ((uint32_t)(__builtin_parity((uint32_t)(r)&0xFF) ^ 1))
 
 #define X87_ST(i) ctx.st[(ctx.top + (i)) & 7]
@@ -84,13 +107,35 @@ inline void x87_compare(X86Context& ctx, double a, double b) {
 // TOP lives in status word bits 11 to 13
 inline uint16_t x87_status(X86Context& ctx) { return uint16_t((ctx.fsw & ~0x3800) | ((ctx.top & 7) << 11)); }
 
+#if defined(X86_COMPACT_MEMORY)
+inline double x86_round(double value, uint32_t mode) {
+    switch (mode & 3) {
+        case 1: return std::floor(value);
+        case 2: return std::ceil(value);
+        case 3: return std::trunc(value);
+        default: {
+            const double magnitude = std::fabs(value);
+            if (!(magnitude < 4503599627370496.0)) { return value; }
+            const double lower = std::floor(magnitude);
+            const double fraction = magnitude - lower;
+            const double rounded = lower + (fraction > 0.5 || (fraction == 0.5 && std::fmod(lower, 2.0) != 0));
+            return std::copysign(rounded, value);
+        }
+    }
+}
+#endif
+
 inline double x87_round(X86Context& ctx, double v) {
+#if defined(X86_COMPACT_MEMORY)
+    return x86_round(v, ctx.fcw >> 10);
+#else
     switch ((ctx.fcw >> 10) & 3) {  // control word RC field
         case 0: return std::nearbyint(v);
         case 1: return std::floor(v);
         case 2: return std::ceil(v);
         default: return std::trunc(v);
     }
+#endif
 }
 
 // out of range gives the integer indefinite value, as the FPU does
@@ -158,6 +203,25 @@ inline uint32_t x87_examine(X86Context& ctx) {
     return 0;
 }
 
+#if defined(X86_COMPACT_MEMORY)
+inline double x87_load80_guest(X86Context& ctx, uint8_t* base, const uint8_t* pointer) {
+    auto& memory = browser::Memory::From(base);
+    const uint32_t address = memory.GuestAddress(ctx, pointer, 10);
+    uint8_t value[10];
+    memory.Read(ctx, address, value, sizeof(value));
+    return x87_load80(value);
+}
+inline void x87_store80_guest(X86Context& ctx, uint8_t* base, uint8_t* pointer, double value) {
+    auto& memory = browser::Memory::From(base);
+    const uint32_t address = memory.GuestAddress(ctx, pointer, 10);
+    uint8_t encoded[10];
+    x87_store80(encoded, value);
+    memory.Write(ctx, address, encoded, sizeof(encoded));
+}
+#define x87_load80(pointer) x87_load80_guest(ctx, base, pointer)
+#define x87_store80(pointer, value) x87_store80_guest(ctx, base, pointer, value)
+#endif
+
 inline float sse_min(float a, float b) { return a < b ? a : b; }
 inline float sse_max(float a, float b) { return a > b ? a : b; }
 
@@ -186,6 +250,15 @@ inline int32_t sse_cvtt(float v) {
     return int32_t(v);
 }
 
+#if defined(X86_COMPACT_MEMORY)
+inline int32_t sse_cvt_guest(X86Context& ctx, float value) {
+    const double rounded = x86_round(value, ctx.mxcsr >> 13);
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0)) { return INT32_MIN; }
+    return int32_t(rounded);
+}
+#define sse_cvt(value) sse_cvt_guest(ctx, value)
+#endif
+
 template <typename T>
 constexpr T sat(int64_t v) {
     constexpr int64_t lo = std::numeric_limits<T>::min(), hi = std::numeric_limits<T>::max();
@@ -208,6 +281,20 @@ inline uint64_t mmx_map2(uint64_t a, uint64_t b, F f) {
 
 // rep movs: element by element semantics, fast path when the ranges cannot interfere
 inline void x86_rep_movs(X86Context& ctx, uint8_t* base, uint32_t w) {
+#if defined(X86_COMPACT_MEMORY)
+    if (w != 1 && w != 2 && w != 4) { throw browser::Fault(ctx, ctx.esi, w, "unsupported rep movs width"); }
+    auto& memory = browser::Memory::From(base);
+    const uint32_t step = ctx.df ? 0u - w : w;
+    while (ctx.ecx) {
+        if (ctx.host) { browser::Runtime::From(ctx).Checkpoint(ctx); }
+        uint32_t value = 0;
+        memory.Read(ctx, ctx.esi, &value, w);
+        memory.Write(ctx, ctx.edi, &value, w);
+        ctx.esi += step;
+        ctx.edi += step;
+        --ctx.ecx;
+    }
+#else
     uint32_t n = ctx.ecx;
     if (!n) return;
     uint32_t bytes = n * w;
@@ -225,9 +312,21 @@ inline void x86_rep_movs(X86Context& ctx, uint8_t* base, uint32_t w) {
         ctx.edi += d;
     }
     ctx.ecx = 0;
+#endif
 }
 
 inline void x86_rep_stos(X86Context& ctx, uint8_t* base, uint32_t w) {
+#if defined(X86_COMPACT_MEMORY)
+    if (w != 1 && w != 2 && w != 4) { throw browser::Fault(ctx, ctx.edi, w, "unsupported rep stos width"); }
+    auto& memory = browser::Memory::From(base);
+    const uint32_t step = ctx.df ? 0u - w : w;
+    while (ctx.ecx) {
+        if (ctx.host) { browser::Runtime::From(ctx).Checkpoint(ctx); }
+        memory.Write(ctx, ctx.edi, &ctx.eax, w);
+        ctx.edi += step;
+        --ctx.ecx;
+    }
+#else
     uint32_t n = ctx.ecx;
     if (!n) return;
     if (!ctx.df && w == 1) {
@@ -243,4 +342,5 @@ inline void x86_rep_stos(X86Context& ctx, uint8_t* base, uint32_t w) {
         ctx.edi += d;
     }
     ctx.ecx = 0;
+#endif
 }

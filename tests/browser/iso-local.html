@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local ISO image preparation contract</title>
+<h1>Local ISO image preparation contract</h1>
+<p>Developer harness only. No guest entry executes. Files remain local. A development manifest is not generation provenance.</p>
+<p><label>Expected manifest <input id="manifest" type="file" accept=".json"></label></p>
+<p><label>Local ISO <input id="iso" type="file" accept=".iso"></label></p>
+<button id="run">Prepare three generations</button>
+<button id="stop" disabled>Stop</button>
+<pre id="output" role="status">Select an expected manifest and a local ISO.</pre>
+<script type="module" src="./iso-local-browser.mjs"></script>
+</html>

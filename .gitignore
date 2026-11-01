@@ -12,6 +12,7 @@
 
 # user's own game files
 /assets/
+/GAMEFILES.md
 
 # runtime files
 scda.toml
@@ -27,3 +28,5 @@ scda.toml
 
 # Local temporary folder
 .local
+
+.DS_Store

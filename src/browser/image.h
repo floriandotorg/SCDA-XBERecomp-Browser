@@ -1,0 +1,88 @@
+#pragma once
+#include "browser/cpu_runtime.h"
+#include "xbe/xbe.h"
+
+namespace browser {
+
+struct ImageLayout {
+  uint32_t base;
+  uint32_t end;
+  uint32_t entry;
+};
+
+struct ImageImport {
+  uint32_t slot;
+  uint32_t ordinal;
+};
+
+struct KernelDataExport {
+  uint32_t ordinal;
+  uint32_t address;
+  uint32_t size;
+};
+
+enum class ImportKind { Missing, Function, Data, FunctionTrap, DataGuard };
+
+struct UnsupportedImport : Fault {
+  uint32_t ordinal;
+  UnsupportedImport(const X86Context& context, uint32_t ordinal)
+    : Fault(context, ordinal, 0, "unsupported kernel function called"), ordinal(ordinal) {}
+};
+
+struct BoundImport {
+  uint32_t slot;
+  uint32_t ordinal;
+  ImportKind kind;
+  uint32_t target;
+};
+
+struct ImageThread {
+  uint32_t id;
+  uint32_t kpcr;
+  uint32_t ethread;
+  uint32_t stackLimit;
+  uint32_t stackTop;
+  uint32_t tls;
+  uint32_t tlsData;
+  X86Context context;
+};
+
+struct PreparedImage {
+private:
+  std::shared_ptr<const xbe::Image> authenticatedSource_;
+  friend std::unique_ptr<PreparedImage> PrepareImage(std::vector<uint8_t> authenticatedBytes, ImageLayout layout);
+public:
+  std::shared_ptr<const xbe::Image> AuthenticatedSource() const { return authenticatedSource_; }
+  xbe::Image image;
+  std::unique_ptr<Memory> memory;
+  std::vector<ImageImport> imports;
+  std::vector<BoundImport> boundImports;
+  std::vector<BoundImport> diagnosticImports;
+  bool importsBound = false;
+  Runtime* boundRuntime = nullptr;
+  Runtime* diagnosticRuntime = nullptr;
+  mutable std::mutex threadLock;
+  std::mutex dpcDeliveryLock;
+  std::vector<ImageThread> threads;
+  std::vector<uint8_t> tlsTemplate;
+  std::vector<uint32_t> tlsCallbacks;
+};
+
+std::unique_ptr<PreparedImage> PrepareImage(std::vector<uint8_t> authenticatedBytes, ImageLayout layout);
+std::vector<BoundImport> InspectImageImports(PreparedImage& prepared, Runtime& runtime, std::span<const KernelDataExport> dataExports);
+void BindImageImports(PreparedImage& prepared, Runtime& runtime, std::span<const KernelDataExport> dataExports);
+struct ImageExecution {
+  bool entered = false;
+  bool returned = false;
+  X86Context context{};
+};
+
+void ExecuteImageEntry(PreparedImage& prepared, Runtime& runtime, ImageExecution& execution);
+uint32_t ImageExecutionThreadId(const PreparedImage& prepared, const ImageExecution& execution);
+void DeclareDiagnosticImport(PreparedImage& prepared, Runtime& runtime, uint32_t ordinal, bool data);
+uint32_t DiagnosticDataOrdinal(const PreparedImage& prepared, uint32_t address);
+ImageThread PrepareImageThread(PreparedImage& prepared, Runtime& runtime, uint32_t id, uint32_t stackSize);
+void LaunchImageThread(PreparedImage& prepared, Runtime& runtime, const X86Context& parent, uint32_t id,
+  uint32_t stackSize, const std::function<void(const ImageThread&)>& launch);
+
+}

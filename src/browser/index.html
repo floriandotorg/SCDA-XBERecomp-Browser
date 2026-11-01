@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SCDA browser compilation diagnostic</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { max-width: 72rem; margin: 3rem auto; padding: 0 1.5rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; background: #20242b; }
+    button { font: inherit; padding: .6rem 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Story compilation diagnostic</h1>
+  <p>This module retains generated code but never starts the game. No game assets are served.</p>
+  <h2>Browser capabilities</h2>
+  <pre id="capabilities"></pre>
+  <h2>Module</h2>
+  <p id="status" role="status">Loading diagnostic</p>
+  <pre id="output"></pre>
+  <button id="placeholder" disabled>Test unavailable guest service</button>
+  <script type="module" src="./diagnostic.mjs"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local ISO reader contracts</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { max-width: 64rem; margin: 3rem auto; padding: 0 1.5rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>Local ISO reader contracts</h1>
+  <p>Synthetic bytes only. This tests independent file completion, not disc validation or game boot.</p>
+  <p id="status" role="status">Checking browser capabilities</p>
+  <pre id="output"></pre>
+  <script type="module" src="./iso-browser.mjs"></script>
+</body>
+</html>

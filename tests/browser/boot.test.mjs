@@ -1,0 +1,230 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { inventedImage } from './image-fixture.mjs';
+import { syntheticDisc } from './iso-wasm-fixture.mjs';
+import { createBootSession } from '../../src/browser/boot-session.mjs';
+import { createIsoMailbox } from '../../src/browser/iso-mailbox.mjs';
+
+const directory = resolve('out/boot-tests');
+mkdirSync(directory, { recursive: true });
+
+test('boot owner pairs retained dispatch and image, rejects missing exports and resets isolated sessions', async () => {
+  const identity = 'c3'.repeat(32);
+  writeFileSync(`${directory}/build_identity.h`, `#pragma once\n#define BROWSER_BUILD_ID "${identity}"\n`);
+  writeFileSync(`${directory}/image_symbols.h`, '#pragma once\n#define SYM_XNetStartup 00011040\n#define SYM_WSAStartup 00011080\n#define SYM_Direct3D_CreateDevice 000110C0\n#define SYM_D3D_Device 00020000\n#define SYM_D3D_pDevice 00023000\n#define SYM_D3D_InitDefaultState 00011000\n');
+  writeFileSync(`${directory}/metadata.cpp`, `#include "browser/cpu_runtime.h"
+#include "cpu/x86_ops.h"
+#include <cstring>
+X86_FUNC(sub_00011040);
+X86_FUNC(sub_00011080);
+X86_FUNC(sub_000110C0);
+X86_FUNC(__imp__sub_000110C0) { ctx.esp += 28; }
+X86_FUNC(__imp__sub_00011040) { ctx.esp += 8; }
+X86_FUNC(__imp__sub_00011080) { ctx.esp += 12; }
+const auto entry = [](X86Context& context, uint8_t* base) {
+  auto& memory = browser::Memory::From(base);
+  memory.Read(context, 0x120f0, &context.ebx, 4);
+  if (context.ebx != 0xc0000010) { throw std::runtime_error("incorrect launch data cell target"); }
+  memory.Read(context, context.ebx, &context.eax, 4);
+  if (context.eax) { throw std::runtime_error("cold boot launch page is not null"); }
+  const uint32_t launchPage = 0x12345000;
+  memory.Write(context, context.ebx, &launchPage, 4);
+  memory.Read(context, context.ebx, &context.ecx, 4);
+  if (context.ecx != launchPage) { throw std::runtime_error("launch data cell is not writable"); }
+  uint32_t cacheCountAddress = 0, cacheCount = 0;
+  memory.Read(context, 0x12138, &cacheCountAddress, 4);
+  memory.Read(context, cacheCountAddress, &cacheCount, 4);
+  if (cacheCount != 1) { throw std::runtime_error("cache partition count does not match owned virtual backing"); }
+  uint32_t imageNameAddress = 0, imageName[2] = {};
+  memory.Read(context, 0x12154, &imageNameAddress, 4);
+  memory.Read(context, imageNameAddress, imageName, sizeof(imageName));
+  constexpr char expectedName[] = "\\\\Device\\\\CdRom0\\\\default.xbe";
+  char storedName[sizeof(expectedName)] = {};
+  if (imageName[0] != ((sizeof(expectedName) << 16) | (sizeof(expectedName) - 1))) {
+    throw std::runtime_error("image file name descriptor is invalid");
+  }
+  memory.Read(context, imageName[1], storedName, sizeof(storedName));
+  if (std::memcmp(storedName, expectedName, sizeof(storedName))) { throw std::runtime_error("image file name is outside the mounted optical namespace"); }
+  uint32_t tickAddress = 0, beforeTick = 0, afterTick = 0;
+  memory.Read(context, 0x1215c, &tickAddress, 4);
+  memory.Read(context, tickAddress, &beforeTick, 4);
+  std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  browser::Runtime::From(context).Poll(context, base);
+  memory.Read(context, tickAddress, &afterTick, 4);
+  if (afterTick == beforeTick) { throw std::runtime_error("session tick count did not advance without armed timers"); }
+  const uint32_t savedStack = context.esp;
+  context.esp -= 12;
+  const std::array<uint32_t, 3> sdkFrame = {0x11020, 0x202, 0};
+  memory.Write(context, context.esp, sdkFrame.data(), sizeof(sdkFrame));
+  sub_00011040(context, base);
+  context.esp = savedStack - 12;
+  sub_00011080(context, base);
+  context.esp = savedStack + 8;
+};
+const X86FuncMapping X86FuncMappings[] = {{0x11000, entry}, {0x11040, sub_00011040}, {0x11080, sub_00011080}, {0x110c0, sub_000110C0}, {0, nullptr}};
+const uint32_t X86Continuations[] = {0};
+const uint32_t X86ImageBase = 0x10000, X86ImageEnd = 0x13000, X86EntryPoint = 0x11000;
+`);
+  const build = spawnSync('em++', ['-std=c++20', '-O1', '-pthread', '-fwasm-exceptions', '-DX86_COMPACT_MEMORY', '-Isrc', `-I${directory}`,
+    'src/browser/boot-wasm.cpp', 'src/browser/disc-wasm.cpp', 'src/kernel/disc_index.cpp',
+    'src/browser/image.cpp', 'src/browser/sdk-provider.cpp', 'src/browser/diagnostic-graphics.cpp', 'src/browser/silent-audio.cpp', 'src/browser/kernel-provider.cpp', 'src/browser/thread-provider.cpp', 'src/browser/platform-profile.cpp', 'src/browser/shutdown-provider.cpp', 'src/browser/dpc-provider.cpp', 'src/browser/timer-provider.cpp', 'src/browser/cpu_runtime.cpp', 'src/browser/virtual-memory.cpp', 'src/browser/contiguous-memory.cpp', 'src/browser/string-provider.cpp', 'src/browser/section-provider.cpp', 'src/browser/file-provider.cpp', 'src/browser/temporary-filesystem.cpp', 'src/browser/raw-cache.cpp', 'src/browser/cache-fatx.cpp', 'src/kernel/crypto.cpp', `${directory}/metadata.cpp`,
+    '--no-entry', '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=node', '-sFILESYSTEM=0',
+    '-sINITIAL_MEMORY=134217728', '-sALLOW_MEMORY_GROWTH=1', '-sEXPORTED_RUNTIME_METHODS=HEAPU8', '-o', `${directory}/boot.mjs`,
+  ], { encoding: 'utf8', timeout: 120000, env: { ...process.env, TMPDIR: directory } });
+  assert.equal(build.status, 0, build.stderr);
+  const { default: create } = await import(pathToFileURL(`${directory}/boot.mjs`));
+  const fixture = syntheticDisc();
+  const discBytes = new Uint8Array(await fixture.arrayBuffer());
+  const module = await create({ readIsoBytes: (offset, destination, length) => {
+    module.HEAPU8.set(discBytes.subarray(offset, offset + length), destination);
+    return length;
+  } });
+  const compiledIdentity = () => {
+    const start = module._boot_build_identity() >>> 0;
+    assert.equal(module._boot_build_identity_size(), 64);
+    return new TextDecoder().decode(module.HEAPU8.subarray(start, start + 64));
+  };
+  assert.equal(compiledIdentity(), identity);
+  const ownership = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.store(ownership, 0, 1);
+  const messages = [];
+  let closed = false;
+  await createBootSession({
+    create: async () => module,
+    manifest: { identity: 'd4'.repeat(32) },
+    prepare: async () => { assert.fail('A mixed build must not prepare an image'); },
+    postMessage: (message) => messages.push(message),
+  })({ data: { ownership, generation: 1, mailbox: createIsoMailbox(), size: fixture.size, port: { close: () => { closed = true; } } } });
+  assert.equal(messages[0].code, 'BUILD_IDENTITY');
+  assert.equal(closed, true);
+  assert.equal(module._image_sections(), 0);
+  const find = () => {
+    const path = new TextEncoder().encode('default.xbe');
+    module.HEAPU8.set(path, module._validation_path());
+    return module._validation_find(path.length);
+  };
+  assert.equal(module._mount_disc(fixture.size), 1);
+  assert.equal(find(), 1);
+  assert.equal(module._validation_size(), 7);
+  assert.equal(module._validation_read(5, 10), 2);
+  assert.deepEqual([...module.HEAPU8.slice(module._validation_buffer(), module._validation_buffer() + 2)], [60, 70]);
+  for (const size of [NaN, Infinity, -1, 0.5, 2 ** 53]) {
+    assert.equal(module._mount_disc(size), 0);
+    assert.equal(find(), 0);
+  }
+  const prepare = (entry = 0x11000) => {
+    const bytes = inventedImage();
+    const address = module._image_allocate(bytes.length);
+    module.HEAPU8.set(bytes, address);
+    return module._image_prepare(0x10000, 0x13000, entry);
+  };
+  assert.equal(module._image_bind(), 0);
+  assert.equal(prepare(0x11010), 0);
+  for (let n = 0; n < 3; ++n) {
+    assert.equal(prepare(), 1);
+    assert.equal(module._image_sections(), 2);
+    assert.equal(module._image_disc_reads_words(), 8);
+    assert.deepEqual(Array.from({ length: 8 }, (_, index) => module._image_disc_reads_word(index)), Array(8).fill(0));
+    assert.equal(module._image_entry_mapped(), 1);
+    assert.equal(module._image_imports(), 1);
+    assert.equal(module._image_bind(), 0);
+    assert.equal(module._image_coverage_count(), 1);
+    assert.equal(module._image_coverage_slot(0), 0x12040);
+    assert.equal(module._image_coverage_ordinal(0), 1);
+    assert.equal(module._image_coverage_target(0), 0);
+    assert.equal(module._image_coverage_kind(0), 0);
+    assert.equal(module._image_coverage_ordinal(1), 0);
+    assert.equal(module._image_fault_ordinal(), 1);
+    assert.equal(module._image_bound(), 0);
+    assert.equal(module._image_active_workers(), 0);
+    module._image_reset();
+    assert.equal(compiledIdentity(), identity);
+    assert.equal(module._image_sections(), 0);
+    assert.equal(module._image_coverage_count(), 0);
+    assert.equal(module._image_trace_count(), 0);
+    assert.equal(module._image_trace_word(0, 0), 0);
+    assert.equal(module._image_sdk_trace_count(), 0);
+    assert.equal(module._image_sdk_trace_word(0, 0), 0);
+    assert.deepEqual(Array.from({ length: 6 }, (_, field) => module._image_graphics_info(field)), Array(6).fill(0));
+    assert.deepEqual(Array.from({ length: 10 }, (_, field) => module._image_audio_info(field)), Array(10).fill(0));
+    assert.equal(module._image_graphics_checkpoint(), 0);
+    assert.equal(module._image_graphics_event_word(0, 0), 0);
+    assert.equal(module._image_graphics_resource_word(0, 0), 0);
+    assert.equal(module._image_disc_reads_words(), 0);
+    assert.deepEqual(Array.from({ length: 8 }, (_, index) => module._image_disc_reads_word(index)), Array(8).fill(0));
+    assert.equal(module._image_entry_mapped(), 0);
+    assert.equal(module._image_fault_ordinal(), 0);
+  }
+  const supported = new Uint8Array(0x800);
+  supported.set(inventedImage());
+  const imports = new DataView(supported.buffer);
+  imports.setUint32(0x288, 0x200, true);
+  imports.setUint32(0x158, 0x120a0 ^ 0x5b6d40b6, true);
+  imports.setUint32(0x60c, 0, true);
+  for (const [n, ordinal] of [277, 291, 294, 161, 252, 253, 129, 15, 17, 23, 301, 24, 346, 340, 322, 324, 47, 107, 113, 184, 164, 165, 171, 178, 289, 279, 67, 190, 202, 211, 218, 236, 255, 187, 258, 149, 327, 328, 40, 219, 196, 128, 200, 203, 215, 326, 217, 156, 126, 323, 181, 41, 42, 335, 336, 337, 338, 339, 166, 226, 199, 2, 356, 0].entries()) {
+    imports.setUint32(0x6a0 + n * 4, ordinal ? 0x80000000 + ordinal : 0, true);
+  }
+  for (let n = 0; n < 3; ++n) {
+    const address = module._image_allocate(supported.length);
+    module.HEAPU8.set(supported, address);
+    assert.equal(module._image_prepare(0x10000, 0x13000, 0x11000), 1);
+    assert.deepEqual(Array.from({ length: 10 }, (_, field) => module._image_audio_info(field)), [48000, 6, 48000, 0, 0, 0, 0, 0, 0, 0]);
+    assert.equal(module._image_declare_import(322, 0), 0);
+    assert.equal(module._image_declare_import(324, 0), 0);
+    assert.equal(module._image_declare_import(164, 0), 0);
+    assert.equal(module._image_declare_import(322, 1), 1);
+    assert.equal(module._image_declare_import(324, 1), 1);
+    assert.equal(module._image_bind(), 1);
+    assert.equal(module._image_bound(), 1);
+    assert.equal(module._image_coverage_count(), 63);
+    for (let n = 0; n < 63; ++n) {
+      const ordinal = module._image_coverage_ordinal(n);
+      if (ordinal === 40 || ordinal === 326 || ordinal === 156 || ordinal === 323 || ordinal === 41 || ordinal === 42 || ordinal === 356) {
+        assert.equal(module._image_coverage_kind(n), 2);
+        assert.notEqual(module._image_coverage_target(n) >>> 0, 0);
+      } else if (ordinal === 322 || ordinal === 324 || ordinal === 164) {
+        assert.equal(module._image_coverage_kind(n), 2);
+        const target = ordinal === 322 ? 0xc0000000 : ordinal === 324 ? 0xc0000008 : 0xc0000010;
+        assert.equal(module._image_coverage_target(n) >>> 0, target);
+      } else {
+        assert.equal(module._image_coverage_kind(n), 1);
+        assert.equal(module._image_coverage_target(n) >>> 0, 0xfe000000 + ordinal * 4);
+      }
+    }
+    assert.equal(typeof module._image_progress_address, 'function');
+    const progressAddress = module._image_progress_address() >>> 0;
+    assert.ok(progressAddress > 0 && progressAddress <= module.HEAPU8.byteLength - 4);
+    assert.equal(progressAddress % 4, 0);
+    const progress = new Uint32Array(module.HEAPU8.buffer, progressAddress, 1);
+    const beforeExecution = Atomics.load(progress, 0);
+    assert.equal(module._image_sdk_trace_count(), 0);
+    assert.equal(module._image_execute(), 1);
+    assert.equal(module._image_sdk_trace_count(), 2);
+    assert.equal(module._image_sdk_trace_word(0, 4), 1);
+    assert.equal(module._image_sdk_trace_word(1, 4), 2);
+    assert.equal(module._image_sdk_trace_word(0, 8), 0x11020);
+    assert.equal(module._image_sdk_trace_word(1, 9), 2);
+    assert.equal(module._image_sdk_trace_word(1, 12), 0x202);
+    assert.equal(module._image_sdk_trace_word(2, 4), 0);
+    assert.equal(module._image_sdk_trace_word(0, 10), 1);
+    assert.equal(module._image_sdk_trace_word(1, 10), 0);
+    assert.equal(module._image_sdk_trace_word(0, 31), 0);
+    assert.notEqual(Atomics.load(progress, 0), beforeExecution);
+    assert.equal(module._image_entered(), 1);
+    assert.equal(module._image_returned(), 1);
+    assert.equal(module._image_active_workers(), 0);
+    assert.equal(module._image_fault_ordinal(), 0);
+    assert.equal(module._image_declare_import(164, 1), 0);
+    assert.equal(module._image_bind(), 0);
+    module._image_reset();
+    assert.equal(module._image_audio_info(0), 0);
+    assert.equal(module._image_graphics_checkpoint(), 0);
+  }
+  assert.equal(prepare(), 1);
+  assert.equal(module._image_allocate(0), 0);
+  assert.equal(module._image_sections(), 0);
+});

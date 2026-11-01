@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Story boot</title>
+  <style>
+    :root { color-scheme: light dark; font: 1rem/1.6 system-ui, sans-serif; }
+    body { max-width: 44rem; margin: 4rem auto; padding: 0 1.5rem; }
+    h1 { line-height: 1.2; }
+    label { display: block; font-weight: 600; margin-bottom: .5rem; }
+    input { display: block; max-width: 100%; }
+    button, input::file-selector-button { font: inherit; padding: .6rem 1rem; }
+    button { margin-right: .5rem; }
+    :focus-visible { outline: 3px solid Highlight; outline-offset: 4px; }
+    #detail { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Story boot</h1>
+    <p>Select your local ISO. The file stays on this device and is read only. Executable identity and story requirements come from this build.</p>
+    <label for="iso">Select ISO</label>
+    <input id="iso" type="file" accept=".iso,application/x-iso9660-image" aria-describedby="selected privacy">
+    <p id="selected">No ISO selected.</p>
+    <p id="privacy">Selection is kept only for this page session. Stop preserves it for another attempt.</p>
+    <p>Cache, profile, and save storage is temporary and discarded when you select Stop or reload the page. Durable saves are not available yet. The selected ISO remains read only.</p>
+    <div role="group" aria-label="Guest controls">
+      <button id="boot" type="button" disabled>Boot</button>
+      <button id="stop" type="button" disabled>Stop</button>
+    </div>
+    <p id="status" role="status" aria-live="polite" aria-atomic="true">Select an ISO to begin.</p>
+    <p id="detail" role="alert" aria-atomic="true"></p>
+    <p>Diagnostic entry execution is not proof of a complete game boot. Unsupported guest services are reported as errors.</p>
+    <noscript>JavaScript is required to boot a selected ISO.</noscript>
+  </main>
+  <script type="module">
+    import { mountBootShell } from './boot-shell.mjs';
+    const shell = mountBootShell();
+    addEventListener('pagehide', () => { void shell.dispose(); }, { once: true });
+  </script>
+</body>
+</html>

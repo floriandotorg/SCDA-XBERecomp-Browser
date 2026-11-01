@@ -1,7 +1,15 @@
 # Splinter Cell: Double Agent (original Xbox), statically recompiled
 
 cmake_minimum_required(VERSION 3.25)
-project(scda LANGUAGES C CXX RC)
+project(scda LANGUAGES C CXX)
+
+option(RECOMP_ONLY "Build only the XBE recompiler" OFF)
+option(BROWSER_BUILD "Build the isolated story Wasm diagnostic" OFF)
+
+if(BROWSER_BUILD)
+    add_subdirectory(tools/browser)
+    return()
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +20,23 @@ set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(zydis GIT_REPOSITORY https://github.com/zyantific/zydis.git GIT_TAG v4.1.1 GIT_SHALLOW TRUE)
 FetchContent_Declare(tomlplusplus GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git GIT_TAG v3.4.0 GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(zydis tomlplusplus)
+
+set(COMPILER_DIR ${CMAKE_BINARY_DIR}/compiler)
+
+file(GLOB RECOMP_SOURCES CONFIGURE_DEPENDS tools/recomp/*.cpp)
+add_executable(xbe_recomp ${RECOMP_SOURCES})
+set_target_properties(xbe_recomp PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${COMPILER_DIR})
+target_include_directories(xbe_recomp PRIVATE src tools/recomp)
+target_compile_definitions(xbe_recomp PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(xbe_recomp PRIVATE Zydis tomlplusplus::tomlplusplus)
+
+if(RECOMP_ONLY)
+    return()
+endif()
+
+enable_language(RC)
+
 FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.91.0 GIT_SHALLOW TRUE)
 # SDL3 for controllers and the headset's audio, static so it links into the exe
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
@@ -29,13 +54,12 @@ set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
 set(OPUS_STACK_PROTECTOR OFF CACHE BOOL "" FORCE)
 set(OPUS_FORTIFY_SOURCE OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(opus GIT_REPOSITORY https://github.com/xiph/opus.git GIT_TAG v1.5.2 GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3 opus)
+FetchContent_MakeAvailable(imgui SDL3 opus)
 
 file(GLOB RECOMP_CONFIGS CONFIGURE_DEPENDS config/*.toml)
 
 # What the game needs to build its code on the player's PC (src/app/game_code.cpp), beside the executables: the
 # recompiler, clang and lld from the toolchain building this, the configs and the headers the generated code includes
-set(COMPILER_DIR ${CMAKE_BINARY_DIR}/compiler)
 get_filename_component(LLVM_BIN ${CMAKE_CXX_COMPILER} DIRECTORY)
 file(GLOB COMPILER_HEADERS CONFIGURE_DEPENDS src/cpu/x86_ops.h src/cpu/x86_context.h)
 file(GLOB FREESTANDING_HEADERS CONFIGURE_DEPENDS src/cpu/freestanding/*)
@@ -49,14 +73,6 @@ add_custom_target(compiler_files ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FREESTANDING_HEADERS} ${COMPILER_DIR}/include/freestanding
     VERBATIM)
 
-# x86 to C++ recompiler
-file(GLOB RECOMP_SOURCES CONFIGURE_DEPENDS tools/recomp/*.cpp)
-add_executable(xbe_recomp ${RECOMP_SOURCES})
-set_target_properties(xbe_recomp PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${COMPILER_DIR})
-target_include_directories(xbe_recomp PRIVATE src tools/recomp)
-target_compile_definitions(xbe_recomp PRIVATE _CRT_SECURE_NO_WARNINGS)
-target_link_libraries(xbe_recomp PRIVATE Zydis tomlplusplus::tomlplusplus)
-
 set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -66,7 +82,7 @@ set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp)
 
 file(GLOB HOST_SOURCES CONFIGURE_DEPENDS src/*/*.cpp)
-list(FILTER HOST_SOURCES EXCLUDE REGEX "/src/(game|versus)/")
+list(FILTER HOST_SOURCES EXCLUDE REGEX "/src/(browser|game|versus)/")
 # SDL's and Opus's headers go to the input, gyro and voice code alone (both are linked LINK_ONLY)
 set_source_files_properties(src/core/input.cpp src/core/gyro.cpp src/audio/voice.cpp src/audio/voice_link.cpp
     PROPERTIES

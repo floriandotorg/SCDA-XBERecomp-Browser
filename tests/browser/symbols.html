@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Wasm symbol dispatch proof</title></head>
+<body>
+  <h1>Wasm symbol dispatch proof</h1>
+  <pre id="output">Loading</pre>
+  <script type="module">
+    import create from './dispatch.mjs';
+    const output = document.querySelector('#output');
+    output.textContent = '';
+    try {
+      await create({ print: (text) => { output.textContent += `${text}\n`; } });
+    } catch (error) {
+      output.textContent += String(error);
+    }
+  </script>
+</body>
+</html>

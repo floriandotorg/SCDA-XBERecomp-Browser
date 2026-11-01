@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Full CPU contracts</title>
+<pre id="result">Running complete story metadata CPU contracts</pre>
+<script type="module">
+import create from './cpu_contracts.mjs';
+const result = document.querySelector('#result');
+window.fullCpuEvidence = { isolated: crossOriginIsolated, lines: [], heartbeats: 0, guestHeartbeats: 0, working: false, exit: null };
+const heartbeat = setInterval(() => {
+  ++window.fullCpuEvidence.heartbeats;
+  if (window.fullCpuEvidence.working) { ++window.fullCpuEvidence.guestHeartbeats; }
+}, 10);
+if (!crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') {
+  clearInterval(heartbeat);
+  result.textContent = 'CPU error: cross origin isolation required';
+} else {
+  const timeout = setTimeout(() => { result.textContent = 'CPU error: worker completion timeout'; }, 30000);
+  const print = text => {
+    if (text === 'cpu-work-begin') { window.fullCpuEvidence.working = true; }
+    if (text.startsWith('cpu-runtime-ok')) { window.fullCpuEvidence.working = false; }
+    window.fullCpuEvidence.lines.push(text);
+    result.textContent = window.fullCpuEvidence.lines.join('\n');
+  };
+  create({ print, printErr: print, onExit: status => { clearTimeout(timeout); clearInterval(heartbeat); window.fullCpuEvidence.exit = status; } })
+    .catch(error => { clearTimeout(timeout); clearInterval(heartbeat); result.textContent = 'CPU error: ' + error; });
+}
+</script>
