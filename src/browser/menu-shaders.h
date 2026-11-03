@@ -17,6 +17,7 @@ struct alignas(16) ShaderConstants {
   std::array<std::array<float, 4>, 4> texsize{};
   std::array<float, 16> wvp{};
   std::array<std::array<float, 16>, 4> tm{};
+  std::array<std::array<float, 4>, 18> pc{};
 };
 
 struct ShaderResult {

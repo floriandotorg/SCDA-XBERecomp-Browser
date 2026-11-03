@@ -30,7 +30,7 @@ void InvokeDispatcherWait(DispatcherHandles& handles, Memory& memory, X86Context
   ReadWords(memory, ctx, ctx.esp, std::span(frame.data(), arguments + 1));
   const uint32_t alertable = frame[arguments - 1] & 0xFF;
   if (alertable) { throw Fault(ctx, 0, 0, "alertable guest waits are not implemented"); }
-  if (ordinal != 233 && frame[arguments - 2] > 1) { throw Fault(ctx, 0, 0, "invalid guest wait processor mode"); }
+  if (ordinal != 233 && (frame[arguments - 2] & 0xFF) > 1) { throw Fault(ctx, 0, 0, "invalid guest wait processor mode"); }
   std::array<uint32_t, 64> guestHandles{};
   size_t count = 1;
   auto mode = Dispatcher::WaitMode::Any;

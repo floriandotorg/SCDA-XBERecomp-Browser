@@ -48,6 +48,36 @@ test('menu services use only completed genuine Present events to activate host r
   assert.equal(harness.events.filter((event) => event[0] === 'presented').length, 2);
 });
 
+test('guest render diagnostics reach the host without becoming validation errors or consuming the outcome', async () => {
+  const harness = fixture();
+  const services = await harness.start();
+  const guest = { generation: 3, ok: false, code: 'GUEST_FAULT', graphics: { renderedFrames: 0, state: { vertex: { program: [1, 2, 3, 4] } } } };
+  assert.equal(services.handle(guest), false);
+  assert.deepEqual(harness.events.find((event) => event[0] === 'diagnostic'), ['diagnostic', { guest }]);
+  assert.equal(harness.events.some((event) => event[0] === 'report'), false);
+  const invalidGraphics = { generation: 3, code: 'GRAPHICS_PROTOCOL', fileOpens: [{ status: 0xc0000033 }] };
+  assert.equal(services.handle(invalidGraphics), false);
+  assert.deepEqual(harness.events.filter((event) => event[0] === 'diagnostic')[1], ['diagnostic', { guest: invalidGraphics }]);
+  harness.retire();
+  services.handle(guest);
+  assert.equal(harness.events.filter((event) => event[0] === 'diagnostic').length, 2);
+  await services.dispose();
+});
+
+test('owned Wasm abort diagnostics survive without graphics or a successful Present', async () => {
+  const harness = fixture();
+  const services = await harness.start();
+  const guest = { generation: 3, ok: false, code: 'WASM_ABORT', message: 'synthetic abort',
+    wasmDiagnostics: { abortReason: 'synthetic abort', caughtMessage: 'unreachable', stderr: ['synthetic stderr'], stderrTruncated: false } };
+  assert.equal(services.handle(guest), false);
+  assert.deepEqual(harness.events.filter((event) => event[0] === 'diagnostic'), [['diagnostic', { guest }]]);
+  assert.equal(harness.events.some((event) => event[0] === 'report' || event[0] === 'presented'), false);
+  harness.retire();
+  services.handle(guest);
+  assert.equal(harness.events.filter((event) => event[0] === 'diagnostic').length, 1);
+  await services.dispose();
+});
+
 test('abort during service initialization wakes and disposes its owned service', async () => {
   const harness = fixture(new Promise(() => {}));
   const starting = harness.start();

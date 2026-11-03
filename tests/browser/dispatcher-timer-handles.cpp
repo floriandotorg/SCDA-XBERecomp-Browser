@@ -221,7 +221,7 @@ const auto contracts = [] {
     handles.Close(timer);
   }
   {
-    std::array<uint32_t, 128> timers{};
+    std::array<uint32_t, browser::kDispatcherCapacity> timers{};
     timers[0] = handles.CreateTimer(false);
     for (size_t n = 1; n < timers.size(); ++n) { timers[n] = handles.Duplicate(timers[0]); }
     fault([&] { handles.CreateTimer(true); }, "timer creation observes handle budget before object allocation");
@@ -235,7 +235,7 @@ const auto contracts = [] {
     fault([&] { handles.CreateTimer(false); }, "closed but pinned timer still consumes object budget");
     dispatcher.AdvanceTime(100);
     waiter.join();
-    check(status == 0 && dispatcher.ActiveObjects() == 127, "expiry releases pinned timer capacity");
+    check(status == 0 && dispatcher.ActiveObjects() == browser::kDispatcherCapacity - 1, "expiry releases pinned timer capacity");
     timers.back() = handles.CreateTimer(false);
     for (const auto handle : timers) { handles.Close(handle); }
     dispatcher.AdvanceTime(100);

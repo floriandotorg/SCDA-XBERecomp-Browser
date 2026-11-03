@@ -27,6 +27,7 @@ public:
     uint64_t submittedCommands = 0;
     uint64_t completedCommands = 0;
     uint64_t presentedFrames = 0;
+    std::string storageViewFailure;
   };
   SnapshotData Snapshot() const;
   bool Init(uint32_t width, uint32_t height) override;
@@ -49,6 +50,7 @@ public:
   bool Busy(uint32_t resource) override;
   void WaitResource(uint32_t resource) override;
   void WaitGpuFrame(uint64_t frame) override;
+  bool ReleaseResource(uint32_t header, uint32_t data) override;
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

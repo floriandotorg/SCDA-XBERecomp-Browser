@@ -1,5 +1,6 @@
 import { createWasmIsoReader } from './iso-wasm.mjs';
 import { prepareDiscImage } from './iso-image.mjs';
+import { readMenuStateDiagnostic, readMenuFileDiagnostics } from './menu-state-report.mjs';
 
 const requireBuildIdentity = (module, manifest) => {
   const reject = () => {
@@ -17,6 +18,28 @@ const requireBuildIdentity = (module, manifest) => {
       new TextDecoder().decode(module.HEAPU8.slice(start, start + size)) !== manifest.identity) {
     reject();
   }
+};
+
+const threadSession = (module, signal) => {
+  if (typeof module._image_thread_session_word !== 'function') { return null; }
+  const reject = () => {
+    throw Object.assign(new Error('Invalid bounded provider child thread session snapshot.'), { code: 'THREAD_SESSION_PROTOCOL' });
+  };
+  const words = Array.from({ length: 9 }, (_, field) => {
+    signal.throwIfAborted();
+    const value = module._image_thread_session_word(field);
+    signal.throwIfAborted();
+    if (!Number.isInteger(value) || value < -0x80000000 || value > 0xffffffff) { reject(); }
+    return value >>> 0;
+  });
+  const [childrenCreated, childrenCompleted, handlesClosed, childrenSuspended, objectReferences] = words;
+  const wide = field => BigInt(words[field]) | (BigInt(words[field + 1]) << 32n);
+  const requestedStackBytes = wide(5), committedBytes = wide(7);
+  if (childrenCreated > 127 || childrenCompleted > childrenCreated || handlesClosed > childrenCreated ||
+      childrenSuspended > childrenCreated || objectReferences > 130048 ||
+      requestedStackBytes > 112n * 1024n * 1024n || committedBytes > 112n * 1024n * 1024n) { reject(); }
+  return { scope: 'provider-children-excluding-initial-thread', childrenCreated, childrenCompleted, handlesClosed, childrenSuspended, objectReferences,
+    requestedStackBytes: requestedStackBytes.toString(), committedBytes: committedBytes.toString() };
 };
 
 const kernelCalls = (module) => {
@@ -53,9 +76,11 @@ const sdkCalls = (module) => {
     const sequence = identifier(0);
     const workerId = identifier(2);
     const id = words[4];
-    const name = [null, 'XNetStartup', 'WSAStartup', 'Direct3D_CreateDevice'][id];
+    const signature = id >= 69 && id <= 72;
+    const name = signature ? (id <= 70 ? 'XCalculateSignatureBegin' : 'XCalculateSignatureEnd') :
+      [null, 'XNetStartup', 'WSAStartup', 'Direct3D_CreateDevice'][id];
     const behavior = ['Original', 'Unavailable', 'Diagnostic'][words[10]];
-    const argumentCount = [0, 1, 2, 6][id];
+    const argumentCount = signature ? (id % 2 ? 1 : 2) : [0, 1, 2, 6][id];
     const presentationCount = id === 3 ? 13 : 0;
     if (!name || !behavior || (words[10] === 1 && id !== 1) || (words[10] === 2 && id !== 3) || sequence <= previous || !workerId ||
         words[9] !== argumentCount || words[11] !== presentationCount ||
@@ -63,6 +88,7 @@ const sdkCalls = (module) => {
     previous = sequence;
     const event = { sequence: sequence.toString(), workerId: workerId.toString(), id, name, behavior,
       fsBase: words[5], threadHandle: words[6], esp: words[7], returnAddress: words[8], arguments: words.slice(12, 12 + argumentCount) };
+    if (signature) { event.phase = id % 2 ? 'entry' : 'return'; }
     if (id === 3) {
       const pp = words.slice(18);
       event.presentation = { width: pp[0], height: pp[1], format: pp[2], count: pp[3], autoDepth: pp[8], depthFmt: pp[9], flags: pp[10], interval: pp[12], raw: pp };
@@ -90,52 +116,79 @@ export const readSilentAudioDiagnostic = (module) => {
 };
 
 export const readGraphicsDiagnostic = (module) => {
-  const reject = () => {
-    throw Object.assign(new Error('Invalid diagnostic graphics snapshot.'), { code: 'GRAPHICS_PROTOCOL' });
+  const reject = (field, value) => {
+    throw Object.assign(new Error(`Invalid diagnostic graphics snapshot: ${field}=${String(value)}.`), { code: 'GRAPHICS_PROTOCOL' });
   };
   if (typeof module._image_graphics_info !== 'function' || typeof module._image_graphics_event_word !== 'function' ||
-      typeof module._image_graphics_resource_word !== 'function') { reject(); }
-  const word = (value) => {
-    if (!Number.isInteger(value) || value < -0x80000000 || value > 0xffffffff) { reject(); }
+      typeof module._image_graphics_resource_word !== 'function') { reject('exports', 'missing'); }
+  const word = (value, field) => {
+    if (!Number.isInteger(value) || value < -0x80000000 || value > 0xffffffff) { reject(field, value); }
     return value >>> 0;
   };
   const wide = (low, high) => BigInt(low) | (BigInt(high) << 32n);
-  const info = Array.from({ length: 6 }, (_, field) => word(module._image_graphics_info(field)));
+  const infoFields = ['initialized', 'total.low', 'total.high', 'eventCount', 'resourceCount', 'commandWords'];
+  const info = infoFields.map((field, index) => word(module._image_graphics_info(index), field));
   const [initialized, low, high, count, resourceCount, commandWords] = info;
   const total = wide(low, high);
-  if (initialized > 1 || count > 64 || resourceCount > 6 || commandWords > 16384 || total < BigInt(count)) { reject(); }
+  if (initialized > 1) { reject('initialized', initialized); }
+  if (count > 64) { reject('eventCount', count); }
+  if (resourceCount > 6) { reject('resourceCount', resourceCount); }
+  if (commandWords > 16384) { reject('commandWords', commandWords); }
+  if (total < BigInt(count)) { reject('total', total); }
   const requests = ['Init', 'Resource', 'Commands', 'Clear', 'Draw', 'Copy', 'Present', 'ReadUnavailable', 'Flush', 'Gamma',
-    'Occlusion', 'FilterShadows', 'ApplyShadows', 'Fence', 'WaitUnavailable', 'Unsupported', 'CpuClear', 'CpuSwap'];
+    'Occlusion', 'FilterShadows', 'ApplyShadows', 'Fence', 'WaitUnavailable', 'Unsupported', 'CpuClear', 'CpuSwap', 'PersistDisplay'];
   let previous = 0n;
   const events = Array.from({ length: count }, (_, index) => {
-    const words = Array.from({ length: 9 }, (_, field) => word(module._image_graphics_event_word(index, field)));
+    const words = Array.from({ length: 9 }, (_, field) => word(module._image_graphics_event_word(index, field), `events[${index}].words[${field}]`));
     const sequence = wide(words[0], words[1]);
     const request = requests[words[2]];
-    if (!request || sequence <= previous || sequence > total) { reject(); }
+    if (!request) { reject(`events[${index}].request`, words[2]); }
+    if (sequence <= previous || sequence > total) { reject(`events[${index}].sequence`, sequence); }
     previous = sequence;
     return { sequence: sequence.toString(), request, arguments: words.slice(3) };
   });
   const resources = Array.from({ length: resourceCount }, (_, index) => {
     const [header, data, bytes, format, size, unavailable] = Array.from({ length: 6 }, (_, field) =>
-      word(module._image_graphics_resource_word(index, field)));
-    if (!header || !data || !bytes || bytes > 0x4000000 || unavailable > 1) { reject(); }
+      word(module._image_graphics_resource_word(index, field), `resources[${index}].words[${field}]`));
+    if (!header) { reject(`resources[${index}].header`, header); }
+    if (!data) { reject(`resources[${index}].data`, data); }
+    if (!bytes || bytes > 0x4000000) { reject(`resources[${index}].bytes`, bytes); }
+    if (unavailable > 1) { reject(`resources[${index}].unavailable`, unavailable); }
     return { header, data, bytes, format, size, unavailable: unavailable === 1 };
   });
   const rendering = module._image_graphics_rendering?.() ?? 0;
-  if (rendering !== 0 && rendering !== 1) { reject(); }
+  if (rendering !== 0 && rendering !== 1) { reject('rendering', rendering); }
   let renderer;
   if (rendering) {
-    if (typeof module._image_renderer_info !== 'function') { reject(); }
-    const words = Array.from({ length: 10 }, (_, field) => word(module._image_renderer_info(field)));
+    if (typeof module._image_renderer_info !== 'function') { reject('renderer.export', 'missing'); }
+    const words = Array.from({ length: 10 }, (_, field) => word(module._image_renderer_info(field), `renderer.words[${field}]`));
     const submitted = wide(words[4], words[5]);
     const completed = wide(words[6], words[7]);
     const presented = wide(words[8], words[9]);
     const resident = wide(words[2], words[3]);
-    if (words[0] > 256 || words[1] > 4096 || resident > 0x4000000n || completed > submitted || presented > completed) { reject(); }
+    if (words[0] > 256) { reject('renderer.pipelineCount', words[0]); }
+    if (words[1] > 4096) { reject('renderer.resourceCount', words[1]); }
+    if (resident > 0x4000000n) { reject('renderer.residentBytes', resident); }
+    if (completed > submitted) { reject('renderer.completedCommands', `${completed}>${submitted}`); }
+    if (presented > submitted) { reject('renderer.renderedFrames', `${presented}>${submitted}`); }
     renderer = { pipelineCount: words[0], resourceCount: words[1], residentBytes: resident.toString(),
       submittedCommands: submitted.toString(), completedCommands: completed.toString(), renderedFrames: presented.toString() };
   }
-  return { mode: rendering ? 'webgpu' : 'diagnostic-cpu', initialized: initialized === 1, renderedFrames: 0, ...renderer, totalEvents: total.toString(),
+  let persistedDisplay;
+  if (typeof module._image_persisted_display_word === 'function') {
+    const words = Array.from({ length: 4 }, (_, field) => word(module._image_persisted_display_word(field), `persistedDisplay[${field}]`));
+    if (words.some(Boolean)) {
+      const pitch = ((words[2] >>> 24) + 1) * 64;
+      const height = ((words[2] >>> 12) & 0xfff) + 1;
+      if (!rendering || (words[0] & 0x70000) !== 0x50000 || !words[1] || !words[3] || words[3] > 0x800000 || words[3] !== pitch * height) {
+        reject('persistedDisplay.bytes', words[3]);
+      }
+      persistedDisplay = { common: words[0], format: words[1], size: words[2], bytes: words[3] };
+    }
+  }
+  return { mode: rendering ? 'webgpu' : 'diagnostic-cpu', initialized: initialized === 1, renderedFrames: 0, ...renderer,
+    ...(persistedDisplay ? { persistedDisplay } : {}),
+    ...(rendering ? { state: readMenuStateDiagnostic(module), fileOpens: readMenuFileDiagnostics(module) } : {}), totalEvents: total.toString(),
     droppedEvents: (total - BigInt(count)).toString(), commandWords, resources, events };
 };
 
@@ -188,6 +241,36 @@ const readLaunchRequest = (module) => {
     data: hasData ? Uint8Array.from({ length: 3072 }, (_, n) => byte(3, n)) : undefined };
 };
 
+export const readMissionDiagnostic = (module) => {
+  if (!module._image_mission_count && !module._image_mission_total_word && !module._image_mission_word) { return undefined; }
+  const reject = () => { throw Object.assign(new Error('Invalid bounded original-dispatch observation.'), { code: 'MISSION_PROTOCOL' }); };
+  if (typeof module._image_mission_count !== 'function' || typeof module._image_mission_total_word !== 'function' ||
+      typeof module._image_mission_word !== 'function') { reject(); }
+  const word = value => {
+    if (!Number.isInteger(value) || value < -0x80000000 || value > 0xffffffff) { reject(); }
+    return value >>> 0;
+  };
+  const wide = (low, high) => BigInt(low) | (BigInt(high) << 32n);
+  const count = module._image_mission_count();
+  const total = wide(word(module._image_mission_total_word(0)), word(module._image_mission_total_word(1)));
+  if (!Number.isInteger(count) || count < 0 || count > 8 || BigInt(count) > total) { reject(); }
+  let previous = 0n;
+  const events = Array.from({ length: count }, (_, n) => {
+    const words = Array.from({ length: 12 }, (_, field) => word(module._image_mission_word(n, field)));
+    const sequence = wide(words[0], words[1]);
+    const workerId = wide(words[2], words[3]);
+    const state = ['Unavailable', 'Malformed', 'ContextMismatch', 'Request'][words[4]];
+    if (sequence <= previous || sequence > total || !workerId || !state || words[5] > 1 || words[6] > 255 || words[7] > 1 ||
+        words[8] > 0x7fffffff || words[9] > 1024 || words[10] > 128 || words[11] > 128 ||
+        (words[5] === 1 && (words[7] !== 1 || !words[9])) || (state === 'Request' && words[5] !== 1)) { reject(); }
+    previous = sequence;
+    return { sequence: sequence.toString(), workerId: workerId.toString(), state, requestObserved: state === 'Request',
+      command: { valid: words[5] === 1, menuPage: words[6], mode: words[7], difficulty: words[8] },
+      commandLength: words[9], mapLength: words[10], profileLength: words[11] };
+  });
+  return { kind: 'original-dispatch-observation', totalEvents: total.toString(), droppedEvents: (total - BigInt(count)).toString(), events };
+};
+
 export const createBootSession = ({ create, manifest, postMessage, prepare = prepareDiscImage, onProgress = () => {} }) => {
   let started = false;
   return async ({ data: { port, mailbox, generation, ownership, size, webgpuMailbox } }) => {
@@ -198,18 +281,41 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
     }
     started = true;
     let module;
+    let execution;
     let ownershipChecked = false;
+    let diagnosticsActive = true;
+    let wasmAborted = false;
+    let abortReason;
+    const stderr = [];
+    const pthreadFailure = [];
+    let stderrTruncated = false;
+    const boundedMessage = (value) => typeof value === 'string' ? value.slice(0, 2048) : undefined;
     const signal = {
       get aborted() { return ownershipChecked && Atomics.load(ownership, 0) !== generation; },
       throwIfAborted() {
         if (this.aborted) { throw new Error('Boot generation was retired.'); }
+        if (wasmAborted) { throw new Error('The WebAssembly runtime aborted.'); }
       },
     };
     try {
       const read = createWasmIsoReader({ port, mailbox, generation, ownership, getHeap: () => module.HEAPU8 });
       ownershipChecked = true;
       signal.throwIfAborted();
-      module = await create({ readIsoBytes: read, ...(webgpuMailbox ? { webgpuMailbox } : {}) });
+      module = await create({
+        readIsoBytes: read, ...(webgpuMailbox ? { webgpuMailbox } : {}),
+        onAbort: (reason) => {
+          if (!diagnosticsActive || signal.aborted || wasmAborted) { return; }
+          wasmAborted = true;
+          abortReason = boundedMessage(reason);
+        },
+        printErr: (text) => {
+          if (!diagnosticsActive || signal.aborted || typeof text !== 'string') { return; }
+          if (text.startsWith('[browser-pthread-crash] ') && pthreadFailure.length < 6) { pthreadFailure.push(text.slice(0, 512)); }
+          if (text.length > 512) { stderrTruncated = true; }
+          if (stderr.length === 16) { stderr.shift(); stderrTruncated = true; }
+          stderr.push(text.slice(0, 512));
+        },
+      });
       signal.throwIfAborted();
       requireBuildIdentity(module, manifest);
       signal.throwIfAborted();
@@ -256,7 +362,6 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
         };
       });
       signal.throwIfAborted();
-      let execution = {};
       if (bound) {
         const address = module._image_progress_address?.();
         const buffer = module.HEAPU8.buffer;
@@ -294,9 +399,19 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
           kernelCalls: kernelCalls(module),
           sdkCalls: sdkCalls(module),
           discReads: discReads(module),
-          graphics: readGraphicsDiagnostic(module),
-          audio: readSilentAudioDiagnostic(module),
+          ...(stderr.some(line => line.startsWith('[browser-memory-fault] ')) ? { wasmDiagnostics: { stderr: [...stderr], stderrTruncated } } : {}),
         };
+        signal.throwIfAborted();
+        execution.threadSession = execution.entryEntered ? threadSession(module, signal) : null;
+        execution.graphics = readGraphicsDiagnostic(module);
+        execution.audio = readSilentAudioDiagnostic(module);
+        const mission = readMissionDiagnostic(module);
+        if (mission) { execution.mission = mission; }
+        const latestMission = mission?.events.at(-1);
+        if (launchRequest && latestMission?.requestObserved && latestMission.command.valid && latestMission.command.mode === 1) {
+          execution.code = 'SINGLE_PLAYER_LAUNCH_REQUEST';
+          execution.message = 'The original single player New Game flow requested a new runtime. Mission execution is not enabled.';
+        }
       }
       signal.throwIfAborted();
       const result = {
@@ -310,10 +425,37 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
       signal.throwIfAborted();
       postMessage(result);
     } catch (error) {
-      postMessage({ ok: false, generation, code: signal.aborted ? 'CANCELLED' : error.code ?? 'BOOT', message: error.message });
+      const diagnostics = !signal.aborted && !wasmAborted && error.code === 'GRAPHICS_PROTOCOL' && execution ? {
+        ...execution, underlyingGuestCode: execution.code, underlyingGuestMessage: execution.message,
+      } : {};
+      if (diagnostics.underlyingGuestCode) {
+        try {
+          const fileOpens = readMenuFileDiagnostics(module);
+          if (fileOpens !== undefined) { diagnostics.fileOpens = fileOpens; }
+        } catch (secondary) {
+          diagnostics.fileOpensError = { code: secondary.code ?? 'BOOT', message: secondary.message };
+        }
+      }
+      const cancelled = signal.aborted;
+      const caughtMessage = boundedMessage(error.message);
+      const wasmDiagnostics = !cancelled && (wasmAborted || stderr.length) ? {
+        ...(abortReason === undefined ? {} : { abortReason }), caughtMessage,
+        stderr: [...stderr], stderrTruncated,
+        ...(pthreadFailure.length ? { pthreadFailure: [...pthreadFailure] } : {}),
+      } : undefined;
+      postMessage({ ...(cancelled ? {} : diagnostics), ok: false, generation,
+        code: cancelled ? 'CANCELLED' : wasmAborted ? 'WASM_ABORT' : error.code ?? 'BOOT',
+        message: cancelled ? 'Boot generation was retired.' : wasmAborted ? abortReason || 'The WebAssembly runtime aborted.' : caughtMessage,
+        ...(wasmDiagnostics ? { wasmDiagnostics } : {}),
+      });
     } finally {
-      module?._image_reset();
-      port.close();
+      diagnosticsActive = false;
+      try {
+        module?._image_reset();
+      } catch {}
+      try {
+        port.close();
+      } catch {}
     }
   };
 };

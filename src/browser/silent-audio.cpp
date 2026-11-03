@@ -21,7 +21,16 @@ void SilentAudioSink::RequireWorker(const X86Context& context) const {
   runtime_.Checkpoint(context);
 }
 
+bool SilentAudioSink::BelongsTo(Runtime& runtime, PreparedImage& image) const {
+  return &runtime == &runtime_ && &image == &image_ && image.memory.get() == memory_;
+}
+
 void SilentAudioSink::Submit(const X86Context& context, std::span<const float> samples) {
+  RequireWorker(context);
+  SubmitAtTime(context, runtime_.TimerTime(context), samples);
+}
+
+void SilentAudioSink::SubmitAtTime(const X86Context& context, uint64_t now, std::span<const float> samples) {
   RequireWorker(context);
   bool consumed = false;
   {
@@ -30,7 +39,6 @@ void SilentAudioSink::Submit(const X86Context& context, std::span<const float> s
     if (samples.size() % audio::kChannels || frames > kCapacityFrames || frames > UINT64_MAX - state_.submittedFrames) {
       throw Fault(context, 0, 0, "silent audio requires whole interleaved frames within its bounded queue and counters");
     }
-    const uint64_t now = runtime_.TimerTime(context);
     auto state = state_;
     auto clock = clock_;
     consumed = AdvanceState(state, clock, now);

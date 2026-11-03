@@ -46,6 +46,7 @@ class Memory {
   size_t leases_ = 0;
   static thread_local size_t threadBorrows_;
   std::vector<Region> regions_;
+  std::array<size_t, 256> regionLookup_{};
   std::shared_ptr<Storage> physicalStorage_;
   void RequireMutable(uint32_t address, size_t size);
   Region& RegionAt(const X86Context& ctx, uint32_t address, size_t size);
@@ -186,17 +187,26 @@ private:
   mutable std::atomic<size_t> stackBudget_ = size_t(-1);
   uint64_t sequence_ = 0;
   struct Worker {
+    Runtime* runtime;
+    uint64_t id;
     std::thread thread;
     std::atomic<bool> done = false;
     std::exception_ptr failure;
+    Worker(Runtime* runtime, uint64_t id) : runtime(runtime), id(id) {}
+    ~Worker();
+    void Join(const char* phase);
+    void Diagnose(const char* phase, const char* reason, int code = 0) const noexcept;
   };
   std::mutex workersLock_;
   std::mutex joiningLock_;
   std::vector<std::unique_ptr<Worker>> workers_;
   std::atomic<size_t> activeWorkers_ = 0;
+  const size_t workerCapacity_;
   std::atomic<Memory*> imageMemory_ = nullptr;
   Memory* sdkMemory_ = nullptr;
   std::function<bool(X86Context&, uint32_t, uint64_t)> sdkObserver_;
+  Memory* invocationMemory_ = nullptr;
+  std::function<void(const X86Context&, uint8_t*, uint32_t, uint64_t)> invocationObserver_;
   std::exception_ptr failure_;
   static thread_local Runtime* worker_;
   static thread_local X86Context* workerContext_;
@@ -209,7 +219,9 @@ private:
   void StartTimer();
   std::function<void(X86Context&, uint8_t*)> expiryDriver_;
   static thread_local bool polling_;
+  static thread_local uint32_t loopPollBudget_;
   void RequireImageSession(const X86Context& ctx, uint8_t* base) const;
+  void ObserveInvocation(const X86Context& ctx, uint8_t* base, uint32_t target) noexcept;
 public:
   enum class WaitResult { Changed, TimedOut };
   std::atomic<uint64_t> ticks = 0;
@@ -230,17 +242,20 @@ public:
   };
   ClockBinding BindClock() { return ClockBinding(*this); }
   Runtime(std::span<const X86FuncMapping> mappings, std::span<const uint32_t> continuations,
-    std::function<uint64_t()> timerSource = {});
+    std::function<uint64_t()> timerSource = {}, size_t workerCapacity = 2);
   void InstallExpiryDriver(std::function<void(X86Context&, uint8_t*)> driver);
   void InstallSdkObserver(Memory& memory, std::function<bool(X86Context&, uint32_t, uint64_t)> observer);
+  void InstallInvocationObserver(Memory& memory, std::function<void(const X86Context&, uint8_t*, uint32_t, uint64_t)> observer);
   static bool ObserveSdkEntry(X86Context& ctx, uint8_t* base, uint32_t id);
   void Poll(X86Context& ctx, uint8_t* base);
+  void PollLoop(X86Context& ctx, uint8_t* base);
   static uint64_t SystemTime();
   uint64_t TimerTime(const X86Context& ctx);
   uint64_t RelativeTimerDeadline(const X86Context& ctx, int64_t dueTime);
   ~Runtime();
   void Launch(X86Context ctx, uint8_t* base, std::function<void(X86Context&, uint8_t*)> entry);
   size_t ActiveWorkers() const { return activeWorkers_.load(); }
+  size_t WorkerCapacity() const { return workerCapacity_; }
   bool HasPublishedImage() const { return imageMemory_.load() != nullptr; }
   const std::atomic<uint32_t>* ProgressAddress() const { return &progress_; }
   bool OwnsCurrentWorker() const { return worker_ == this; }

@@ -10,7 +10,7 @@ namespace browser {
 
 class CacheFatx {
 public:
-  static constexpr uint64_t Capacity = 16 * 1024 * 1024;
+  static constexpr uint64_t Capacity = 64 * 1024 * 1024;
   static constexpr uint32_t SectorSize = 512;
   static constexpr uint32_t AllocationUnit = 16384;
   static constexpr uint32_t MaximumTransfer = 64 * 1024;
@@ -21,15 +21,16 @@ public:
   uint32_t Dismount();
   uint32_t Mount();
   bool Mounted() const;
+  size_t RawBackingBytes() const;
   std::shared_ptr<TemporaryFilesystem> Filesystem() const;
 
 private:
   static constexpr uint32_t HeaderSize = 4096;
-  static constexpr uint32_t FatSize = 4096;
+  static constexpr uint32_t FatSize = (((Capacity / AllocationUnit + 1) * sizeof(uint16_t) + HeaderSize - 1) / HeaderSize) * HeaderSize;
   static constexpr uint32_t DataOffset = HeaderSize + FatSize;
   static constexpr uint64_t UsableCapacity = ((Capacity - DataOffset) / AllocationUnit) * AllocationUnit;
   mutable std::mutex lock_;
-  std::vector<uint8_t> bytes_ = std::vector<uint8_t>(Capacity);
+  std::vector<uint8_t> bytes_;
   std::shared_ptr<TemporaryFilesystem> filesystem_;
   bool rawOpen_ = false;
   bool dismounted_ = false;

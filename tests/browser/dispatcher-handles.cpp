@@ -22,6 +22,53 @@ const auto parked = [](Dispatcher& dispatcher, size_t count = 1) {
   check(dispatcher.ActiveWaiters() == count, "wait reaches independent blocking boundary");
 };
 
+const auto threadObjects = [] {
+  Runtime runtime({}, {});
+  Dispatcher dispatcher(runtime);
+  DispatcherHandles handles(dispatcher);
+  Memory memory;
+  X86Context ctx{};
+  memory.Ensure(0x10000, 4096);
+  const uint64_t zero = 0;
+  memory.Write(ctx, 0x10000, &zero, 8);
+  const uint32_t handle = 0x70000004;
+  const auto poll = [&] {
+    return handles.WaitGuestStatus(memory, ctx, std::span(&handle, 1), Dispatcher::WaitMode::Any, 0x10000, false, 2s);
+  };
+  const auto first = handles.PublishThread(handle);
+  check(poll() == 0x102, "live thread is unsignaled");
+  fault([&] { handles.SetEvent(handle); }, "thread rejects event signaling");
+  fault([&] { handles.ResetEvent(handle); }, "thread rejects event reset");
+  handles.RollbackThread(handle, first);
+  const auto second = handles.PublishThread(handle);
+  check(first != second, "rollback cannot reuse an object identity");
+  fault([&] { dispatcher.CompleteThread(first); }, "stale completion cannot signal replacement");
+  check(poll() == 0x102, "stale completion preserves replacement signal");
+  dispatcher.CompleteThread(second);
+  for (uint32_t n = 0; n < 3; ++n) { check(poll() == 0, "completion is permanent"); }
+  handles.Close(handle);
+  check(dispatcher.ActiveObjects() == 0, "completed thread retires after final close");
+  for (uint32_t n = 0; n < 150; ++n) {
+    const auto token = handles.PublishThread(handle);
+    handles.RollbackThread(handle, token);
+  }
+  const auto token = handles.PublishThread(handle);
+  handles.Close(handle);
+  check(dispatcher.ActiveObjects() == 1, "running closed thread retains its completion token");
+  dispatcher.CompleteThread(token);
+  check(dispatcher.ActiveObjects() == 0, "closed thread retires on completion");
+  const auto pinned = handles.PublishThread(handle);
+  uint32_t status = UINT32_MAX;
+  std::jthread waiter([&] {
+    status = handles.WaitGuestStatus(memory, ctx, std::span(&handle, 1), Dispatcher::WaitMode::Any, 0, false, 2s);
+  });
+  parked(dispatcher);
+  handles.Close(handle);
+  dispatcher.CompleteThread(pinned);
+  waiter.join();
+  check(status == 0 && dispatcher.ActiveObjects() == 0, "pending wait survives handle close and retires its pin");
+};
+
 const auto contracts = [] {
   Runtime runtime({}, {});
   Dispatcher dispatcher(runtime);
@@ -126,14 +173,14 @@ const auto contracts = [] {
     handles.Close(semaphore);
   }
   {
-    std::array<uint32_t, 128> aliases{};
+    std::array<uint32_t, browser::kDispatcherCapacity> aliases{};
     aliases[0] = handles.CreateEvent(true, false);
     for (size_t n = 1; n < aliases.size(); ++n) { aliases[n] = handles.Duplicate(aliases[0]); }
     fault([&] { handles.Duplicate(aliases[0]); }, "handle capacity rejects duplication");
     fault([&] { handles.CreateEvent(false, false); }, "handle capacity rejects creation without an object leak");
-    check(dispatcher.ActiveObjects() == 1 && handles.ActiveHandles() == 128, "handle capacity is independent of object capacity");
+    check(dispatcher.ActiveObjects() == 1 && handles.ActiveHandles() == 256, "handle capacity is independent of object capacity");
     for (const auto handle : aliases) { handles.Close(handle); }
-    std::array<uint32_t, 128> objects{};
+    std::array<uint32_t, browser::kDispatcherCapacity> objects{};
     for (auto& handle : objects) { handle = handles.CreateEvent(false, false); }
     const uint64_t relative = UINT64_MAX;
     memory.Write(ctx, 0x10000, &relative, sizeof(relative));
@@ -142,10 +189,10 @@ const auto contracts = [] {
     parked(dispatcher);
     handles.Close(objects.back());
     fault([&] { handles.CreateEvent(false, false); }, "pinned object capacity rejects creation despite a free handle slot");
-    check(handles.ActiveHandles() == 127 && dispatcher.ActiveObjects() == 128, "failed object allocation leaks neither a handle nor an extra object");
+    check(handles.ActiveHandles() == objects.size() - 1 && dispatcher.ActiveObjects() == objects.size(), "failed object allocation leaks neither a handle nor an extra object");
     dispatcher.AdvanceTime(1);
     waiter.join();
-    check(status == 0x102 && dispatcher.ActiveObjects() == 127, "closed object survives until genuine guest timeout then releases its capacity");
+    check(status == 0x102 && dispatcher.ActiveObjects() == objects.size() - 1, "closed object survives until genuine guest timeout then releases its capacity");
     memory.Write(ctx, 0x10000, &zero, sizeof(zero));
     objects.back() = handles.CreateSemaphore(0, 1);
     for (const auto handle : objects) { handles.Close(handle); }
@@ -205,6 +252,7 @@ const auto cancellation = [] {
 
 int main() {
   try {
+    threadObjects();
     contracts();
     cancellation();
     std::puts("dispatcher-handles-contracts-ok");

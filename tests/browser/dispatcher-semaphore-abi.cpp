@@ -160,7 +160,7 @@ const auto contracts = [] {
       "output retirement race publishes registers only on complete release");
     memory.Commit(0x11000, 0x1000);
   }
-  std::array<uint32_t, 126> capacity{};
+  std::array<uint32_t, browser::kDispatcherCapacity - 2> capacity{};
   for (auto& handle : capacity) { handle = handles.Duplicate(alias); }
   writeWord(memory, ctx, output, sentinel);
   reject(193, {output, 0, 1, 2});

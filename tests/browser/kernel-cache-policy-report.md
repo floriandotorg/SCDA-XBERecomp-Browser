@@ -1,0 +1,7 @@
+# Native-parity non-caching FSC policy
+
+The browser implements only the reached `FscSetCacheSize` advisory call, ordinal 37, with its exact one-argument NTSTATUS/stdcall ABI. The repository's native implementation is `KERNEL_EXPORT(37, FscSetCacheSize, 1) { return kSuccess; }` in `src/kernel/xboxkrnl.cpp`. It ignores every supplied hint and does not allocate, resize or expose a native FSC cache.
+
+The browser likewise has no reusable disc-data cache. Actual disc bytes are delivered through owned direct reads with independently bounded temporary I/O staging. Its explicit non-caching policy accepts this advisory hint without allocating a cache, modifying guest data, changing virtual volume quota/raw backing, or claiming physical Xbox cache behavior. This is named native compatibility, not a generic unsupported-ordinal success fallback. No `FscGetCacheSize` or cache-backed file semantics are implemented by this provider.
+
+Focused native ASan/UBSan, ordinary Wasm and tail-optimized Wasm contracts cover zero, small, large and full-range hints, exact eight-byte frame consumption, unchanged non-result registers/flags and guest bytes, no backing growth, invalid/partial/uncommitted/overflowing frames, foreign runtime/base, inherited leases, cold calls and cancelled sessions. The test separately checks the actual retained native source contract. A caller that demonstrably requires cache-backed behavior must not be satisfied by this non-caching policy.

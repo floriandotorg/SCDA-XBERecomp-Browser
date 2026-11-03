@@ -43,14 +43,16 @@ bool MenuLaunch::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
     auto lease = memory_->Borrow();
     memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
     if (frame[1]) {
-      for (uint32_t n = 0; n < 520; ++n) {
+      for (uint32_t n = 0; n <= 260; ++n) {
         if (uint64_t(frame[1]) + n > UINT32_MAX) { throw Fault(ctx, frame[1], n, "menu launch path overflow"); }
         char value = 0;
         memory_->Read(ctx, frame[1] + n, &value, 1);
         if (!value) { break; }
+        if (n == 260 || uint8_t(value) < 32 || uint8_t(value) > 126) {
+          throw Fault(ctx, frame[1], n + 1, "menu launch path exceeds the owned host protocol");
+        }
         request.path.push_back(value);
       }
-      if (request.path.size() == 520) { throw Fault(ctx, frame[1], 520, "menu launch path is unterminated"); }
     }
     std::string lower = request.path;
     for (char& value : lower) {

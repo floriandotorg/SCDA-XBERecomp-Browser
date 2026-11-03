@@ -1,4 +1,5 @@
 #include "browser/cpu_runtime.h"
+#include "cpu/x86_ops.h"
 #include <atomic>
 #include <cstdio>
 
@@ -7,6 +8,44 @@ const auto check = [](bool value, const char* reason) {
 };
 
 int main() {
+  {
+    browser::Memory memory;
+    const std::array<X86FuncMapping, 1> mappings = {{{0x10000, [](X86Context&, uint8_t*) {}}}};
+    browser::Runtime runtime(mappings, {});
+    const auto nativeTarget = runtime.HostThunk([](X86Context&, uint8_t*) {});
+    std::atomic<uint32_t> deliveries = 0;
+    runtime.InstallExpiryDriver([&](X86Context&, uint8_t*) { ++deliveries; });
+    runtime.RegisterKernel(1, [](X86Context&, uint8_t*) {});
+    runtime.InstallSdkObserver(memory, [](X86Context&, uint32_t, uint64_t) { return true; });
+    runtime.PublishImageMemory(memory, runtime.KernelRevision(), [] {});
+    X86Context context{};
+    context.host = &runtime;
+    runtime.Launch(context, memory.Base(), [&](X86Context& ctx, uint8_t* base) {
+      for (uint32_t n = 0; n < 10000; ++n) { X86_BARRIER(); }
+      check(deliveries == 40, "loop barriers must bound timer work to one delivery check per 256 backedges");
+      check(runtime.ProgressAddress()->load() == 10000, "sampled timer work lost guest progress");
+      runtime.Poll(ctx, base);
+      for (uint32_t n = 0; n < 10000; ++n) { runtime.Invoke(ctx, base, 0x10000); }
+      check(deliveries == 81, "guest indirect calls repeated full timer servicing");
+      runtime.Invoke(ctx, base, nativeTarget);
+      check(deliveries == 82, "native thunk boundary did not force timer work");
+      runtime.Kernel(ctx, base, 1);
+      check(deliveries == 83, "kernel boundary did not force timer work");
+      check(browser::Runtime::ObserveSdkEntry(ctx, base, 1) && deliveries == 84, "SDK boundary did not force timer work");
+      runtime.Poll(ctx, base);
+      check(deliveries == 85, "explicit poll did not force timer work");
+      X86_BARRIER();
+      check(deliveries == 86, "first backedge after an explicit boundary did not refresh timers");
+      runtime.Launch(ctx, base, [&](X86Context& ctx, uint8_t* base) { X86_BARRIER(); });
+      while (runtime.ActiveWorkers() > 1) { runtime.Checkpoint(ctx); std::this_thread::yield(); }
+      check(deliveries == 87, "child worker inherited the parent timer budget");
+      runtime.Cancel();
+      bool cancelled = false;
+      try { X86_BARRIER(); } catch (const browser::Cancelled&) { cancelled = true; }
+      check(cancelled, "sampled loop barrier skipped cancellation");
+    });
+    if (auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+  }
   browser::Memory memory;
   browser::Runtime runtime({}, {});
   auto* progress = runtime.ProgressAddress();

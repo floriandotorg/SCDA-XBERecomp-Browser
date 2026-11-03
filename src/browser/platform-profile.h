@@ -6,5 +6,6 @@ namespace browser {
 
 std::array<KernelDataExport, 6> InstallPlatformProfile(Runtime& runtime, PreparedImage& image);
 KernelDataExport InstallVirtualDriveKey(Runtime& runtime, PreparedImage& image);
+KernelDataExport InstallSignatureKey(Runtime& runtime, PreparedImage& image);
 
 }

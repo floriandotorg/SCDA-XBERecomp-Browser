@@ -85,16 +85,20 @@ const auto contracts = [] {
   check(poll(synchronization) == 0x102, "high BOOLEAN bits do not signal creation");
   invoke(225, {synchronization, 0});
   check(poll(synchronization) == 0 && poll(synchronization) == 0x102, "optional previous output and single signal consumption");
-  invoke(192, {output, 0, 0x101});
+  reject(192, {output, 0, 0x101});
+  invoke(192, {output, 0, 1});
   const auto mutant = readWord(memory, ctx, output);
   const auto alias = handles.Duplicate(mutant);
   check(poll(alias, 8) == 0x102 && poll(alias) == 0, "initial ownership uses context identity and aliases recurse");
   invoke(221, {mutant, output});
-  check(readWord(memory, ctx, output) == UINT32_MAX && poll(alias, 8) == 0x102, "recursive release publishes signed prior signal");
+  check(readWord(memory, ctx, output) == 0 && poll(alias, 8) == 0x102,
+    "recursive release publishes the native zero prior signal");
   invoke(221, {alias, output});
   check(readWord(memory, ctx, output) == 0 && poll(mutant, 8) == 0, "final release publishes prior zero and permits new owner");
+  writeWord(memory, ctx, output, 0xAABBCCDD);
   reject(221, {alias, output});
-  check(poll(mutant) == 0x102, "wrong owner release leaves ownership intact");
+  check(readWord(memory, ctx, output) == 0 && poll(mutant) == 0x102,
+    "not-owned release publishes the owned zero count and leaves ownership intact");
   ctx.thread_handle = 8;
   invoke(221, {mutant, 0});
   ctx.thread_handle = 4;
@@ -119,13 +123,16 @@ const auto contracts = [] {
   }
   ctx.thread_handle = 0;
   reject(192, {output, 0, 1});
-  invoke(192, {output, 0, 0x100});
+  reject(192, {output, 0, 0x100});
+  invoke(192, {output, 0, 0});
   const auto unowned = readWord(memory, ctx, output);
+  writeWord(memory, ctx, output, 0xAABBCCDD);
   reject(221, {unowned, output});
+  check(readWord(memory, ctx, output) == 1, "not-owned release publishes the free count");
   ctx.thread_handle = 4;
   handles.Close(unowned);
   writeWord(memory, ctx, output, 0xAABBCCDD);
-  for (const auto ordinal : {0u, 188u, 190u, 197u, 233u}) { reject(ordinal, {notification, output}); }
+  for (const auto ordinal : {0u, 188u, 190u, 233u}) { reject(ordinal, {notification, output}); }
   for (const auto ordinal : {186u, 187u, 221u, 225u}) { reject(ordinal, {0, output}); }
   reject(221, {notification, output});
   const auto semaphore = handles.CreateSemaphore(1, 1);
@@ -199,7 +206,7 @@ const auto contracts = [] {
       "output retirement race publishes registers only on complete operation");
     memory.Commit(0x11000, 0x1000);
   }
-  std::array<uint32_t, 126> capacity{};
+  std::array<uint32_t, browser::kDispatcherCapacity - 2> capacity{};
   for (auto& handle : capacity) { handle = handles.CreateEvent(false, false); }
   writeWord(memory, ctx, output, 0xAABBCCDD);
   reject(189, {output, 0, 0, 1});

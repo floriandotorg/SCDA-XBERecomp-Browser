@@ -1,5 +1,6 @@
 import { createBootController } from './boot-controller.mjs';
 import { createBootRuntime } from './boot-runtime.mjs';
+import { assertWasmCapabilities } from './wasm-capabilities.mjs';
 
 const phaseText = Object.freeze({
   selection: 'Select an ISO to begin.',
@@ -11,7 +12,8 @@ const phaseText = Object.freeze({
   error: 'Boot failed.',
 });
 
-export const mountBootShell = ({ root = document, createRuntime = createBootRuntime } = {}) => {
+export const mountBootShell = ({ root = document, createRuntime = createBootRuntime,
+  loadManifest = async () => (await import('./boot-manifest.mjs')).default, validateWasm } = {}) => {
   const input = root.querySelector('#iso');
   const boot = root.querySelector('#boot');
   const stop = root.querySelector('#stop');
@@ -26,7 +28,8 @@ export const mountBootShell = ({ root = document, createRuntime = createBootRunt
     boot.disabled = !state.source || active || state.stopping || state.code === 'TEARDOWN';
     stop.disabled = !active || state.stopping;
     input.disabled = state.stopping || state.code === 'TEARDOWN';
-    status.textContent = state.stopping ? 'Stopping guest workers and cancelling pending reads.' : phaseText[state.phase];
+    status.textContent = state.stopping ? 'Stopping guest workers and cancelling pending reads.' :
+      state.phase === 'stopped' && state.code === 'SINGLE_PLAYER_LAUNCH_REQUEST' ? 'Single player launch boundary reached.' : phaseText[state.phase];
     selected.textContent = state.source ? `${state.source.name ?? 'Local ISO'} (${state.source.size.toLocaleString()} bytes)` : 'No ISO selected.';
     const diagnostic = state.diagnostic;
     const service = diagnostic?.exportName ? `${diagnostic.exportName} (${diagnostic.ordinal}). ` : '';
@@ -46,6 +49,9 @@ export const mountBootShell = ({ root = document, createRuntime = createBootRunt
       if (!Number.isSafeInteger(source.size) || source.size < 1 || typeof source.slice !== 'function') {
         throw Object.assign(new Error('Select a nonempty local ISO.'), { code: 'FILE' });
       }
+      const manifest = await loadManifest();
+      signal.throwIfAborted();
+      assertWasmCapabilities(manifest, validateWasm);
     },
     onChange: render,
   });

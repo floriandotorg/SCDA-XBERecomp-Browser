@@ -57,7 +57,25 @@ std::optional<TemporaryFilesystem::Metadata> TemporaryFilesystem::Stat(const std
   const auto node = nodes_.find(*normalized);
   if (node == nodes_.end()) { return {}; }
   const auto& value = node->second;
-  return Metadata{value.directory, value.bytes.size(), value.attributes, value.creationTime, value.lastAccessTime, value.lastWriteTime, value.changeTime};
+  return Metadata{value.directory, value.bytes.size(), value.attributes, value.creationTime, value.lastAccessTime, value.lastWriteTime, value.changeTime, std::max(Allocation(value.bytes.size()), value.reservation)};
+}
+
+std::optional<std::vector<TemporaryFilesystem::DirectoryEntry>> TemporaryFilesystem::List(const std::string& path) const {
+  const auto normalized = Normalize(path);
+  if (!normalized) { return {}; }
+  std::lock_guard lock(lock_);
+  const auto parent = nodes_.find(*normalized);
+  if (parent == nodes_.end() || !parent->second.directory) { return {}; }
+  std::vector<DirectoryEntry> entries;
+  const auto prefix = normalized->empty() ? "" : *normalized + "\\";
+  for (auto node = nodes_.lower_bound(prefix); node != nodes_.end() && node->first.starts_with(prefix); ++node) {
+    const auto name = node->first.substr(prefix.size());
+    if (name.empty() || name.find('\\') != std::string::npos) { continue; }
+    const auto& value = node->second;
+    entries.push_back({name, {value.directory, value.bytes.size(), value.attributes,
+      value.creationTime, value.lastAccessTime, value.lastWriteTime, value.changeTime, std::max(Allocation(value.bytes.size()), value.reservation)}});
+  }
+  return entries;
 }
 
 TemporaryFilesystem::Accounting TemporaryFilesystem::Usage() const {
@@ -78,14 +96,19 @@ uint32_t TemporaryFilesystem::CreateDirectory(const std::string& path) {
   return 0;
 }
 
-uint32_t TemporaryFilesystem::CreateFile(const std::string& path, uint32_t attributes) {
+uint32_t TemporaryFilesystem::CreateFile(const std::string& path, uint32_t attributes, uint64_t allocation) {
   const auto normalized = Normalize(path);
   if (!normalized) { return 0xc0000033; }
   std::lock_guard lock(lock_);
   if (nodes_.contains(*normalized)) { return 0xc0000035; }
   if (const auto status = ParentStatus(*normalized)) { return status; }
   if (nodes_.size() >= maximumEntries_) { return 0xc000009a; }
-  nodes_.emplace(*normalized, NewNode(false, attributes));
+  if (allocation >> 63) { return 0xc000000d; }
+  if (allocation > capacity_ || Allocation(allocation) > capacity_ - allocated_) { return 0xc000007f; }
+  auto node = NewNode(false, attributes);
+  node.reservation = Allocation(allocation);
+  nodes_.emplace(*normalized, std::move(node));
+  allocated_ += Allocation(allocation);
   return 0;
 }
 
@@ -98,7 +121,8 @@ uint32_t TemporaryFilesystem::OverwriteFile(const std::string& path, uint32_t at
   if (node->second.directory) { return 0xc00000ba; }
   if (node->second.attributes & 1) { return 0xc0000022; }
   const auto now = clock_();
-  allocated_ -= Allocation(node->second.bytes.size());
+  allocated_ -= std::max(Allocation(node->second.bytes.size()), node->second.reservation);
+  node->second.reservation = 0;
   std::vector<uint8_t>().swap(node->second.bytes);
   node->second.attributes = attributes;
   node->second.lastWriteTime = now;
@@ -115,8 +139,9 @@ uint32_t TemporaryFilesystem::WriteFile(const std::string& path, std::span<const
   if (node != nodes_.end() && (node->second.attributes & 1)) { return 0xc0000022; }
   if (const auto status = ParentStatus(*normalized)) { return status; }
   if (node == nodes_.end() && nodes_.size() >= maximumEntries_) { return 0xc000009a; }
-  const auto previous = node == nodes_.end() ? 0 : Allocation(node->second.bytes.size());
-  if (bytes.size() > capacity_ || Allocation(bytes.size()) > capacity_ - allocated_ + previous) { return 0xc000007f; }
+  const auto previous = node == nodes_.end() ? 0 : std::max(Allocation(node->second.bytes.size()), node->second.reservation);
+  const auto allocation = std::max(Allocation(bytes.size()), node == nodes_.end() ? uint64_t(0) : node->second.reservation);
+  if (bytes.size() > capacity_ || allocation > capacity_ - allocated_ + previous) { return 0xc000007f; }
   std::vector<uint8_t> replacement(bytes.begin(), bytes.end());
   if (node == nodes_.end()) { nodes_.emplace(*normalized, NewNode(false, 0x80, std::move(replacement))); }
   else {
@@ -125,7 +150,7 @@ uint32_t TemporaryFilesystem::WriteFile(const std::string& path, std::span<const
     node->second.lastWriteTime = now;
     node->second.changeTime = now;
   }
-  allocated_ = allocated_ - previous + Allocation(bytes.size());
+  allocated_ = allocated_ - previous + allocation;
   return 0;
 }
 
@@ -140,16 +165,15 @@ uint32_t TemporaryFilesystem::Write(const std::string& path, uint64_t offset, st
   if (bytes.empty()) { return 0; }
   if (offset > capacity_ || bytes.size() > capacity_ - offset) { return 0xc000007f; }
   const auto size = std::max<uint64_t>(node->second.bytes.size(), offset + bytes.size());
-  const auto previous = Allocation(node->second.bytes.size());
-  if (Allocation(size) > capacity_ - allocated_ + previous) { return 0xc000007f; }
-  auto replacement = node->second.bytes;
-  replacement.resize(size);
-  std::copy(bytes.begin(), bytes.end(), replacement.begin() + offset);
+  const auto previous = std::max(Allocation(node->second.bytes.size()), node->second.reservation);
+  const auto allocation = std::max(Allocation(size), node->second.reservation);
+  if (allocation > capacity_ - allocated_ + previous) { return 0xc000007f; }
   const auto now = clock_();
-  node->second.bytes.swap(replacement);
+  node->second.bytes.resize(size);
+  std::copy(bytes.begin(), bytes.end(), node->second.bytes.begin() + offset);
   node->second.lastWriteTime = now;
   node->second.changeTime = now;
-  allocated_ = allocated_ - previous + Allocation(size);
+  allocated_ = allocated_ - previous + allocation;
   return 0;
 }
 

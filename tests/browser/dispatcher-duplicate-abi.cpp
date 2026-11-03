@@ -131,7 +131,7 @@ const auto contracts = [] {
   ctx.eax = sentinel;
   fault([&] { browser::InvokeDispatcherObject(handles, memory, ctx, 197); }, "complete final frame cannot wrap cleanup");
   check(ctx.esp == 0xFFFFFFF0 && ctx.eax == sentinel, "cleanup overflow preserves registers");
-  std::array<uint32_t, 127> capacity{};
+  std::array<uint32_t, browser::kDispatcherCapacity - 1> capacity{};
   for (auto& handle : capacity) { handle = handles.Duplicate(source); }
   writeWord(memory, ctx, output, sentinel);
   reject(source, output, 0);
@@ -149,9 +149,9 @@ const auto contracts = [] {
   const auto owned = handles.CreateMutant(4);
   handles.Close(owned);
   for (auto& handle : capacity) { handle = handles.CreateEvent(false, true); }
-  check(dispatcher.ActiveObjects() == 128 && handles.ActiveHandles() == 127, "object capacity can be full with a free handle");
+  check(dispatcher.ActiveObjects() == browser::kDispatcherCapacity && handles.ActiveHandles() == browser::kDispatcherCapacity - 1, "object capacity can be full with a free handle");
   const auto atObjectCapacity = duplicate(capacity[0]);
-  check(dispatcher.ActiveObjects() == 128 && handles.ActiveHandles() == 128 && poll(atObjectCapacity) == 0,
+  check(dispatcher.ActiveObjects() == browser::kDispatcherCapacity && handles.ActiveHandles() == browser::kDispatcherCapacity && poll(atObjectCapacity) == 0,
     "duplication needs a handle slot but never allocates another object");
   handles.Close(atObjectCapacity);
   for (const auto handle : capacity) { handles.Close(handle); }

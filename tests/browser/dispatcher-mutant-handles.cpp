@@ -1,4 +1,5 @@
 #include "browser/dispatcher-wait-abi.h"
+#include "browser/dispatcher-object-abi.h"
 #include <atomic>
 #include <cstdio>
 
@@ -47,7 +48,8 @@ const auto contracts = [] {
     check(poll(alias, 8) == 0x102, "different owner cannot consume held mutant");
     fault([&] { handles.ReleaseMutant(alias, 8); }, "wrong owner release rejects");
     fault([&] { handles.ReleaseMutant(alias, 0); }, "zero owner release rejects");
-    check(handles.ReleaseMutant(mutant, 4) == -1 && poll(alias, 8) == 0x102, "partial recursive release preserves owner");
+    check(handles.ReleaseMutant(mutant, 4) == -1 && poll(alias, 8) == 0x102,
+      "internal recursive release keeps its internal negative count and preserves owner");
     check(handles.ReleaseMutant(alias, 4) == 0 && poll(mutant, 8) == 0, "final release transfers ownership");
     handles.Close(mutant);
     fault([&] { handles.ReleaseMutant(mutant, 8); }, "closed identifier cannot release through alias");
@@ -202,14 +204,14 @@ const auto contracts = [] {
       "closed multiobject acquisition retains each distinct owner");
   }
   {
-    std::array<uint32_t, 128> mutants{};
+    std::array<uint32_t, browser::kDispatcherCapacity> mutants{};
     for (auto& handle : mutants) { handle = handles.CreateMutant(4); }
     fault([&] { handles.CreateMutant(8); }, "mutant handle capacity rejects before object allocation");
     for (const auto handle : mutants) { handles.Close(handle); }
     fault([&] { handles.CreateMutant(); }, "closed ownership still consumes object budget");
-    check(handles.ActiveHandles() == 0 && dispatcher.ActiveObjects() == 128 && handles.AbandonOwner(8) == 0,
+    check(handles.ActiveHandles() == 0 && dispatcher.ActiveObjects() == browser::kDispatcherCapacity && handles.AbandonOwner(8) == 0,
       "failed creation leaks no owner or handle");
-    check(handles.AbandonOwner(4) == 128 && dispatcher.ActiveObjects() == 0, "owner exit releases full closed object budget");
+    check(handles.AbandonOwner(4) == browser::kDispatcherCapacity && dispatcher.ActiveObjects() == 0, "owner exit releases full closed object budget");
     const auto replacement = handles.CreateMutant();
     handles.Close(replacement);
   }
@@ -241,6 +243,41 @@ const auto contracts = [] {
     releasing.join();
     check(handles.AbandonOwner(4) == (released ? 0 : 1) && dispatcher.ActiveObjects() == 0,
       "release racing final close either completes or leaves explicit owner cleanup");
+  }
+  {
+    const auto mutant = handles.CreateMutant(4);
+    check(poll(mutant, 4) == 0 && poll(mutant, 4) == 0, "release parity fixture recursion failed");
+    const auto release = [&](uint32_t output, uint32_t owner) {
+      const std::array<uint32_t, 3> frame{0, mutant, output};
+      memory.Write(ctx, 0x10200, frame.data(), sizeof(frame));
+      auto abi = ctx;
+      abi.esp = 0x10200;
+      abi.thread_handle = owner;
+      try { browser::InvokeDispatcherObject(handles, memory, abi, 221); }
+      catch (const browser::DispatcherError& error) { return error.status; }
+      check(abi.esp == 0x1020C, "release ABI did not clean its stack frame");
+      return abi.eax;
+    };
+    const auto publish = [&](uint32_t value) { memory.Write(ctx, 0x10300, &value, 4); };
+    const auto published = [&] { uint32_t value = 0; memory.Read(ctx, 0x10300, &value, 4); return value; };
+    publish(0xdeadbeef);
+    check(release(0x10300, 4) == 0 && published() == 0, "recursive ABI release did not publish the native zero count");
+    publish(0xdeadbeef);
+    check(release(0x10300, 4) == 0 && published() == 0, "penultimate ABI release previous count wrong");
+    publish(0xdeadbeef);
+    check(release(0x10300, 4) == 0 && published() == 0, "final ABI release previous count wrong");
+    publish(0xdeadbeef);
+    check(release(0x10300, 8) == 0xc0000046 && published() == 1,
+      "not-owned release of a free mutant must publish the free count");
+    check(poll(mutant, 4) == 0, "reacquisition after release parity failed");
+    publish(0xdeadbeef);
+    check(release(0x10300, 8) == 0xc0000046 && published() == 0,
+      "not-owned release of an owned mutant must publish the owned zero count");
+    publish(0xdeadbeef);
+    check(release(0, 4) == 0 && published() == 0xdeadbeef, "null output release wrote guest memory");
+    handles.Close(mutant);
+    publish(0xdeadbeef);
+    check(release(0x10300, 4) == 0xc0000008 && published() == 0xdeadbeef, "invalid release handle wrote a count");
   }
   check(handles.ActiveHandles() == 0 && dispatcher.ActiveObjects() == 0 && dispatcher.ActiveWaiters() == 0,
     "mutant contracts clean up all handles objects and waits");

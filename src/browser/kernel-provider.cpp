@@ -125,6 +125,20 @@ void InvokeSystemTime(Runtime& runtime, Memory& memory, X86Context& ctx) {
   ctx.esp = uint32_t(stackEnd);
 }
 
+void InvokeNonCachingFscPolicy(Runtime& runtime, Memory& memory, X86Context& ctx) {
+  if (!runtime.OwnsCurrentContext(ctx) || Memory::HasBorrow()) {
+    throw Fault(ctx, 37, 0, "non-caching FSC policy requires its current owned context without a backing lease");
+  }
+  const uint64_t stackEnd = uint64_t(ctx.esp) + 8;
+  if (stackEnd > UINT32_MAX) { throw Fault(ctx, ctx.esp, 8, "FSC policy stack cleanup overflow"); }
+  auto lease = memory.Borrow();
+  std::array<uint32_t, 2> frame;
+  memory.Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+  runtime.Checkpoint(ctx);
+  ctx.eax = 0;
+  ctx.esp = uint32_t(stackEnd);
+}
+
 void InvokeOfflineLinkState(Runtime& runtime, Memory& memory, X86Context& ctx) {
   const uint64_t stackEnd = uint64_t(ctx.esp) + 8;
   if (stackEnd > UINT32_MAX) { throw Fault(ctx, ctx.esp, 8, "link state stack cleanup overflow"); }
@@ -448,14 +462,14 @@ void InvokeIrql(Runtime& runtime, Memory& memory, X86Context& ctx, uint32_t ordi
   uint8_t current;
   const uint32_t address = ctx.fs_base + 0x24;
   memory.Read(ctx, address, &current, 1);
-  const bool raiseDpc = ordinal == 129;
-  const uint8_t requested = raiseDpc ? 2 : uint8_t(ctx.ecx);
-  if (current > 31 || (raiseDpc ? current > requested : requested > current)) {
+  const bool lower = ordinal == 161;
+  const uint8_t requested = ordinal == 129 ? 2 : uint8_t(ctx.ecx);
+  if (current > 31 || requested > 31 || (lower ? requested > current : requested < current)) {
     throw Fault(ctx, address, 1, "invalid IRQL transition");
   }
   runtime.Checkpoint(ctx);
   memory.Write(ctx, address, &requested, 1);
-  ctx.eax = raiseDpc ? current : 0;
+  ctx.eax = lower ? 0 : current;
   ctx.esp = uint32_t(stackEnd);
 }
 
@@ -550,15 +564,16 @@ void InstallKernelProvider(Runtime& runtime, Memory& memory) {
   runtime.Checkpoint({});
   auto pool = std::make_shared<GuestPool>(memory);
   const std::array<uint32_t, 3> settings = {1, KernelVideoFlags, 0};
-  for (const uint32_t ordinal : {2u, 15u, 17u, 23u, 24u, 126u, 128u, 129u, 161u, 252u, 253u, 277u, 291u, 294u, 301u, 335u, 336u, 337u, 338u, 339u, 340u, 346u}) {
+  for (const uint32_t ordinal : {2u, 15u, 17u, 23u, 24u, 37u, 126u, 128u, 129u, 160u, 161u, 252u, 253u, 277u, 291u, 294u, 301u, 335u, 336u, 337u, 338u, 339u, 340u, 346u}) {
     runtime.RegisterKernel(ordinal, [&runtime, &memory, ordinal, pool, settings](X86Context& ctx, uint8_t* base) {
       if (&Runtime::From(ctx) != &runtime || base != memory.Base()) { throw Fault(ctx, ordinal, 0, "kernel provider session mismatch"); }
       if (ordinal == 2) { InvokeDiagnosticVirtualDisplayQuery(runtime, memory, ctx); }
       else if (ordinal == 15 || ordinal == 17 || ordinal == 23) { pool->Invoke(runtime, memory, ctx, ordinal); }
       else if (ordinal == 24) { InvokeSettings(runtime, memory, ctx, settings); }
+      else if (ordinal == 37) { InvokeNonCachingFscPolicy(runtime, memory, ctx); }
       else if (ordinal == 126) { InvokePerformanceCounter(runtime, memory, ctx); }
       else if (ordinal == 128) { InvokeSystemTime(runtime, memory, ctx); }
-      else if (ordinal == 129 || ordinal == 161) { InvokeIrql(runtime, memory, ctx, ordinal); }
+      else if (ordinal == 129 || ordinal == 160 || ordinal == 161) { InvokeIrql(runtime, memory, ctx, ordinal); }
       else if (ordinal == 252) { InvokeOfflineLinkState(runtime, memory, ctx); }
       else if (ordinal == 253) { InvokeOfflinePhyInitialization(runtime, memory, ctx); }
       else if (ordinal == 301) { InvokeStatusTranslation(runtime, memory, ctx); }

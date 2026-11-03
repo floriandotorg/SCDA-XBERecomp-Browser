@@ -48,6 +48,18 @@ int main() {
     try { invoke("default.xbe", 0); }
     catch (const browser::MenuLaunchRequested& request) { caught = !request.hasData; }
     check(caught, "null data launch lost");
+    const std::string longest = "D:\\" + std::string(245, 'a') + "\\default.xbe";
+    check(longest.size() == 260, "path fixture length");
+    caught = false;
+    try { invoke(longest.c_str(), 0); }
+    catch (const browser::MenuLaunchRequested& request) { caught = request.path == longest && !request.hasData; }
+    check(caught, "host-compatible path limit rejected");
+    for (const std::string path : {"a" + longest, std::string("D:\\bad\n\\default.xbe"), std::string("D:\\bad\x80\\default.xbe")}) {
+      bool rejected = false;
+      try { invoke(path.c_str(), 0); } catch (const browser::Fault&) { rejected = true; }
+      catch (const browser::MenuLaunchRequested&) {}
+      check(rejected && ctx.esp == 0x20f00 && ctx.eax == 0xabcdef01, "host-incompatible path escaped native validation");
+    }
     bool fault = false;
     try { invoke("default.xbe", 0x21fff); } catch (const browser::Fault&) { fault = true; }
     check(fault, "invalid payload accepted");

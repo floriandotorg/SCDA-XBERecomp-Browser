@@ -24,7 +24,7 @@ namespace browser {
 namespace {
 constexpr uint32_t gamepadType = MI_ADDRESS(XPP_GamepadType);
 constexpr uint32_t memoryUnitType = MI_ADDRESS(XPP_MemoryUnitType);
-constexpr uint32_t validButtons = 2047;
+constexpr uint32_t validButtons = 131071;
 static_assert(sizeof(std::atomic<uint32_t>) == 4 && std::atomic<uint32_t>::is_always_lock_free);
 }
 
@@ -138,6 +138,8 @@ bool MenuInput::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
   put16(0, (mask & 15) | ((mask & Start) ? 0x10 : 0));
   sample[2] = (mask & Confirm) ? 255 : 0;
   sample[3] = (mask & Back) ? 255 : 0;
+  const std::array<uint32_t, 6> analogMasks{X, Y, Black, White, LeftTrigger, RightTrigger};
+  for (uint32_t n = 0; n < analogMasks.size(); ++n) { sample[4 + n] = (mask & analogMasks[n]) ? 255 : 0; }
   put16(10, (int32_t(bool(mask & StrafeRight)) - int32_t(bool(mask & StrafeLeft))) * 32767);
   put16(12, (int32_t(bool(mask & Forward)) - int32_t(bool(mask & Backward))) * 32767);
   const uint32_t packet = handle->packet + uint32_t(!handle->sampled || sample != handle->last);

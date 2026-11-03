@@ -70,6 +70,38 @@ KernelDataExport InstallVirtualDriveKey(Runtime& runtime, PreparedImage& image) 
   return {323, address, 16};
 }
 
+KernelDataExport InstallSignatureKey(Runtime& runtime, PreparedImage& image) {
+  auto* const memory = image.memory.get();
+  const auto preflight = [&] {
+    runtime.Checkpoint({});
+    if (!memory || image.memory.get() != memory || image.importsBound || image.boundRuntime ||
+        (image.diagnosticRuntime && image.diagnosticRuntime != &runtime) || !image.diagnosticImports.empty() ||
+        runtime.ActiveWorkers() || runtime.HasPublishedImage() || runtime.KernelTarget(325) || Memory::HasBorrow()) {
+      throw Fault({}, 325, 16, "signature key requires an unclaimed unpublished stopped image");
+    }
+  };
+  preflight();
+  constexpr uint32_t address = 0xc0004000;
+  auto mutation = memory->Mutate();
+  if (memory->QueryPages(address).mapped) {
+    throw Fault({}, address, 16, "signature key requires fresh owned storage");
+  }
+  preflight();
+  memory->Map(address, 4096);
+  struct PendingMapping {
+    Memory& memory;
+    bool installed = false;
+    ~PendingMapping() { if (!installed) { memory.Discard(0xc0004000, 4096); } }
+  } pending{*memory};
+  memory->Commit(address, 4096);
+  constexpr std::array<uint8_t, 16> initial{};
+  memory->Write({}, address, initial.data(), initial.size());
+  preflight();
+  image.diagnosticRuntime = &runtime;
+  pending.installed = true;
+  return {325, address, 16};
+}
+
 std::array<KernelDataExport, 6> InstallPlatformProfile(Runtime& runtime, PreparedImage& image) {
   auto* const memory = image.memory.get();
   const auto preflight = [&] {

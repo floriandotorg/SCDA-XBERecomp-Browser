@@ -3,6 +3,7 @@ export const MENU_INPUT = Object.freeze({
   up: 1, down: 2, left: 4, right: 8,
   forward: 16, backward: 32, strafeLeft: 64, strafeRight: 128,
   start: 256, confirm: 512, back: 1024,
+  x: 2048, y: 4096, black: 8192, white: 16384, leftTrigger: 32768, rightTrigger: 65536,
 });
 
 const bindings = new Map([
@@ -13,6 +14,9 @@ const bindings = new Map([
   ['Enter', MENU_INPUT.start], ['NumpadEnter', MENU_INPUT.start],
   ['Space', MENU_INPUT.confirm], ['KeyZ', MENU_INPUT.confirm],
   ['Escape', MENU_INPUT.back], ['Backspace', MENU_INPUT.back],
+  ['KeyX', MENU_INPUT.x], ['KeyY', MENU_INPUT.y],
+  ['KeyQ', MENU_INPUT.black], ['KeyE', MENU_INPUT.white],
+  ['BracketLeft', MENU_INPUT.leftTrigger], ['BracketRight', MENU_INPUT.rightTrigger],
 ]);
 const producers = new WeakMap();
 
@@ -42,7 +46,6 @@ export const createMenuInput = ({ buffer, byteOffset, target = globalThis.window
   Atomics.store(words, 0, 0);
   Atomics.store(words, 1, 0);
   const held = new Set();
-  const suppressed = new Set();
   let enabled = Boolean(active);
   let focused = typeof visibilityTarget.hasFocus === 'function' ? visibilityTarget.hasFocus() : true;
   let disposed = false;
@@ -55,31 +58,32 @@ export const createMenuInput = ({ buffer, byteOffset, target = globalThis.window
     if (Atomics.exchange(words, 0, mask) !== mask) { Atomics.add(words, 1, 1); }
   };
   const clear = () => {
-    for (const code of held) { suppressed.add(code); }
     held.clear();
     publish();
   };
+  const hostControl = (element) => element?.closest?.('input,textarea,select,button,a,summary,[contenteditable]:not([contenteditable="false"])');
   const keydown = (event) => {
     if (!bindings.has(event.code)) { return; }
-    if (!available()) { suppressed.add(event.code); return; }
+    if (!available()) { return; }
     const element = event.composedPath?.()[0] ?? event.target;
-    if (element?.closest?.('input,textarea,select,button,a,[contenteditable]:not([contenteditable="false"])')) {
+    if (hostControl(element)) {
       clear();
       return;
     }
     if (event.ctrlKey || event.altKey || event.metaKey) { return; }
     event.preventDefault();
-    if (event.repeat || suppressed.has(event.code)) { return; }
+    if (event.repeat) { return; }
     held.add(event.code);
     publish();
   };
   const keyup = (event) => {
     if (!bindings.has(event.code)) { return; }
     const consumed = held.delete(event.code);
-    suppressed.delete(event.code);
     if (consumed) { event.preventDefault(); }
     publish();
   };
+  const focusout = (event) => { if (hostControl(event.relatedTarget)) { clear(); } };
+  const focusin = (event) => { if (hostControl(event.composedPath?.()[0] ?? event.target)) { clear(); } };
   const blur = () => { focused = false; clear(); };
   const focus = () => { focused = true; clear(); };
   const visibility = () => { clear(); };
@@ -89,6 +93,8 @@ export const createMenuInput = ({ buffer, byteOffset, target = globalThis.window
     clear();
     target.removeEventListener('keydown', keydown);
     target.removeEventListener('keyup', keyup);
+    target.removeEventListener('focusout', focusout);
+    target.removeEventListener('focusin', focusin);
     focusTarget.removeEventListener('blur', blur);
     focusTarget.removeEventListener('focus', focus);
     visibilityTarget.removeEventListener('visibilitychange', visibility);
@@ -97,6 +103,8 @@ export const createMenuInput = ({ buffer, byteOffset, target = globalThis.window
   };
   target.addEventListener('keydown', keydown);
   target.addEventListener('keyup', keyup);
+  target.addEventListener('focusout', focusout);
+  target.addEventListener('focusin', focusin);
   focusTarget.addEventListener('blur', blur);
   focusTarget.addEventListener('focus', focus);
   visibilityTarget.addEventListener('visibilitychange', visibility);

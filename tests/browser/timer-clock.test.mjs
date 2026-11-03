@@ -7,12 +7,12 @@ import { resolve } from 'node:path';
 const directory = resolve('out/timer-clock-tests');
 mkdirSync(directory, { recursive: true });
 writeFileSync(`${directory}/run.mjs`, "import create from './clock.mjs'; await create();\n");
-for (const platform of ['native', 'wasm']) {
+for (const platform of ['native', 'wasm', 'wasm-main']) {
   test(`${platform} session timer clock shares a monotonic epoch and checks relative deadlines`, () => {
-    const wasm = platform === 'wasm';
+    const wasm = platform !== 'native';
     const output = `${directory}/${wasm ? 'clock.mjs' : 'native'}`;
     const flags = wasm
-      ? ['-fwasm-exceptions', '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=node', '-sFILESYSTEM=0', '-sINITIAL_MEMORY=134217728', '-sPTHREAD_POOL_SIZE=3', '-sPTHREAD_POOL_SIZE_STRICT=2', '-sPROXY_TO_PTHREAD=1', '-sEXIT_RUNTIME=1']
+      ? ['-fwasm-exceptions', '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=node', '-sFILESYSTEM=0', '-sINITIAL_MEMORY=134217728', '-sPTHREAD_POOL_SIZE=3', '-sPTHREAD_POOL_SIZE_STRICT=2', ...(platform === 'wasm' ? ['-sPROXY_TO_PTHREAD=1'] : []), '-sEXIT_RUNTIME=1']
       : ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'];
     const build = spawnSync(wasm ? 'em++' : 'clang++', ['-std=c++20', '-O1', '-g', '-pthread',
       '-DX86_PORTABLE_RUNTIME', '-DX86_COMPACT_MEMORY', '-Isrc', 'tests/browser/timer-clock.cpp',

@@ -9,6 +9,8 @@ const auto check = [](bool value, const char* reason) {
 };
 
 int main() {
+  check(browser::RawCache::PartitionCapacity == 64 * 1024 * 1024 &&
+    browser::RawCache::PartitionCapacity == browser::CacheFatx::Capacity, "raw/cache capacity sources disagree");
   browser::RawCache cache;
   browser::RawCache isolated;
   std::array<uint8_t, 512> bytes{};

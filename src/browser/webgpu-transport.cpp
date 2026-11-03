@@ -41,6 +41,7 @@ uint32_t webgpu_exchange(uint32_t opcode, uint32_t resource, const uint8_t* inpu
   HEAPU32[(metadata >> 2) + 1] = terminal ? 0 : length;
   const status = terminal ? header[7] : header[6];
   Atomics.compareExchange(header, 0, 3, 0);
+  Atomics.notify(header, 0);
   return status;
   }, opcode, resource, input, size, output, metadata);
 }

@@ -1,4 +1,4 @@
-import { serveMailbox, closeMailbox, Status, MAX_BYTES, Opcode } from './webgpu-transport.mjs';
+import { waitForMailboxRequest, serveMailbox, closeMailbox, Status, MAX_BYTES, Opcode } from './webgpu-transport.mjs';
 
 export const createGPUService = async ({ canvas, moduleURL, diagnostic = () => {}, onPresented = () => {}, onAdapter = () => {} }) => {
   const { default: createModule } = await import(moduleURL);
@@ -141,7 +141,7 @@ if (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlob
       service = await createGPUService({ ...event.data, diagnostic: diagnostic => globalThis.postMessage({ type: 'diagnostic', diagnostic }), onPresented: details => globalThis.postMessage({ type: 'presented', details }), onAdapter: details => globalThis.postMessage({ type: 'adapter', details }) });
       if (stopped) { service.shutdown(); globalThis.postMessage({ type: 'stopped', resources: service.resources() }); return; }
       globalThis.postMessage({ type: 'ready' });
-      while (!stopped) {
+      while (!stopped && await waitForMailboxRequest(mailbox)) {
         await serveMailbox(mailbox, async packet => {
           const result = await service.execute(packet);
           if (packet.opcode === Opcode.Shutdown) {
@@ -150,7 +150,6 @@ if (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlob
           }
           return result;
         });
-        await new Promise(resolve => setTimeout(resolve, 1));
       }
     } catch (error) {
       closeMailbox(mailbox, Status.Error);

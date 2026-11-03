@@ -11,6 +11,8 @@ const auto rejects = [](const auto& action) {
   try { action(); } catch (const browser::Fault&) { refused = true; }
   check(refused, "unavailable graphics operation accepted");
 };
+X86_FUNC(__imp__sub_000534B8) { throw browser::Fault(ctx, 0x534b8, 0, "signature Begin is absent from graphics fixture"); }
+X86_FUNC(__imp__sub_0005351A) { throw browser::Fault(ctx, 0x5351a, 0, "signature End is absent from graphics fixture"); }
 std::atomic<uint32_t> defaults = 0;
 std::atomic<uint32_t> originals = 0;
 std::atomic<uint32_t> defaultMode = 0;
@@ -21,9 +23,31 @@ X86_FUNC(__imp__sub_00F13000);
 X86_FUNC(sub_0049CE00);
 X86_FUNC(sub_0049DE60);
 X86_FUNC(sub_004A17C0);
+X86_FUNC(sub_0049BD00);
+X86_FUNC(sub_0049BF30);
+X86_FUNC(sub_0049BD80);
+X86_FUNC(__imp__sub_0049BD80);
+std::vector<uint32_t> destroyedResources;
+bool destroyFails = false;
+void DestroyResource(X86Context& ctx, uint8_t* base) {
+  check(!browser::Memory::HasBorrow(), "resource destruction borrowed guest memory");
+  if (destroyFails) { throw browser::Fault(ctx, 0, 0, "injected destruction failure"); }
+  auto& memory = browser::Memory::From(base);
+  uint32_t header;
+  memory.Read(ctx, ctx.esp + 4, &header, 4);
+  destroyedResources.push_back(header);
+  memory.Decommit(header, 0x1000);
+  ctx.eax = 0x12345678;
+  ctx.ecx ^= 0xabcdef;
+  ctx.esp += 8;
+}
 X86_FUNC(sub_0049CC50);
 X86_FUNC(sub_0049A3D0);
+X86_FUNC(sub_00F14000);
+X86_FUNC(__imp__sub_00F14000);
 X86_FUNC(sub_0049EFF0);
+X86_FUNC(sub_0049EFC0);
+X86_FUNC(__imp__sub_0049EFC0) { throw std::runtime_error("original fastcall state setter should not be called"); }
 X86_FUNC(sub_0049E8B0);
 X86_FUNC(__imp__sub_0049EFF0) { throw std::runtime_error("original state setter should not be called"); }
 X86_FUNC(__imp__sub_0049E8B0) { throw std::runtime_error("unimplemented constant setter should not be called"); }
@@ -64,6 +88,12 @@ int checkpointContracts() {
   browser::QueryContiguousMemoryUsage usage;
   browser::InstallContiguousMemory(runtime, *image.memory, &usage, &access);
   auto graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, image, access, browser::GraphicsMode::Checkpoint);
+  rejects([&] { graphics->ConfigurePresentCheckpoint(1); });
+  graphics->ConfigurePresentCheckpoint(0);
+  {
+    auto lease = image.memory->Borrow();
+    rejects([&] { graphics->ConfigurePresentCheckpoint(0); });
+  }
   browser::InstallSdkProvider(runtime, image, browser::SdkPolicy::UnavailableXNet, graphics);
   browser::BindImageImports(image, runtime, {});
   X86Context context{};
@@ -121,12 +151,23 @@ public:
   uint32_t flags = 0;
   uint32_t lateSyncs = 0;
   uint32_t syncs = 0;
+  bool rejectSync = false;
+  std::function<void(uint32_t, uint32_t)> onSync;
   uint32_t presents = 0;
+  uint32_t flushes = 0;
+  bool rejectFlush = false;
   bool rejectPresent = false;
   gpu::Surface front;
   std::array<uint8_t, 768> gamma{};
   uint32_t gammaCalls = 0;
   std::vector<uint16_t> indices;
+  std::vector<std::array<uint32_t, 2>> released;
+  bool ReleaseResource(uint32_t header, uint32_t data) override {
+    check(!browser::Memory::HasBorrow(), "resource retirement borrowed guest memory");
+    check(std::find(destroyedResources.begin(), destroyedResources.end(), header) != destroyedResources.end(), "resource retired before genuine destruction");
+    released.push_back({header, data});
+    return true;
+  }
   gpu::State state;
   bool Init(uint32_t width, uint32_t height) override {
     ++initializations;
@@ -153,23 +194,119 @@ public:
     ++presents;
   }
   void Sync(uint32_t address, uint32_t bytes) override {
-    check(address >= 0x80000000 && !bytes, "resource sync ABI mismatch");
+    check(address >= 0x80000000 && (!bytes || bytes == 640 * 480 * 4), "resource sync ABI mismatch");
+    if (rejectSync) { throw std::runtime_error("injected sync failure"); }
+    if (onSync) { onSync(address, bytes); }
     ++syncs;
   }
   void SyncLate(uint32_t address) override {
     check(address >= 0x80000000, "SyncLate did not receive checked virtual resource data");
     ++lateSyncs;
   }
-  void Flush() override {}
+  void Flush() override {
+    if (rejectFlush) { throw std::runtime_error("injected flush failure"); }
+    ++flushes;
+  }
   void SetGamma(const uint8_t* ramp) override {
     std::memcpy(gamma.data(), ramp, gamma.size());
     ++gammaCalls;
   }
 };
 
-int captureContracts(bool rendering, bool failInitialization = false) {
+int presentCheckpointContracts(uint32_t limit, bool backendFailure = false) {
   browser::PreparedImage image;
   browser::Runtime runtime(std::array<X86FuncMapping, 4>{{{0xf11000, sub_00F11000}, {0xf12000, sub_00F12000}, {0xf13000, sub_00F13000}, {0x4a1a80, sub_004A1A80}}}, {});
+  image.memory = std::make_unique<browser::Memory>();
+  image.memory->Ensure(0x10000, 0x1000);
+  image.memory->Ensure(0x20000, 0x4000);
+  image.memory->Ensure(0x4ab000, 0x4000);
+  image.image.kernel_thunk = 0x10000;
+  browser::ContiguousMemoryAccess access;
+  browser::InstallContiguousMemory(runtime, *image.memory, nullptr, &access);
+  auto backend = std::make_unique<ProbeBackend>();
+  auto* probe = backend.get();
+  const std::weak_ptr<uint8_t> lifetime = backend->lifetime;
+  auto graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, image, access, browser::GraphicsMode::Rendering, std::move(backend));
+  rejects([&] { graphics->ConfigurePresentCheckpoint(10001); });
+  rejects([&] { graphics->ConfigurePresentCheckpoint(UINT32_MAX); });
+  graphics->ConfigurePresentCheckpoint(10000);
+  graphics->ConfigurePresentCheckpoint(limit);
+  const auto sdk = browser::InstallSdkProvider(runtime, image, browser::SdkPolicy::Observer, graphics);
+  browser::BindImageImports(image, runtime, {});
+  rejects([&] { graphics->ConfigurePresentCheckpoint(0); });
+  X86Context context{};
+  context.host = &runtime;
+  context.esp = 0x22000;
+  const std::array<uint32_t, 7> frame{0xabcdef, 0, 1, 0, 0x50, 0x20000, 0x20100};
+  const std::array<uint32_t, 13> presentation{640, 480, 18, 1, 0, 1, 0, 0, 1, 46, 320, 0, 0x80000002};
+  image.memory->Write(context, context.esp, frame.data(), sizeof(frame));
+  image.memory->Write(context, frame[5], presentation.data(), sizeof(presentation));
+  std::atomic<bool> waiting = false;
+  std::atomic<bool> cancelled = false;
+  std::atomic<bool> returned = false;
+  runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+    sub_00F13000(ctx, base);
+    check(probe->presents == 0 && graphics->Snapshot().completedPresents == 0, "checkpoint synthesized a Present during initialization");
+    rejects([&] { graphics->ConfigurePresentCheckpoint(0); });
+    if (limit) {
+      auto sibling = ctx;
+      sibling.esp = 0x23000;
+      runtime.Launch(sibling, base, [&](X86Context& current, uint8_t*) {
+        waiting = true;
+        try {
+          while (true) { runtime.Checkpoint(current); std::this_thread::yield(); }
+        } catch (const browser::Cancelled&) { cancelled = true; throw; }
+      });
+      while (!waiting.load()) { std::this_thread::yield(); }
+    }
+    const std::array<uint32_t, 2> swap{0xabcdef, 0};
+    const uint32_t attempts = limit ? limit : 3;
+    for (uint32_t n = 0; n < attempts; ++n) {
+      ctx.esp = 0x22000;
+      image.memory->Write(ctx, ctx.esp, swap.data(), sizeof(swap));
+      probe->rejectPresent = backendFailure && n + 1 == attempts;
+      sub_0049CC50(ctx, base);
+      check(ctx.eax == n + 1 && probe->presents == n + 1 && graphics->Snapshot().completedPresents == n + 1,
+        "successful Present was not published exactly once");
+    }
+    returned = true;
+  });
+  const auto failure = runtime.Join();
+  check(runtime.ActiveWorkers() == 0, "Present checkpoint left guest workers alive");
+  const uint32_t completed = limit ? limit - uint32_t(backendFailure) : 3;
+  check(probe->presents == completed && graphics->Snapshot().completedPresents == completed,
+    "failed backend Present was counted or checkpoint stopped at the wrong frame");
+  uint32_t published;
+  image.memory->Read({}, 0x4ab670 + 0x2478, &published, 4);
+  check(published == completed, "terminal snapshot lost genuine guest swap count");
+  check(sdk->Snapshot().count > 0, "terminal checkpoint lost real SDK observations");
+  if (limit) {
+    check(failure && cancelled && !returned, "checkpoint did not cancel and join its sibling worker");
+    bool identified = false;
+    try { std::rethrow_exception(failure); }
+    catch (const browser::GraphicsPresentCheckpoint& fault) {
+      check(!backendFailure && fault.completedPresents == limit && fault.context->eax == limit && fault.context->esp == 0x22008,
+        "named Present checkpoint lost published count or completed Swap context");
+      identified = true;
+    } catch (const browser::Fault& fault) {
+      check(backendFailure && std::string(fault.what()).starts_with("injected present failure") && fault.context->esp == 0x22000,
+        "diagnostic checkpoint swallowed the original backend failure");
+      identified = true;
+    }
+    check(identified, "terminal Present fault was not explicit");
+  } else {
+    check(!failure && returned && !cancelled, "disabled Present checkpoint changed normal execution");
+  }
+  graphics->Shutdown();
+  check(lifetime.expired() && runtime.ActiveWorkers() == 0, "terminal checkpoint retained backend or workers after owned cleanup");
+  rejects([&] { graphics->ConfigurePresentCheckpoint(0); });
+  defaults = 0;
+  return 0;
+}
+
+int captureContracts(bool rendering, bool failInitialization = false) {
+  browser::PreparedImage image;
+  browser::Runtime runtime(std::array<X86FuncMapping, 6>{{{0xf11000, sub_00F11000}, {0xf12000, sub_00F12000}, {0xf13000, sub_00F13000}, {0x4a1a80, sub_004A1A80}, {0x49bd00, sub_0049BD00}, {0x49bf30, sub_0049BF30}}}, {});
   image.memory = std::make_unique<browser::Memory>();
   image.memory->Ensure(0x10000, 0x1000);
   image.memory->Ensure(0x20000, 0x4000);
@@ -213,6 +350,40 @@ int captureContracts(bool rendering, bool failInitialization = false) {
     sub_00F13000(ctx, base);
     const auto snapshot = graphics->Snapshot();
     check(snapshot.initialized && snapshot.resources.size() == 3 && snapshot.commandWords == 2, "normal state capture omitted retained defaults or depth");
+    const std::array<uint32_t, 2> disabledOverlay{0xabcdef, 0};
+    ctx.esp = 0x22000;
+    image.memory->Write(ctx, ctx.esp, disabledOverlay.data(), sizeof(disabledOverlay));
+    bool retainedOverlayFault = false;
+    try { __imp__sub_00F14000(ctx, base); } catch (const browser::Fault& fault) {
+      retainedOverlayFault = fault.context->eax == 0 && fault.address < 0x10000 && !image.memory->IsCommitted(fault.address);
+    }
+    check(retainedOverlayFault, "retained overlay fixture did not expose absent hardware state");
+    for (uint32_t n = 0; n < 2; ++n) {
+      ctx.esp = 0x22000;
+      ctx.eax = 0xdeadbeef;
+      const auto before = ctx;
+      const auto events = graphics->Snapshot().total;
+      sub_00F14000(ctx, base);
+      auto expected = before;
+      expected.eax = 0;
+      expected.esp += 8;
+      check(!std::memcmp(&ctx, &expected, sizeof(ctx)), "disabled overlay changed native stdcall ABI or unrelated registers");
+      check(graphics->Snapshot().total == events, "already disabled overlay submitted fake renderer work");
+    }
+    for (const uint32_t enabled : {1u, UINT32_MAX}) {
+      const std::array<uint32_t, 2> overlay{0xabcdef, enabled};
+      ctx.esp = 0x22000;
+      image.memory->Write(ctx, ctx.esp, overlay.data(), sizeof(overlay));
+      const auto before = ctx;
+      rejects([&] { sub_00F14000(ctx, base); });
+      check(!std::memcmp(&ctx, &before, sizeof(ctx)), "unsupported overlay enable completed or changed caller state");
+    }
+    for (const uint32_t stack : {0x23ffcu, 0xfffffffcu}) {
+      ctx.esp = stack;
+      const auto before = ctx;
+      rejects([&] { sub_00F14000(ctx, base); });
+      check(!std::memcmp(&ctx, &before, sizeof(ctx)), "invalid overlay frame changed caller state");
+    }
     const uint32_t encoding = gpu::kMBlendEnable;
     image.memory->Write(ctx, 0x4a8000 + 57 * 4, &encoding, 4);
     const std::array<uint32_t, 3> simple{0xabcdef, 57, 1};
@@ -229,6 +400,15 @@ int captureContracts(bool rendering, bool failInitialization = false) {
     check(state.simple[gpu::kMBlendEnable >> 2] == 1 && state.rs[gpu::kRsCullMode] == 0x900, "native SDK state semantics were not captured");
     check(state.zs.header == snapshot.resources[2].header && ((state.zs.format >> 8) & 255) == 46, "state capture depth mismatch");
     if (rendering) {
+      ctx.esp = 0x22000;
+      const std::array<uint32_t, 1> idle{0xabcdef};
+      image.memory->Write(ctx, ctx.esp, idle.data(), sizeof(idle));
+      probe->rejectFlush = true;
+      rejects([&] { graphics->Dispatch(ctx, base, 7); });
+      check(ctx.esp == 0x22000 && probe->flushes == 0, "failed renderer drain completed idle wait");
+      probe->rejectFlush = false;
+      check(!graphics->Dispatch(ctx, base, 7) && ctx.esp == 0x22004 && ctx.eax == 0 && probe->flushes == 1,
+        "idle wait did not drain through rendering backend");
       std::array<uint8_t, 768> ramp;
       for (uint32_t n = 0; n < ramp.size(); ++n) { ramp[n] = uint8_t(n); }
       image.memory->Write(ctx, 0x20800, ramp.data(), ramp.size());
@@ -245,11 +425,173 @@ int captureContracts(bool rendering, bool failInitialization = false) {
       rejects([&] { sub_0049A3D0(ctx, base); });
       check(ctx.esp == 0x22000 && probe->gammaCalls == 1, "invalid Gamma source reached backend or advanced stack");
     }
+    const auto typedState = std::make_unique<gpu::State>();
+    const auto refresh = [&]() -> const gpu::State& {
+      *typedState = graphics->State();
+      return *typedState;
+    };
+    const auto typed = [&](uint32_t id, std::initializer_list<uint32_t> arguments) {
+      std::vector<uint32_t> call{0xabcdef};
+      call.insert(call.end(), arguments.begin(), arguments.end());
+      ctx.esp = 0x22000;
+      ctx.eax = 0xdeadbeef;
+      image.memory->Write(ctx, ctx.esp, call.data(), call.size() * 4);
+      check(!graphics->Dispatch(ctx, base, id), "typed state operation delegated to original");
+      check(ctx.esp == 0x22000 + call.size() * 4 && ctx.eax == 0, "typed state operation cleanup mismatch");
+    };
+    ctx.esp = 0x22000;
+    ctx.ecx = 0xa0040000 | gpu::kMSrcBlend | 3;
+    ctx.edx = 0x302;
+    sub_0049EFC0(ctx, base);
+    check(ctx.esp == 0x22004 && ctx.eax == 0 && refresh().simple[gpu::kMSrcBlend >> 2] == 0x302,
+      "fastcall simple state method was not masked and captured");
+    const std::array<std::array<float, 4>, 4> constants{{{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}}};
+    image.memory->Write(ctx, 0x20300, constants.data(), sizeof(constants));
     ctx.esp = 0x22000;
     ctx.ecx = 17;
     ctx.edx = 0x20300;
-    rejects([&] { sub_0049E8B0(ctx, base); });
-    check(ctx.esp == 0x22000 && graphics->State().vsc[17] == std::array<float, 4>{}, "unmirrored typed shader constant setter completed");
+    sub_0049E8B0(ctx, base);
+    check(ctx.esp == 0x22004 && refresh().vsc[17] == constants[0], "fastcall constants were not captured");
+    ctx.ecx = 190;
+    typed(31, {19});
+    check(refresh().vsc[190] == constants[0] && refresh().vsc[191] == constants[1], "constant upload was not clipped to native register range");
+    ctx.ecx = 192;
+    ctx.edx = 0xffffffff;
+    typed(30, {});
+    ctx.ecx = 18;
+    ctx.edx = 0x23ff0;
+    const auto beforeConstants = refresh().vsc;
+    ctx.esp = 0x22000;
+    const std::array<uint32_t, 2> invalidConstants{0xabcdef, 8};
+    image.memory->Write(ctx, ctx.esp, invalidConstants.data(), sizeof(invalidConstants));
+    rejects([&] { graphics->Dispatch(ctx, base, 31); });
+    check(ctx.esp == 0x22000 && refresh().vsc == beforeConstants, "partially readable constants mutated state");
+    const std::array<uint32_t, 8> scissors{1, 2, 3, 4, 5, 6, 7, 8};
+    image.memory->Write(ctx, 0x20400, scissors.data(), sizeof(scissors));
+    typed(35, {2, 1, 0x20400});
+    check(refresh().scissor_count == 2 && refresh().scissors[7] == 8, "scissor state mismatch");
+    const std::array<uint32_t, 6> viewport{10, 20, 320, 240, 0x3e800000, 0x3f400000};
+    image.memory->Write(ctx, 0x20400, viewport.data(), sizeof(viewport));
+    typed(34, {0x20400});
+    typed(36, {0x3f000000, 0xbf000000});
+    const auto& viewportState = refresh();
+    check(viewportState.scissor_count == 0 && viewportState.vsc[58] == std::array<float, 4>{160, -120, 8388607.5f, 0} &&
+      viewportState.vsc[59] == std::array<float, 4>{170.5f, 139.5f, 4194303.75f, 0}, "viewport constants mismatch");
+    image.memory->Write(ctx, 0x20400, constants.data(), sizeof(constants));
+    typed(37, {6, 0x20400});
+    check(refresh().transforms[256][15] == 16, "transform type mapping mismatch");
+    typed(37, {10, 0xffffffff});
+    std::array<float, 17> material{};
+    material[16] = 24;
+    image.memory->Write(ctx, 0x20400, material.data(), sizeof(material));
+    typed(38, {0x20400});
+    check(refresh().material == material, "material mismatch");
+    typed(39, {0x144});
+    check(refresh().vs_handle == 0x144 && !refresh().vs, "FVF selection mismatch");
+    typed(56, {7, gpu::kTssBumpEnvMat00, 0x3f800000});
+    typed(57, {7, 0x11223344});
+    typed(58, {7, 0x55667788});
+    typed(59, {7, 0x1234});
+    typed(60, {7, gpu::kTssMinFilter, 3});
+    const auto textureState = refresh().tss[3];
+    check(textureState[gpu::kTssBumpEnvMat00] == 0x3f800000 && textureState[gpu::kTssBorderColor] == 0x11223344 &&
+      textureState[gpu::kTssColorKeyColor] == 0x55667788 && textureState[gpu::kTssTexCoordIndex] == 0x1234 &&
+      textureState[gpu::kTssMinFilter] == 3, "texture stage masking or typed state mismatch");
+    typed(60, {3, 32, 99});
+    const uint32_t initialDeviceFlags = 0xa5000041;
+    image.memory->Write(ctx, 0x4ab670 + 8, &initialDeviceFlags, 4);
+    typed(63, {0x12});
+    uint32_t constantMode;
+    uint32_t deviceFlags;
+    image.memory->Read(ctx, 0x4ab670 + 0x1928, &constantMode, 4);
+    image.memory->Read(ctx, 0x4ab670 + 8, &deviceFlags, 4);
+    check(constantMode == 2 && deviceFlags == (initialDeviceFlags | 0x200), "shader constant mode metadata mismatch");
+    typed(63, {1});
+    image.memory->Read(ctx, 0x4ab670 + 8, &deviceFlags, 4);
+    check(deviceFlags == initialDeviceFlags, "shader constant mode flag clearing damaged device flags");
+    ctx.esp = 0x22000;
+    const std::array<uint32_t, 2> fixedFunctionMode{0xabcdef, 0x10};
+    image.memory->Write(ctx, ctx.esp, fixedFunctionMode.data(), sizeof(fixedFunctionMode));
+    rejects([&] { graphics->Dispatch(ctx, base, 63); });
+    image.memory->Read(ctx, 0x4ab670 + 0x1928, &constantMode, 4);
+    check(ctx.esp == 0x22000 && constantMode == 1, "unsupported fixed-function mode partially changed device metadata");
+    const auto readWord = [&](uint32_t address) {
+      uint32_t value;
+      image.memory->Read(ctx, address, &value, 4);
+      return value;
+    };
+    const std::array<uint32_t, 6> textureHeader{0x40001, 0x102000, 0, 0x11221, 0x00001001, 0};
+    image.memory->Write(ctx, 0x20600, textureHeader.data(), sizeof(textureHeader));
+    typed(46, {5, 0x20600});
+    check(readWord(0x20600) == 0xc0001 && readWord(0x4ab670 + 0xf8c) == 0x20600 &&
+      (readWord(0x4ab1c8) & 0x4800) == 0x4800 && refresh().textures[1] == 0x20600, "texture binding omitted native references or dirty flags");
+    typed(46, {1, 0x20600});
+    check(readWord(0x20600) == 0xc0001, "redundant texture binding changed references");
+    typed(46, {1, 0});
+    check(readWord(0x20600) == 0x40001, "texture unbind leaked internal reference");
+    const std::array<uint32_t, 3> bufferHeader{1, 0x102000, 0};
+    image.memory->Write(ctx, 0x20600, bufferHeader.data(), sizeof(bufferHeader));
+    typed(47, {17, 0x20600, 24});
+    check(readWord(0x20600) == 0x80001 && readWord(0x4adb10 + 12) == 24 &&
+      readWord(0x4adb10 + 20) == 0x20600 && refresh().streams[1].vb == 0x20600, "stream binding omitted native metadata");
+    typed(47, {1, 0x20600, 32});
+    check(readWord(0x20600) == 0x80001 && refresh().streams[1].stride == 32, "redundant stream binding lost stride update");
+    typed(48, {0x20600, 7});
+    check(readWord(0x20600) == 0x100001 && readWord(0x4ab1cc) == 0x102000 &&
+      readWord(0x4ab670 + 0x7a0) == 0x20600 && readWord(0x4ab670 + 0x1c) == 7, "index binding omitted native metadata");
+    typed(48, {0, 9});
+    typed(47, {1, 0, 0});
+    check(readWord(0x20600) == 1 && refresh().index_data == 0 && refresh().base_vertex == 9, "buffer unbind leaked references");
+    typed(45, {0, 0});
+    check(refresh().rt.header == state.rt.header && !refresh().zs.header && refresh().viewport.w == 640 &&
+      refresh().viewport.h == 480, "render target reuse or full viewport reset mismatch");
+    typed(45, {state.rt.header, state.zs.header});
+    const auto bindings = refresh().textures;
+    ctx.esp = 0x22000;
+    const std::array<uint32_t, 3> invalidTexture{0xabcdef, 0, 0x24000};
+    image.memory->Write(ctx, ctx.esp, invalidTexture.data(), sizeof(invalidTexture));
+    rejects([&] { graphics->Dispatch(ctx, base, 46); });
+    check(ctx.esp == 0x22000 && refresh().textures == bindings, "invalid resource binding mutated state");
+    const std::array<uint32_t, 8> declaration{0x20000000, 0x40320000, 0x82000011, 0x3f800000, 0x40000000, 0x40400000, 0x40800000, 0xffffffff};
+    const std::array<uint32_t, 5> program{0x00012078, 0, 0x00200000, 0, 1};
+    image.memory->Write(ctx, 0x20800, declaration.data(), sizeof(declaration));
+    image.memory->Write(ctx, 0x20900, program.data(), sizeof(program));
+    typed(49, {0x20800, 0x20900, 0x20700, 0});
+    const uint32_t vertexShader = readWord(0x20700);
+    typed(39, {vertexShader});
+    check(refresh().vs && refresh().vs->handle == vertexShader && refresh().vs->program_type == 0x2078 &&
+      refresh().vs->inputs[0].type == 0x32 && refresh().vsc[17] == constants[0], "created vertex shader selection omitted declaration constants or program");
+    const auto ownedVertex = graphics->SnapshotState().vs;
+    typed(50, {vertexShader});
+    check(refresh().vs && ownedVertex->program.size() == 4, "deleting a bound shader invalidated its retained state");
+    typed(39, {0x144});
+    std::array<uint32_t, 60> definition{};
+    for (uint32_t n = 0; n < definition.size(); ++n) { definition[n] = n + 100; }
+    definition[57] = 0xfffffff0;
+    definition[58] = 0xffffff1f;
+    definition[59] = 0x10;
+    image.memory->Write(ctx, 0x20800, definition.data(), sizeof(definition));
+    typed(51, {0x20800, 0x20704});
+    const uint32_t pixelShader = readWord(0x20704);
+    typed(32, {pixelShader});
+    check(refresh().ps && refresh().ps->handle == pixelShader && refresh().simple[gpu::kMPsFinalAbcd / 4] == definition[8] &&
+      refresh().simple[gpu::kMPsCombinerCount / 4] == definition[53] && refresh().rs[gpu::kRsPsTextureModes] == definition[54],
+      "created pixel shader did not load native combiner state");
+    const std::array<float, 8> pixelConstants{1, 0.5f, 0, 0.25f, 0, 1, 0.25f, 1};
+    image.memory->Write(ctx, 0x20900, pixelConstants.data(), sizeof(pixelConstants));
+    typed(33, {0, 0x20900, 2});
+    check(refresh().simple[gpu::kMPsConstant0 / 4] == 0x40ff8000 &&
+      refresh().simple[gpu::kMPsConstant1 / 4 + 1] == 0xff00ff40 && refresh().simple[gpu::kMPsFinalConstant1 / 4] == 0xff00ff40,
+      "pixel shader constant mappings did not update native combiner words");
+    typed(33, {16, 0xffffffff, UINT32_MAX});
+    typed(52, {pixelShader});
+    check(refresh().ps && refresh().ps->def[59] == 0x10, "deleting bound pixel shader lost owned definition");
+    typed(32, {0});
+    ctx.esp = 0x22000;
+    const std::array<uint32_t, 2> unknownShader{0xabcdef, pixelShader};
+    image.memory->Write(ctx, ctx.esp, unknownShader.data(), sizeof(unknownShader));
+    rejects([&] { graphics->Dispatch(ctx, base, 32); });
+    check(ctx.esp == 0x22000 && !refresh().ps, "deleted shader handle was accepted");
     const std::array<uint32_t, 2> block{0xabcdef, state.rt.header};
     ctx.esp = 0x22000;
     image.memory->Write(ctx, ctx.esp, block.data(), sizeof(block));
@@ -321,6 +663,40 @@ int captureContracts(bool rendering, bool failInitialization = false) {
       sub_0049CC50(ctx, base);
       check(ctx.eax == 2 && graphics->Snapshot().resources[1].data == snapshot.resources[1].data,
         "second native Swap did not restore payload ring");
+      const std::array<uint32_t, 1> persistFrame{0xabcdef};
+      image.memory->Write(ctx, 0x22000, persistFrame.data(), sizeof(persistFrame));
+      ctx.esp = 0x22000;
+      probe->rejectSync = true;
+      rejects([&] { graphics->Dispatch(ctx, base, 15); });
+      check(ctx.esp == 0x22000 && !graphics->PersistedDisplaySnapshot(), "failed persistence published success or pixels");
+      probe->rejectSync = false;
+      std::vector<uint8_t> pixels(640 * 480 * 4, 0x3a);
+      probe->onSync = [&](uint32_t address, uint32_t bytes) {
+        check(bytes == pixels.size(), "persist readback size differs from owned front surface");
+        image.memory->Write(ctx, address, pixels.data(), pixels.size());
+      };
+      check(!graphics->Dispatch(ctx, base, 15) && ctx.esp == 0x22004 && ctx.eax == 0,
+        "PersistDisplay did not complete native stdcall ABI");
+      const auto persisted = graphics->PersistedDisplaySnapshot();
+      check(persisted && persisted->pixels == pixels && persisted->format == snapshot.resources[0].format &&
+        persisted->size == snapshot.resources[0].size, "persisted display did not own real synchronized front pixels");
+      const uint8_t changed = 0xee;
+      image.memory->Write(ctx, snapshot.resources[0].data, &changed, 1);
+      check(graphics->PersistedDisplaySnapshot()->pixels.front() == 0x3a, "persisted frame borrowed guest storage");
+      pixels.front() = 0x6b;
+      ctx.esp = 0x22000;
+      check(!graphics->Dispatch(ctx, base, 15) && graphics->PersistedDisplaySnapshot()->pixels == pixels &&
+        persisted->pixels.front() == 0x3a, "repeated persistence retained stale pixels or changed a previous snapshot");
+      const uint32_t invalidSize = UINT32_MAX;
+      image.memory->Write(ctx, snapshot.resources[0].header + 16, &invalidSize, 4);
+      ctx.esp = 0x22000;
+      const auto syncs = probe->syncs;
+      rejects([&] { graphics->Dispatch(ctx, base, 15); });
+      check(probe->syncs == syncs && ctx.esp == 0x22000 && graphics->PersistedDisplaySnapshot()->pixels == pixels,
+        "invalid persistence metadata reached GPU or replaced the valid frame");
+      image.memory->Write(ctx, snapshot.resources[0].header + 16, &snapshot.resources[0].size, 4);
+      probe->onSync = {};
+
     } else {
       rejects([&] { sub_0049CE00(ctx, base); });
       const auto stopped = graphics->Snapshot();
@@ -346,6 +722,23 @@ int captureContracts(bool rendering, bool failInitialization = false) {
     image.memory->Write(ctx, ctx.esp, block.data(), sizeof(block));
     check(!graphics->Dispatch(ctx, base, 8) && graphics->State().vsc[17] == std::array<float, 4>{1, 2, 3, 4},
       "verified state-only pushes did not update portable constants before resource wait");
+    if (rendering) {
+      uint32_t threshold;
+      image.memory->Read(ctx, 0x4ab674, &threshold, 4);
+      const uint32_t scratch = threshold - 0xf000;
+      for (uint32_t n = 0; n < 128; ++n) {
+        ctx.esp = 0x22000;
+        check(!graphics->Dispatch(ctx, base, 4) && ctx.esp == 0x22004 && ctx.eax == scratch,
+          "MakeSpace did not return and rewind owned scratch storage");
+        image.memory->Read(ctx, 0x4ab670, &push, 4);
+        check(push == scratch && graphics->Snapshot().commands.empty() &&
+          graphics->State().vsc[17] == std::array<float, 4>{1, 2, 3, 4},
+          "scratch recycling lost decoded state or retained command history");
+        image.memory->Write(ctx, push, stateOnly.data(), sizeof(stateOnly));
+        push += sizeof(stateOnly);
+        image.memory->Write(ctx, 0x4ab670, &push, 4);
+      }
+    }
     const std::array<uint32_t, 2> unsubmitted{0x000417fc, 99};
     image.memory->Write(ctx, push, unsubmitted.data(), sizeof(unsubmitted));
     push += sizeof(unsubmitted);
@@ -354,12 +747,21 @@ int captureContracts(bool rendering, bool failInitialization = false) {
     image.memory->Write(ctx, ctx.esp, lock.data(), sizeof(lock));
     rejects([&] { graphics->Dispatch(ctx, base, 9); });
     rejects([&] { graphics->Dispatch(ctx, base, 9); });
+    if (rendering) {
+      const auto flushes = probe->flushes;
+      rejects([&] { graphics->Dispatch(ctx, base, 7); });
+      check(probe->flushes == flushes, "unverified guest draws reached idle drain");
+      rejects([&] { graphics->Dispatch(ctx, base, 4); });
+      uint32_t cursor;
+      image.memory->Read(ctx, 0x4ab670, &cursor, 4);
+      check(cursor == push, "MakeSpace discarded unverified guest commands");
+    }
     check(ctx.esp == 0x22000, "unsubmitted guest pushes were acknowledged as available CPU data");
   });
   if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
   runtime.Stop();
   graphics->Shutdown();
-  check(backendLifetime.expired(), "GPU backend outlived its joined image memory owner");
+  check(backendLifetime.expired() && !graphics->PersistedDisplaySnapshot(), "GPU backend or persisted pixels outlived joined cleanup");
   graphics->Shutdown();
   image.memory.reset();
   defaults = 0;
@@ -559,8 +961,135 @@ int contracts() {
   std::puts("diagnostic-graphics-contracts-ok");
   return 0;
 }
+int releaseContracts() {
+  browser::PreparedImage image;
+  browser::Runtime runtime(std::array<X86FuncMapping, 4>{{{0xf11000, sub_00F11000}, {0xf12000, sub_00F12000}, {0xf13000, sub_00F13000}, {0x49bd80, sub_0049BD80}}}, {});
+  image.memory = std::make_unique<browser::Memory>();
+  image.memory->Ensure(0x10000, 0x1000);
+  image.memory->Ensure(0x20000, 0x4000);
+  image.image.kernel_thunk = 0x10000;
+  browser::ContiguousMemoryAccess access;
+  browser::InstallContiguousMemory(runtime, *image.memory, nullptr, &access);
+  auto backend = std::make_unique<ProbeBackend>();
+  auto* probe = backend.get();
+  auto graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, image, access, browser::GraphicsMode::Rendering, std::move(backend));
+  browser::InstallSdkProvider(runtime, image, browser::SdkPolicy::Observer, graphics);
+  browser::BindImageImports(image, runtime, {});
+  X86Context context{};
+  context.host = &runtime;
+  context.esp = 0x22000;
+  destroyedResources.clear();
+  runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+    const auto create = [&](uint32_t header, uint32_t common, uint32_t data, uint32_t parent = 0) {
+      image.memory->Ensure(header, 0x1000);
+      const std::array<uint32_t, 6> words{common, data, 0, 0, 0, parent};
+      image.memory->Write(ctx, header, words.data(), sizeof(words));
+    };
+    const auto frame = [&](uint32_t header) {
+      ctx.esp = 0x22000;
+      const std::array<uint32_t, 2> words{0xabcdef, header};
+      image.memory->Write(ctx, ctx.esp, words.data(), sizeof(words));
+    };
+    create(0x30000, 0x40002, 0x80123000);
+    frame(0x30000);
+    sub_0049BD80(ctx, base);
+    check(ctx.eax == 1 && ctx.esp == 0x22008 && probe->released.empty(), "nonfinal external release retired storage or changed ABI");
+    frame(0x30000);
+    sub_0049BD80(ctx, base);
+    check(ctx.eax == 0 && ctx.esp == 0x22008 && probe->released == std::vector<std::array<uint32_t, 2>>{{0x30000, 0x80123000}}, "genuine final release did not notify after header decommit");
+    create(0x31000, 0xc0001, 0x123000);
+    frame(0x31000);
+    sub_0049BD80(ctx, base);
+    check(ctx.eax == 0 && probe->released.size() == 1 && image.memory->IsCommitted(0x31000), "external zero retired internally retained alias");
+    frame(0x31000);
+    sub_0049BF30(ctx, base);
+    check(probe->released.size() == 2 && probe->released.back()[0] == 0x31000, "internal final release failed retirement");
+    create(0x32000, 0x40001, 0x123000);
+    create(0x33000, 0x50001, 0x123000, 0x32000);
+    frame(0x33000);
+    sub_0049BD80(ctx, base);
+    check(ctx.eax == 0 && ctx.esp == 0x22008 && probe->released.size() == 4 && probe->released[2][0] == 0x32000 && probe->released[3][0] == 0x33000, "nested parent final release lost owned snapshot");
+    create(0x34000, 0x40001, 0x123000);
+    frame(0x34000);
+    destroyFails = true;
+    rejects([&] { sub_0049BD80(ctx, base); });
+    destroyFails = false;
+    check(probe->released.size() == 4, "failed original release retired storage");
+    frame(0x34000);
+    sub_0049BD80(ctx, base);
+    check(probe->released.size() == 5, "exception leaked release marker");
+    create(0x37000, 0xc0000, 0x123000);
+    create(0x38000, 0xd0000, 0x123000, 0x37000);
+    frame(0x38000);
+    sub_0049BF30(ctx, base);
+    check(probe->released.size() == 7 && probe->released[5][0] == 0x37000 && probe->released[6][0] == 0x38000, "internal final release lost direct parent destruction");
+    create(0x39000, 0x40001, 0x123000);
+    frame(0x39000);
+    const auto finalBefore = ctx;
+    __imp__sub_0049BD80(ctx, base);
+    const auto finalExpected = ctx;
+    create(0x39000, 0x40001, 0x123000);
+    ctx = finalBefore;
+    sub_0049BD80(ctx, base);
+    check(!std::memcmp(&ctx, &finalExpected, sizeof(ctx)), "final release observer altered genuine destructor effects or ABI");
+    const auto releasesBeforeOverflow = probe->released.size();
+    for (uint32_t n = 0; n < 34; ++n) {
+      create(0x40000 + n * 0x1000, 0x50001, 0x123000, n == 33 ? 0 : 0x41000 + n * 0x1000);
+    }
+    frame(0x40000);
+    rejects([&] { sub_0049BD80(ctx, base); });
+    check(probe->released.size() == releasesBeforeOverflow, "release nesting overflow retired incomplete originals");
+    create(0x39000, 0x40001, 0x123000);
+    frame(0x39000);
+    sub_0049BD80(ctx, base);
+    check(probe->released.size() == releasesBeforeOverflow + 1, "release nesting overflow leaked worker markers");
+    frame(0x34000);
+    rejects([&] { browser::Runtime::ObserveSdkEntry(ctx, base, 66); });
+    rejects([&] { browser::Runtime::ObserveSdkEntry(ctx, base, 67); });
+    rejects([&] { browser::Runtime::ObserveSdkEntry(ctx, base, 68); });
+    rejects([&] { browser::Runtime::ObserveSdkEntry(ctx, base, 69); });
+    for (const uint32_t stack : {0x23ffcu, 0xfffffffcu}) {
+      ctx.esp = stack;
+      rejects([&] { sub_0049BD80(ctx, base); });
+    }
+    create(0x35000, 0x40002, 0x123000);
+    create(0x36000, 0x40002, 0x123000);
+    frame(0x35000);
+    const auto before = ctx;
+    __imp__sub_0049BD80(ctx, base);
+    const auto expected = ctx;
+    ctx = before;
+    frame(0x36000);
+    sub_0049BD80(ctx, base);
+    check(!std::memcmp(&ctx, &expected, sizeof(ctx)), "release wrapper altered genuine ABI registers or flags");
+  });
+  if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+  const auto releasedBeforeWorkers = probe->released.size();
+  std::atomic<uint32_t> ready = 0;
+  for (uint32_t n = 0; n < 2; ++n) {
+    const uint32_t header = 0x80000 + n * 0x1000;
+    image.memory->Ensure(header, 0x1000);
+    const std::array<uint32_t, 6> words{0x40001, 0x123000};
+    image.memory->Write({}, header, words.data(), sizeof(words));
+    auto current = context;
+    current.esp += n * 0x100;
+    const std::array<uint32_t, 2> frame{0xabcdef, header};
+    image.memory->Write({}, current.esp, frame.data(), sizeof(frame));
+    runtime.Launch(current, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+      ++ready;
+      while (ready.load() < 2) { std::this_thread::yield(); }
+      const auto stack = ctx.esp;
+      sub_0049BD80(ctx, base);
+      check(ctx.eax == 0 && ctx.esp == stack + 8, "concurrent release used another worker marker");
+    });
+  }
+  if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+  check(probe->released.size() == releasedBeforeWorkers + 2, "concurrent release lost a worker retirement");
+  graphics->Shutdown();
+  return 0;
+}
 int main() {
-  try { checkpointContracts(); captureContracts(false); captureContracts(true); captureContracts(true, true); return contracts(); } catch (const std::exception& error) {
+  try { presentCheckpointContracts(1); presentCheckpointContracts(3); presentCheckpointContracts(3, true); presentCheckpointContracts(0); releaseContracts(); checkpointContracts(); captureContracts(false); captureContracts(true); captureContracts(true, true); return contracts(); } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());
     return 1;
   }

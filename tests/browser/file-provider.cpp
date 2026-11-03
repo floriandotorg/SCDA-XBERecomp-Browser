@@ -1,7 +1,9 @@
 #include "browser/file-provider.h"
+#include "browser/cache-fatx.h"
 #include "browser/thread-provider.h"
 #include "browser/temporary-filesystem.h"
 #include <array>
+#include <chrono>
 #include <cstdio>
 
 const auto check = [](bool value, const char* reason) {
@@ -9,6 +11,10 @@ const auto check = [](bool value, const char* reason) {
 };
 std::function<bool(uint32_t)> closeFile;
 const auto entry = [](X86Context& ctx, uint8_t* base) {
+  constexpr uint32_t cacheHeaderSize = 4096;
+  constexpr uint32_t cacheFatSize = ((browser::CacheFatx::Capacity / browser::CacheFatx::AllocationUnit + 1) * 2 + 4095) / 4096 * 4096;
+  constexpr uint32_t cacheRootOffset = cacheHeaderSize + cacheFatSize;
+  constexpr uint32_t cacheUnits = (browser::CacheFatx::Capacity - cacheRootOffset) / browser::CacheFatx::AllocationUnit;
   auto& memory = browser::Memory::From(base);
   auto& runtime = browser::Runtime::From(ctx);
   const auto close = [&](uint32_t handle) { return runtime.Call(ctx, base, runtime.KernelTarget(187), {handle}) == 0; };
@@ -118,10 +124,10 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
     check(ctx.esp == stack && get(status) == result && get(status + 4) == (result ? 0 : code == 0x70000 ? 24 : 32), "raw IOCTL status or frame cleanup corrupted");
     return result;
   };
-  check(deviceControl(0x70000, 24) == 0 && get(0x10a00) == 1024 && get(0x10a04) == 0 &&
+  check(deviceControl(0x70000, 24) == 0 && get(0x10a00) == browser::CacheFatx::Capacity / (512 * 32) && get(0x10a04) == 0 &&
     get(0x10a08) == 12 && get(0x10a0c) == 1 && get(0x10a10) == 32 && get(0x10a14) == 512, "virtual cache geometry not coherent");
   check(deviceControl(0x74004, 32) == 0 && get(0x10a00) == 0 && get(0x10a04) == 0 &&
-    get(0x10a08) == 16 * 1024 * 1024 && get(0x10a0c) == 0 && get(0x10a10) == 0 &&
+    get(0x10a08) == browser::CacheFatx::Capacity && get(0x10a0c) == 0 && get(0x10a10) == 0 &&
     get(0x10a14) == 3 && get(0x10a18) == 0 && get(0x10a1c) == 0, "virtual partition record not backed by owned cache");
   put(0x10a00, 0x12345678);
   check(deviceControl(0x70000, 23) == 0xc0000023 && get(0x10a00) == 0x12345678, "short geometry query modified output");
@@ -150,7 +156,7 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   for (uint32_t ordinal : {236u}) {
     check(rawPartitionTransfer(ordinal, 1) == 0xc000000d, "cache partition accepted unaligned offset");
     check(rawPartitionTransfer(ordinal, 0, 511) == 0xc000000d, "cache partition accepted unaligned length");
-    check(rawPartitionTransfer(ordinal, 16 * 1024 * 1024 - 512, 1024) == 0xc000000d, "cache partition admitted overflow beyond capacity");
+    check(rawPartitionTransfer(ordinal, browser::CacheFatx::Capacity - 512, 1024) == 0xc000000d, "cache partition admitted overflow beyond capacity");
     check(rawPartitionTransfer(ordinal, UINT64_MAX) == 0xc000000d, "cache partition admitted negative offset");
     bool refused = false;
     try { rawPartitionTransfer(ordinal, 0, 4096, 0x30000, 0x30004); }
@@ -276,6 +282,27 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   check(createAlias("\\??\\X:", "\\Device\\Harddisk0\\Partition1\\..\\X") == 0xc0000033, "alias target traversal accepted");
   check(createAlias("\\??\\T:", "\\Device\\Harddisk0\\Partition1\\CACHE") == 0, "owned temporary alias failed");
   check(open("T:\\save.bin") == 0 && close(get(0x10100)), "temporary alias not bound to backed namespace");
+  for (const std::string path : {"D:\\LEVELS\\", "\\??\\D:\\LEVELS\\", "\\Device\\CdRom0\\LEVELS\\",
+      "T:\\", "\\Device\\Harddisk0\\Partition1\\CACHE\\"}) {
+    check(open(path, 0xfffffffdu, 0x100001, 0x4021) == 0 && close(get(0x10100)),
+      ("observed directory open refused single terminal separator after resolution: " + path).c_str());
+  }
+  check(open("D:\\", 0, 0x100001, 0x4021) == 0, "directory relative fixture failed");
+  const auto levels = get(0x10100);
+  check(open("LEVELS\\", levels, 0x100001, 0x4021) == 0 && close(get(0x10100)), "rooted directory terminal separator refused");
+  check(close(levels), "directory relative fixture did not close");
+  for (const std::string path : {"D:\\LEVELS\\\\", "D:\\LEVELS\\..\\", "D:\\LEVELS\\.\\", "D:\\\\LEVELS\\", "D:\\\\", "T:\\\\"}) {
+    check(open(path, 0xfffffffdu, 0x100001, 0x4021) == 0xc0000033,
+      "directory terminal normalization weakened separator or traversal checks");
+  }
+  for (const std::string path : {"D:\\default.xbe\\", "T:\\save.bin\\", "D:\\LEVELS\\"}) {
+    check(open(path, 0xfffffffdu, 0x100001, 0x60) == 0xc0000033,
+      "non-directory open gained terminal separator normalization");
+  }
+  check(open("D:\\default.xbe\\", 0xfffffffdu, 0x100001, 0x4021) == 0xc0000103,
+    "normalized directory open accepted backed file");
+  check(open("T:\\absent\\", 0xfffffffdu, 0x100001, 0x4021) == 0xc0000034,
+    "directory normalization fabricated missing entry");
   check(createAlias("\\??\\Z:", "\\??\\D:") == 0xc00000bb, "unbounded alias chain accepted");
   check(open("\\Device\\CdRom0", 0, 0x100001, 0x21) == 0, "selected disc root did not open");
   const auto root = get(0x10100);
@@ -334,13 +361,13 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   check(createDirectory("D:\\FORBIDDEN") == 0xc0000022, "directory create modified selected ISO");
   check(createDirectory("..\\ESCAPE", 3, temporaryRoot) == 0xc0000033, "directory create traversal accepted");
   check(query(temporaryRoot) == 0 && get(0x10408) == 1020, "guest directory creation not reflected in quota");
-  const auto createFile = [&](std::string path, uint32_t disposition = 3, uint32_t output = 0x10100, uint32_t allocation = 0, uint32_t attributes = 4) {
+  const auto createFile = [&](std::string path, uint32_t disposition = 3, uint32_t output = 0x10100, uint32_t allocation = 0, uint32_t attributes = 4, uint32_t access = 0x40100000, uint32_t options = 0x22) {
     memory.Write(ctx, 0x10300, path.data(), path.size());
     put(0x10200, uint32_t(path.size()) | (uint32_t(path.size()) << 16)); put(0x10204, 0x10300);
     put(0x10210, 0); put(0x10214, 0x10200); put(0x10218, 0x40);
     put(0x10100, 0xabcdef); put(0x10108, 0xabcdef); put(0x1010c, 0xabcdef);
     const auto stack = ctx.esp;
-    const auto result = runtime.Call(ctx, base, runtime.KernelTarget(190), {output, 0x40100000, 0x10210, 0x10108, allocation, attributes, 1, disposition, 0x22});
+    const auto result = runtime.Call(ctx, base, runtime.KernelTarget(190), {output, access, 0x10210, 0x10108, allocation, attributes, 1, disposition, options});
     check(ctx.esp == stack && get(0x10108) == result, "create file status or cleanup corrupted");
     if (result) { check(get(0x10100) == 0xabcdef && get(0x1010c) == 0, "failed file create published partial outputs"); }
     return result;
@@ -408,8 +435,35 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   check(createFile("D:\\NEW.XBX") == 0xc0000022, "file create modified selected ISO");
   check(createFile("\\Device\\Harddisk0\\partition1\\MISSING\\NEW.XBX") == 0xc000003a, "file create synthesized missing parent");
   put(0x10700, 1); put(0x10704, 0);
-  check(createFile(titleFile, 3, 0x10100, 0x10700) == 0xc00000bb, "unobserved allocation request accepted");
+  check(createFile(titleFile, 3, 0x10100, 0x10700) == 0 && queryFile(get(0x10100)) == 0 &&
+    get(0x10828) == 5 && close(get(0x10100)), "existing OPEN_IF hint changed EOF");
+  check(createFile("\\Device\\Harddisk0\\Partition1\\UDATA\\1234ABCD\\SaveMeta.xbx", 3, 0x10100, 0x10700, 4, 0xc0100000) == 0,
+    "observed SaveMeta initial allocation request refused");
+  const auto saveMeta = get(0x10100);
+  check(queryFile(saveMeta) == 0 && get(0x10820) == 16384 && get(0x10828) == 0,
+    "initial allocation changed logical EOF or vanished from metadata");
+  check(writeFile(saveMeta) == 0 && queryFile(saveMeta) == 0 && get(0x10828) == 3 &&
+    get(0x10820) == 16384 && close(saveMeta), "reserved metadata did not retain genuine writes");
+  check(createFile("\\Device\\Harddisk0\\Partition1\\UDATA\\1234ABCD\\SaveMeta.xbx", 3, 0x10100, 0, 4, 0x80100080, 0x60) == 0,
+    "observed readonly metadata OPEN_IF refused");
+  const auto metadataReader = get(0x10100);
+  check(runtime.Call(ctx, base, runtime.KernelTarget(219), {metadataReader, 0, 0, 0, 0x10840, 0x10a00, 3, 0}) == 0 &&
+    (get(0x10a00) & 0xffffff) == (get(0x10900) & 0xffffff) && close(metadataReader), "metadata OPEN_IF lost stored bytes");
   check(createFile(titleFile, 5) == 0xc00000bb, "unobserved overwrite disposition accepted");
+  for (const uint32_t options : {0x60u, 0x64u}) {
+    const std::string profile = "\\Device\\Harddisk0\\Partition1\\UDATA\\1234ABCD\\PROFILE.SAV";
+    check(createFile(profile, 5, 0x10100, 0, 0x80, 0x40100080, options) == 0,
+      "observed profile CREATE_ALWAYS mode refused");
+    const auto handle = get(0x10100);
+    check(writeFile(handle) == 0 && queryFile(handle) == 0 && get(0x10828) == 3 && close(handle),
+      "profile CREATE_ALWAYS did not retain written bytes");
+    check(createFile(profile, 3, 0x10100, 0, 0x80, 0x40100080, 0x60) == 0 && get(0x1010c) == 1 &&
+      queryFile(get(0x10100)) == 0 && get(0x10828) == 3 && close(get(0x10100)),
+      "observed profile write OPEN_IF refused or truncated existing bytes");
+    check(createFile(profile, 5, 0x10100, 0, 0x80, 0x40100080, options) == 0 &&
+      get(0x1010c) == 3 && queryFile(get(0x10100)) == 0 && get(0x10828) == 0 && close(get(0x10100)),
+      "profile overwrite did not atomically reset EOF");
+  }
   check(createFile(titleFile, 3, 0x10100, 0, 0x10) == 0xc000000d, "byte-file create accepted directory attribute");
   bool invalidFileRefused = false;
   try { createFile("\\Device\\Harddisk0\\partition1\\UDATA\\ATOMIC.XBX", 3, 0x20000); }
@@ -452,10 +506,16 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   rawBytes.fill(0);
   memory.Write(ctx, 0x30000, rawBytes.data(), rawBytes.size());
   put(0x30000, 0xfffffff8);
-  check(rawPartitionTransfer(236, 4096) == 0, "guest FATX allocation table write failed");
+  check(rawPartitionTransfer(236, cacheHeaderSize) == 0, "guest FATX allocation table write failed");
+  put(0x30000, 0);
+  for (uint32_t n = 1; n < cacheFatSize / rawBytes.size(); ++n) {
+    check(rawPartitionTransfer(236, cacheHeaderSize + n * rawBytes.size()) == 0, "guest FATX table tail write failed");
+  }
   rawBytes.fill(0xff);
   memory.Write(ctx, 0x30000, rawBytes.data(), rawBytes.size());
-  for (uint32_t n = 0; n < 4; ++n) { check(rawPartitionTransfer(236, 8192 + 4096 * n) == 0, "guest FATX root cluster write failed"); }
+  for (uint32_t n = 0; n < browser::CacheFatx::AllocationUnit / rawBytes.size(); ++n) {
+    check(rawPartitionTransfer(236, cacheRootOffset + n * rawBytes.size()) == 0, "guest FATX root cluster write failed");
+  }
   check(dismount(0x1234) == 0xc00000bb, "unknown filesystem control faked success");
   check(dismount(0x90020, 0x10a00, 4) == 0xc00000bb, "unobserved dismount output mode accepted");
   bool invalidDismountRefused = false;
@@ -468,7 +528,7 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   check(close(formatter), "formatted cache raw handle did not close");
   check(open("\\Device\\Harddisk0\\Partition3\\", 0, 0x100001, 0x800021) == 0, "validated FATX namespace did not mount lazily");
   const auto cacheRoot = get(0x10100);
-  check(query(cacheRoot) == 0 && get(0x10400) == 1023 && get(0x10408) == 1022 && get(0x10410) * get(0x10414) == 16384, "cache quota includes reserved FATX bytes or wrong allocation unit");
+  check(query(cacheRoot) == 0 && get(0x10400) == cacheUnits && get(0x10408) == cacheUnits - 1 && get(0x10410) * get(0x10414) == 16384, "cache quota includes reserved FATX bytes or wrong allocation unit");
   check(open("\\Device\\Harddisk0\\Partition3", 0, 0x100003, 0x18, 0x10100, 0x10108, 0) == 0xc00000bb, "mounted namespace reopened stale raw disk");
   check(createDirectory("\\Device\\Harddisk0\\Partition3\\CACHE") == 0 && close(get(0x10100)), "cache namespace directory not backed");
   check(createFile("\\Device\\Harddisk0\\Partition3\\CACHE\\SAVE.BIN") == 0, "cache namespace byte file creation failed");
@@ -482,6 +542,19 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   const auto cacheReader = get(0x10100);
   check(queryFile(cacheReader) == 0 && get(0x10828) == 5 && close(cacheReader), "cache root relative open aliased Partition1");
   check(createAlias("\\??\\Z:", "\\Device\\Harddisk0\\Partition3\\") == 0, "cache mapped alias creation failed");
+  for (const std::string path : {"\\Device\\Harddisk0\\Partition3\\CACHE\\", "Z:\\CACHE\\"}) {
+    check(open(path, 0xfffffffdu, 0x100001, 0x4021) == 0 && close(get(0x10100)),
+      "mounted cache directory refused single terminal separator");
+  }
+  check(open("CACHE\\", cacheRoot, 0x100001, 0x4021) == 0, "cache directory relative terminal separator refused");
+  const auto cacheDirectory = get(0x10100);
+  for (const auto handle : {cacheRoot, cacheDirectory}) {
+    check(runtime.Call(ctx, base, runtime.KernelTarget(207), {handle, 0, 0, 0, 0x10840, 0x10a00, 0x148, 1, 0, 0}) == 0 &&
+      get(0x10840) == 0 && get(0x10a3c) == (handle == cacheRoot ? 5u : 8u) &&
+      get(0x10a38) == (handle == cacheRoot ? 0x10u : 4u) && get(0x10a28) == (handle == cacheRoot ? 0u : 5u),
+      "mounted cache enumeration did not use its real isolated metadata namespace");
+  }
+  check(close(cacheDirectory), "cache directory query fixture did not close");
   check(open("Z:\\CACHE\\SAVE.BIN") == 0, "cache alias file open failed");
   const auto aliasReader = get(0x10100);
   check(queryFile(aliasReader) == 0 && get(0x10828) == 5 && close(aliasReader), "cache alias resolved to wrong backing");
@@ -502,7 +575,7 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
     "OPEN_EXISTING admitted allocation request");
   check(openExisting("Z:\\CACHE\\SAVE.BIN", 0x60, 1, 0xfffffffdu, 0xc0100080) == 0xc00000bb,
     "temporary backing broadened new mode to write access");
-  check(query(cacheRoot) == 0 && get(0x10408) == 1020, "cache namespace accounting does not reflect real cluster use");
+  check(query(cacheRoot) == 0 && get(0x10408) == cacheUnits - 3, "cache namespace accounting does not reflect real cluster use");
   const auto overwrite = [&](std::string path, uint32_t rootHandle = 0xfffffffdu, uint32_t output = 0x10100, uint32_t status = 0x10108,
       uint32_t access = 0x40100080, uint32_t options = 0x64, uint32_t allocation = 0) {
     return openExisting(path, options, 0, rootHandle, access, 5, 0, allocation, output, status);
@@ -520,7 +593,7 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   check(writeFile(destination) == 0 && writeFile(destination, 0x10900, 2) == 0 && writeFile(destination, 0, 0) == 0,
     "actual write-only destination did not retain sequential writes");
   check(queryFile(destination) == 0 && get(0x10828) == 5 && get(0x10820) == 16384, "cache overwrite destination EOF or allocation wrong");
-  check(query(cacheRoot) == 0 && get(0x10408) == 1018, "cache destination bytes not charged to real volume");
+  check(query(cacheRoot) == 0 && get(0x10408) == cacheUnits - 5, "cache destination bytes not charged to real volume");
   check(overwrite("Z:\\DEFAULT\\DYNAMICXBOX.UMD") == 0xc0000043 && queryFile(destination) == 0 && get(0x10828) == 5,
     "exclusive overwrite collision truncated live destination");
   check(openExisting("Z:\\DEFAULT\\DYNAMICXBOX.UMD", 0x64, 7) == 0xc0000043, "actual exclusive destination admitted reader");
@@ -549,7 +622,7 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   const auto truncated = get(0x10100);
   check(queryFile(truncated) == 0 && get(0x10828) == 0 && get(0x10820) == 0 && get(0x10800) == creationLow && get(0x10804) == creationHigh,
     "overwrite lost creation timestamp or did not truncate backing");
-  check(query(cacheRoot) == 0 && get(0x10408) == 1019, "overwrite did not release real allocation");
+  check(query(cacheRoot) == 0 && get(0x10408) == cacheUnits - 4, "overwrite did not release real allocation");
   check(writeFile(truncated, 0x10900, 1) == 0 && queryFile(truncated) == 0 && get(0x10828) == 1, "overwrite did not reset new cursor");
   const auto seek = [&](uint32_t handle, uint64_t position, uint32_t length = 8, uint32_t information = 14, uint32_t input = 0x10700, uint32_t status = 0x10840) {
     put(0x10700, uint32_t(position)); put(0x10704, uint32_t(position >> 32));
@@ -583,7 +656,7 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   put(0x10700, 1); put(0x10704, 0);
   check(overwrite("Z:\\DEFAULT\\DYNAMICXBOX.UMD", 0xfffffffdu, 0x10100, 0x10108, 0x40100080, 0x64, 0x10700) == 0xc00000bb,
     "actual overwrite admitted unobserved allocation");
-  for (uint32_t options : {0x60u, 0x44u, 0x74u}) {
+  for (uint32_t options : {0x44u, 0x74u}) {
     check(overwrite("Z:\\DEFAULT\\DYNAMICXBOX.UMD", 0xfffffffdu, 0x10100, 0x10108, 0x40100080, options) == 0xc00000bb,
       "actual overwrite broadened unsupported synchronous mode");
   }
@@ -732,7 +805,9 @@ const auto testConcurrentProvider = [](std::shared_ptr<const kernel::DiscIndex> 
     image.image.kernel_thunk = 0x10000;
     auto temporary = std::make_shared<browser::TemporaryFilesystem>();
     lifetime = temporary;
-    auto close = browser::InstallFileProvider(runtime, image, std::move(disc), temporary);
+    std::vector<browser::FileOpenDiagnostic> diagnostics;
+    auto close = browser::InstallFileProvider(runtime, image, std::move(disc), temporary, nullptr, nullptr,
+      [&](browser::FileOpenDiagnostic diagnostic) { diagnostics.push_back(std::move(diagnostic)); });
     browser::InstallThreadProvider(runtime, image, close);
     browser::BindImageImports(image, runtime, {});
     std::atomic<uint32_t> ready = 0, created = 0;
@@ -764,6 +839,12 @@ const auto testConcurrentProvider = [](std::shared_ptr<const kernel::DiscIndex> 
     if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
     check(ready == 2 && created == 1 && runtime.ActiveWorkers() == 0, "concurrent create was not serialized exactly once");
     check(temporary->Usage().entries == 2, "concurrent directory duplicated metadata");
+    check(diagnostics.size() == 64, "concurrent completed opens did not emit exactly once under provider serialization");
+    for (const auto& diagnostic : diagnostics) {
+      check(diagnostic.originalPath == "\\Device\\Harddisk0\\Partition1\\RACE" && diagnostic.resolvedPath == "RACE" &&
+        diagnostic.status == 0 && diagnostic.root == 0 && diagnostic.disposition == 3 && diagnostic.options == 0x4021,
+        "concurrent diagnostic lost owned path or frame fields");
+    }
     std::atomic<bool> cancelled = false;
     X86Context context{}; context.host = &runtime; context.esp = 0x13000;
     runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
@@ -780,7 +861,8 @@ const auto testConcurrentProvider = [](std::shared_ptr<const kernel::DiscIndex> 
       check(output == sentinel && status == sentinel, "cancelled create published outputs");
     });
     if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
-    check(cancelled && runtime.ActiveWorkers() == 0 && temporary->Usage().entries == 2, "cancelled namespace operation retained workers or mutated backing");
+    check(cancelled && runtime.ActiveWorkers() == 0 && temporary->Usage().entries == 2 && diagnostics.size() == 64,
+      "cancelled namespace operation retained workers, mutated backing or emitted diagnostic");
     close = {}; temporary.reset();
     check(!lifetime.expired(), "runtime lost its temporary backing early");
   }
@@ -1060,7 +1142,533 @@ const auto testDataExportPreflight = [] {
   }
 };
 
+const auto testDirectoryQueries = [](std::shared_ptr<const kernel::DiscIndex> disc) {
+  browser::Runtime runtime({}, {});
+  browser::PreparedImage image;
+  image.memory = std::make_unique<browser::Memory>();
+  image.memory->Map(0x10000, 8192); image.memory->Commit(0x10000, 8192);
+  image.image.kernel_thunk = 0x10000;
+  uint64_t time = 100;
+  auto temporary = std::make_shared<browser::TemporaryFilesystem>(16 * 1024 * 1024, 256, [&] { return ++time; });
+  check(temporary->CreateDirectory("DIR") == 0 && temporary->CreateDirectory("DIR\\SUB") == 0 &&
+    temporary->CreateDirectory("EMPTY") == 0 && temporary->WriteFile("DIR\\B.TXT", std::array<uint8_t, 3>{1, 2, 3}) == 0 &&
+    temporary->CreateFile("DIR\\A.BIN", 1) == 0 && temporary->CreateFile("DIR\\SUB\\NESTED.TXT", 0x80) == 0,
+    "directory query temporary fixture failed");
+  auto snapshot = temporary->List("dir");
+  check(snapshot && snapshot->size() == 3 && (*snapshot)[0].name == "A.BIN" && (*snapshot)[0].metadata.attributes == 1 &&
+    (*snapshot)[1].name == "B.TXT" && (*snapshot)[1].metadata.size == 3 && (*snapshot)[2].name == "SUB" &&
+    (*snapshot)[2].metadata.directory && !temporary->List("DIR\\A.BIN") && !temporary->List("ABSENT") &&
+    !temporary->List("DIR\\..") && temporary->List("EMPTY")->empty(), "metadata listing invented entries or exposed descendants");
+  const auto original = (*snapshot)[1].metadata;
+  check(temporary->WriteFile("DIR\\B.TXT", std::array<uint8_t, 4>{1, 2, 3, 4}) == 0 &&
+    (*snapshot)[1].metadata.size == 3 && (*snapshot)[1].metadata.lastWriteTime == original.lastWriteTime,
+    "temporary listing borrowed mutable backing");
+  auto close = browser::InstallFileProvider(runtime, image, std::move(disc), temporary);
+  browser::BindImageImports(image, runtime, {});
+  X86Context context{}; context.host = &runtime; context.fs_base = 0x10800; context.esp = 0x11f00;
+  X86Context retired{};
+  runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+    auto& memory = *image.memory;
+    const auto put = [&](uint32_t at, uint32_t value) { memory.Write(ctx, at, &value, 4); };
+    const auto get = [&](uint32_t at) { uint32_t value = 0; memory.Read(ctx, at, &value, 4); return value; };
+    const auto get64 = [&](uint32_t at) { uint64_t value = 0; memory.Read(ctx, at, &value, 8); return value; };
+    const auto open = [&](const std::string& path, uint32_t access = 0x100001, uint32_t options = 0x4021) {
+      memory.Write(ctx, 0x10300, path.data(), path.size());
+      put(0x10200, uint32_t(path.size()) | (uint32_t(path.size()) << 16)); put(0x10204, 0x10300);
+      put(0x10210, 0xfffffffdu); put(0x10214, 0x10200); put(0x10218, 0x40);
+      const auto status = runtime.Call(ctx, base, runtime.KernelTarget(202), {0x10100, access, 0x10210, 0x10108, 3, options});
+      check(status == 0, ("query fixture open failed: " + path + " access=" + std::to_string(access) +
+        " options=" + std::to_string(options) + " status=" + std::to_string(status)).c_str());
+      return get(0x10100);
+    };
+    const auto query = [&](uint32_t handle, const std::string& pattern = "", uint32_t restart = 0,
+        uint32_t length = 0x148, uint32_t output = 0x11000, uint32_t statusOutput = 0x10180,
+        uint32_t informationClass = 1, uint32_t event = 0, uint32_t apc = 0, uint32_t apcContext = 0,
+        uint32_t descriptor = 0) {
+      if (!pattern.empty()) {
+        memory.Write(ctx, 0x10500, pattern.data(), pattern.size());
+        put(0x10400, uint32_t(pattern.size()) | (uint32_t(pattern.size()) << 16)); put(0x10404, 0x10500);
+        descriptor = 0x10400;
+      }
+      put(0x10180, 0xabcdef); put(0x10184, 0xabcdef);
+      std::array<uint8_t, 0x148> guard; guard.fill(0x63); memory.Write(ctx, 0x11000, guard.data(), guard.size());
+      const auto stack = ctx.esp;
+      const auto result = runtime.Call(ctx, base, runtime.KernelTarget(207),
+        {handle, event, apc, apcContext, statusOutput, output, length, informationClass, descriptor, restart});
+      check(ctx.esp == stack && (statusOutput != 0x10180 || get(statusOutput) == result), "directory query status or ten-argument cleanup wrong");
+      return result;
+    };
+    const auto name = [&] {
+      std::string result(get(0x1103c), '\0'); memory.Read(ctx, 0x11040, result.data(), uint32_t(result.size())); return result;
+    };
+    const auto disk = open("D:\\"), independent = open("D:\\");
+    check(query(disk, "*.X?E") == 0 && name() == "default.xbe" && get(0x10184) == 75 && get(0x11000) == 0 &&
+      get(0x11038) == 0x80 && get64(0x11028) == 6 && get64(0x11030) == 4096 && get(0x1104b) == 0x63636363,
+      "disc enumeration did not publish exact indexed file metadata/name/span");
+    check(query(disk, "LEVELS") == 0x80000006 && get(0x10184) == 0 && get(0x11000) == 0x63636363,
+      "subsequent mask replaced captured wildcard or end modified byte output");
+    check(query(disk, "LEVELS", 1) == 0 && name() == "default.xbe", "restart replaced captured mask or did not rewind");
+    check(query(independent, "LEVELS") == 0 && name() == "LEVELS" && get(0x11038) == 0x10 &&
+      get64(0x11028) == 0 && get64(0x11030) == 0, "independent directory cursor or actual directory metadata wrong");
+    const auto none = open("D:\\");
+    check(query(none, "missing*") == 0xc000000f && get(0x10184) == 0 &&
+      query(none) == 0x80000006 && query(none, "*", 1) == 0x80000006,
+      "missing-match first/end/restart statuses wrong or wildcard not captured");
+    const auto empty = open("D:\\LEVELS\\");
+    check(query(empty) == 0xc000000f && query(empty) == 0x80000006, "actual empty directory did not report truthful exhaustion");
+    const auto small = open("D:\\");
+    check(query(small, "DEFAULT.XBE", 0, 63) == 0xc0000004 && get(0x10184) == 0 && get(0x11000) == 0x63636363,
+      "short fixed-header query wrote output or captured cursor");
+    check(query(small, "DEFAULT.XBE", 0, 66) == 0x80000005 && get(0x10184) == 66 && get(0x1103c) == 11 &&
+      get(0x11040) == 0x63636564 && get(0x11044) == 0x63636363,
+      "first filename overflow did not publish exact partial counted name");
+    check(query(small, "", 0, 66) == 0 && get(0x10184) == 0 && get(0x11000) == 0x63636363,
+      "subsequent short-buffer query modified output or advanced cursor");
+    check(query(small) == 0 && name() == "default.xbe" && query(small) == 0x80000006,
+      "overflow retry lost or duplicated real directory entry");
+    const auto files = open("\\Device\\Harddisk0\\Partition1\\DIR\\");
+    const auto files2 = open("\\Device\\Harddisk0\\Partition1\\DIR\\");
+    check(query(files) == 0 && name() == "A.BIN" && get(0x11038) == 1 && get64(0x11008) != 0,
+      "temporary snapshot omitted actual attributes/times");
+    check(temporary->CreateFile("DIR\\AA.NEW", 0x80) == 0 && temporary->WriteFile("DIR\\B.TXT", std::array<uint8_t, 5>{1, 2, 3, 4, 5}) == 0,
+      "temporary mutation fixture failed");
+    check(query(files) == 0 && name() == "B.TXT" && get64(0x11028) == 4 && get64(0x11030) == 16384,
+      "in-flight directory snapshot changed after backing mutation");
+    check(query(files) == 0 && name() == "SUB" && get64(0x11030) == 16384 && query(files) == 0x80000006, "snapshot included late child or descendant");
+    check(query(files, "", 1) == 0 && name() == "A.BIN" && query(files) == 0 && name() == "AA.NEW" &&
+      query(files) == 0 && name() == "B.TXT" && get64(0x11028) == 5,
+      "restart did not refresh real temporary child metadata");
+    check(query(files2, "*.txt") == 0 && name() == "B.TXT" && query(files2) == 0x80000006,
+      "temporary independent case-insensitive wildcard incorrect");
+    const auto checks = open("D:\\");
+    for (const uint32_t informationClass : {0u, 2u, 3u, 12u}) {
+      check(query(checks, "", 0, 0x148, 0x11000, 0x10180, informationClass) == 0xc00000bb && get(0x10184) == 0,
+        "unsupported directory information class accepted");
+    }
+    for (uint32_t n = 0; n < 3; ++n) {
+      check(query(checks, "", 0, 0x148, 0x11000, 0x10180, 1, n == 0, n == 1, n == 2) == 0xc00000bb,
+        "asynchronous event/APC directory query accepted");
+    }
+    check(query(checks, "bad\\name") == 0xc0000033 && query(checks, std::string(241, 'a')) == 0xc0000033 &&
+      query(checks, "D:*") == 0xc0000033, "malformed wildcard descriptor accepted");
+    for (uint32_t n = 0; n < 8; ++n) {
+      bool refused = false;
+      try {
+        if (n == 7) { auto lease = memory.Borrow(); query(checks); }
+        else {
+          query(checks, "", 0, n == 5 ? UINT32_MAX : 0x148,
+            n == 0 ? 0x20000 : n == 2 ? 0x10180 : n == 3 ? ctx.esp - 16 : n == 6 ? 0x10400 : 0x11000,
+            n == 1 ? 0x20000 : n == 4 ? 0x10181 : 0x10180, 1, 0, 0, 0, n == 6 ? 0x10400 : 0);
+        }
+      } catch (const browser::Fault&) { refused = true; }
+      check(refused && get(0x10180) == 0xabcdef && get(0x10184) == 0xabcdef && get(0x11000) == 0x63636363,
+        "invalid directory output/input span partially published or failed to fault");
+    }
+    check(query(checks, "DEFAULT.XBE") == 0 && name() == "default.xbe",
+      "refused queries captured mask, initialized snapshot or advanced cursor");
+    check(query(checks, "", 0, 0x148, 0x11000, 0x10180, 1, 0, 0, 0, 0x20000) == 0x80000006,
+      "ignored subsequent descriptor introduced guest read fault");
+    check(query(0x70000004) == 0xc0000008 && get(0x10184) == 0, "foreign directory handle accepted");
+    const auto file = open("D:\\default.xbe", 0x100001, 0x60);
+    check(query(file) == 0xc0000024, "file handle accepted as directory");
+    const auto noAccess = open("D:\\", 0x100080);
+    check(query(noAccess) == 0xc0000022, "directory list access bypassed");
+    const auto asynchronous = open("D:\\", 1, 1);
+    check(query(asynchronous) == 0xc00000bb, "unsupported directory scheduling mode accepted");
+    for (const auto handle : {disk, independent, none, empty, small, files, files2, checks, file, noAccess, asynchronous}) {
+      check(close(handle) && query(handle) == 0xc0000008, "closed directory snapshot remained usable");
+    }
+    const auto cancelledHandle = open("D:\\");
+    const std::array<uint32_t, 11> cancelledFrame{0, cancelledHandle, 0, 0, 0, 0x10180, 0x11000, 0x148, 1, 0, 0};
+    memory.Write(ctx, ctx.esp, cancelledFrame.data(), sizeof(cancelledFrame));
+    put(0x10180, 0xabcdef); put(0x10184, 0xabcdef); put(0x11000, 0x63636363);
+    bool cancelled = false;
+    runtime.Cancel();
+    try { runtime.Kernel(ctx, base, 207); } catch (const browser::Cancelled&) { cancelled = true; }
+    check(cancelled && get(0x10180) == 0xabcdef && get(0x10184) == 0xabcdef && get(0x11000) == 0x63636363 &&
+      close(cancelledHandle), "cancelled directory query published outputs or retained handle");
+    retired = ctx;
+  });
+  if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+  check(runtime.ActiveWorkers() == 0, "directory cancellation retained worker");
+  bool refused = false;
+  try { runtime.Kernel(retired, image.memory->Base(), 207); } catch (const browser::Fault&) { refused = true; }
+  check(refused, "retired context retained directory-query access");
+};
+
+const auto testOpenDiagnostics = [] {
+  for (uint32_t n = 0; n < 2; ++n) {
+    browser::Runtime runtime({}, {});
+    browser::PreparedImage image;
+    image.memory = std::make_unique<browser::Memory>();
+    image.memory->Map(0x10000, 4096); image.memory->Commit(0x10000, 4096);
+    image.image.kernel_thunk = 0x10000;
+    auto temporary = std::make_shared<browser::TemporaryFilesystem>();
+    check(temporary->CreateFile("TARGET", 0x80) == 0 && temporary->CreateDirectory("DIR") == 0, "diagnostic fixture failed");
+    std::vector<browser::FileOpenDiagnostic> diagnostics;
+    X86Context* active = nullptr;
+    uint32_t completedStack = 0;
+    auto close = browser::InstallFileProvider(runtime, image, {}, temporary, nullptr, nullptr,
+      [&](browser::FileOpenDiagnostic diagnostic) {
+        uint32_t status = 0, handle = 0, information = 0;
+        image.memory->Read(*active, 0x10108, &status, 4);
+        image.memory->Read(*active, 0x10100, &handle, 4);
+        image.memory->Read(*active, 0x1010c, &information, 4);
+        check(active->eax == diagnostic.status && status == diagnostic.status && active->esp == completedStack &&
+          (status ? handle == 0xabcdef && information == 0 : handle != 0xabcdef && information == 1),
+          "diagnostic observed incomplete guest publication");
+        diagnostics.push_back(std::move(diagnostic));
+        if (n) { throw std::runtime_error("diagnostic observer failure"); }
+      });
+    browser::BindImageImports(image, runtime, {});
+    X86Context context{}; context.host = &runtime; context.fs_base = 0x10800; context.esp = 0x10f00;
+    X86Context retired{};
+    runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+      active = &ctx;
+      auto& memory = *image.memory;
+      const auto put = [&](uint32_t at, uint32_t value) { memory.Write(ctx, at, &value, 4); };
+      const auto get = [&](uint32_t at) { uint32_t value = 0; memory.Read(ctx, at, &value, 4); return value; };
+      const auto open = [&](const std::string& path, bool create = false, uint32_t root = 0, uint32_t output = 0x10100,
+          uint32_t descriptor = 0x10200, uint32_t options = 0x60) {
+        memory.Write(ctx, 0x10300, path.data(), path.size());
+        put(0x10200, uint32_t(path.size()) | (uint32_t(path.size()) << 16)); put(0x10204, 0x10300);
+        put(0x10210, root); put(0x10214, descriptor); put(0x10218, 0x40);
+        put(0x10100, 0xabcdef); put(0x10108, 0xabcdef); put(0x1010c, 0xabcdef);
+        completedStack = ctx.esp;
+        return create ? runtime.Call(ctx, base, runtime.KernelTarget(190), {output, 0x80100080, 0x10210, 0x10108, 0, 0x80, 1, 1, options}) :
+          runtime.Call(ctx, base, runtime.KernelTarget(202), {output, 0x80100080, 0x10210, 0x10108, 1, options});
+      };
+      const std::string path = "\\Device\\Harddisk0\\Partition1\\target";
+      for (const bool create : {false, true}) {
+        check(open(path, create) == 0 && close(get(0x10100)), "diagnostic changed successful open result");
+        check(diagnostics.back().originalPath == path && diagnostics.back().resolvedPath == "TARGET" &&
+          diagnostics.back().status == 0 && diagnostics.back().root == 0 && diagnostics.back().disposition == 1 &&
+          diagnostics.back().options == 0x60, "diagnostic did not retain original case, resolution or frame");
+      }
+      const std::string directoryPath = "\\Device\\Harddisk0\\Partition1\\dir\\";
+      check(open(directoryPath, false, 0xfffffffdu, 0x10100, 0x10200, 0x4021) == 0 && close(get(0x10100)) &&
+        diagnostics.back().originalPath == directoryPath && diagnostics.back().resolvedPath == "DIR" &&
+        diagnostics.back().status == 0 && diagnostics.back().options == 0x4021,
+        "directory normalization diagnostic lost original separator or resolved backing");
+      check(open("relative.movie", false, 0xfffffffdu) == 0xc0000033 && diagnostics.back().originalPath == "relative.movie" &&
+        diagnostics.back().resolvedPath == "RELATIVE.MOVIE" && diagnostics.back().status == 0xc0000033 &&
+        diagnostics.back().root == 0xfffffffdu, "invalid-name failure was not recorded truthfully");
+      const std::string invalid = std::string("D:\\bad\0name", 11);
+      check(open(invalid) == 0xc0000033 && diagnostics.back().originalPath == invalid,
+        "diagnostic lost malformed counted name bytes");
+      check(open(std::string(241, 'a')) == 0xc0000033 && diagnostics.back().originalPath.empty() &&
+        diagnostics.back().resolvedPath.empty(), "rejected overlength descriptor was read for diagnostics");
+      check(open(std::string(240, 'a')) == 0xc00000bb && diagnostics.back().originalPath == std::string(240, 'a') &&
+        diagnostics.back().resolvedPath == std::string(240, 'A'), "diagnostic lost bounded input at exact limit");
+      const std::string alias = "\\??\\T:", target = "\\Device\\Harddisk0\\Partition1\\" + std::string(200, 'a');
+      memory.Write(ctx, 0x10400, target.data(), target.size()); memory.Write(ctx, 0x104f0, alias.data(), alias.size());
+      put(0x10240, uint32_t(alias.size()) | (uint32_t(alias.size()) << 16)); put(0x10244, 0x104f0);
+      put(0x10248, uint32_t(target.size()) | (uint32_t(target.size()) << 16)); put(0x1024c, 0x10400);
+      check(runtime.Call(ctx, base, runtime.KernelTarget(67), {0x10240, 0x10248}) == 0, "diagnostic long alias fixture failed");
+      const std::string aliasPath = "T:\\" + std::string(80, 'b');
+      check(open(aliasPath) == 0xc0000033 && diagnostics.back().originalPath == aliasPath &&
+        diagnostics.back().resolvedPath == std::string(200, 'A') + "\\" + std::string(39, 'B'),
+        "expanded invalid-name diagnostic exceeded bound or changed return");
+      const auto count = diagnostics.size();
+      for (uint32_t fault = 0; fault < 3; ++fault) {
+        bool refused = false;
+        try {
+          if (fault == 2) { auto lease = memory.Borrow(); open(path); }
+          else { open(path, false, 0, fault == 0 ? 0x20000 : 0x10100, fault == 1 ? 0x20000 : 0x10200); }
+        } catch (const browser::Fault&) { refused = true; }
+        check(refused && diagnostics.size() == count && get(0x10100) == 0xabcdef && get(0x10108) == 0xabcdef &&
+          get(0x1010c) == 0xabcdef, "faulting open emitted diagnostic or partially published");
+      }
+      check(diagnostics.size() == 8, "completed open emitted duplicate diagnostics");
+      retired = ctx;
+    });
+    if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+    active = nullptr;
+    bool refused = false;
+    try { runtime.Kernel(retired, image.memory->Base(), 202); }
+    catch (const browser::Fault&) { refused = true; }
+    check(refused && diagnostics.size() == 8, "retired context emitted diagnostic");
+    for (const auto& diagnostic : diagnostics) {
+      check(diagnostic.originalPath.size() <= 240 && diagnostic.resolvedPath.size() <= 240,
+        "diagnostic path exceeded bound");
+    }
+    check(diagnostics[0].originalPath == "\\Device\\Harddisk0\\Partition1\\target" && diagnostics[0].resolvedPath == "TARGET",
+      "diagnostic borrowed guest or provider path lifetime");
+  }
+};
+
+const auto testPositionQueries = [](std::shared_ptr<const kernel::DiscIndex> disc) {
+  browser::Runtime runtime({}, {});
+  browser::PreparedImage image;
+  image.memory = std::make_unique<browser::Memory>();
+  image.memory->Map(0x10000, 8192); image.memory->Commit(0x10000, 8192);
+  image.image.kernel_thunk = 0x10000;
+  uint64_t clock = 133000000000000000;
+  auto temporary = std::make_shared<browser::TemporaryFilesystem>(65536, 8, [&] { return ++clock; });
+  const std::array<uint8_t, 6> payload{1, 2, 3, 4, 5, 6};
+  check(temporary->WriteFile("DATA", payload) == 0, "position-query temporary fixture failed");
+  std::function<browser::DiscReadSnapshot()> discReads;
+  auto close = browser::InstallFileProvider(runtime, image, std::move(disc), temporary, nullptr, &discReads);
+  browser::BindImageImports(image, runtime, {});
+  X86Context context{}; context.host = &runtime; context.fs_base = 0x10800; context.esp = 0x11f00;
+  X86Context retired{};
+  runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+    auto& memory = *image.memory;
+    const auto put = [&](uint32_t at, uint32_t value) { memory.Write(ctx, at, &value, 4); };
+    const auto get = [&](uint32_t at) { uint32_t value = 0; memory.Read(ctx, at, &value, 4); return value; };
+    const auto get64 = [&](uint32_t at) { uint64_t value = 0; memory.Read(ctx, at, &value, 8); return value; };
+    const auto open = [&](const std::string& path, uint32_t access = 0x100001, uint32_t options = 0x20) {
+      memory.Write(ctx, 0x10300, path.data(), path.size());
+      put(0x10200, uint32_t(path.size()) | (uint32_t(path.size()) << 16)); put(0x10204, 0x10300);
+      put(0x10210, 0); put(0x10214, 0x10200); put(0x10218, 0x40);
+      check(runtime.Call(ctx, base, runtime.KernelTarget(202), {0x10100, access, 0x10210, 0x10108, 3, options}) == 0,
+        "position-query handle did not open");
+      return get(0x10100);
+    };
+    const auto query = [&](uint32_t handle, uint32_t length = 8, uint32_t output = 0x10404, uint32_t status = 0x10500,
+        uint32_t information = 14) {
+      std::array<uint32_t, 16> guard; guard.fill(0xa5a5a5a5);
+      memory.Write(ctx, 0x10400, guard.data(), sizeof(guard));
+      put(0x10500, 0xabcdef); put(0x10504, 0xabcdef);
+      const auto stack = ctx.esp;
+      const auto result = runtime.Call(ctx, base, runtime.KernelTarget(211), {handle, status, output, length, information});
+      check(ctx.esp == stack && get(status) == result && get(status + 4) == (result ? 0u : information == 34 ? 56u : 8u),
+        "position-query IOSB or stdcall cleanup corrupt");
+      check(get(0x10400) == 0xa5a5a5a5 && (result ? get64(0x10404) == 0xa5a5a5a5a5a5a5a5ull : true) &&
+        (information != 14 || get(0x1040c) == 0xa5a5a5a5), "position-query wrote outside exact eight-byte result");
+      return result;
+    };
+    const auto expect = [&](uint32_t handle, uint64_t position) {
+      const auto status = query(handle);
+      if (status || get64(0x10404) != position) {
+        std::fprintf(stderr, "class14 cursor mismatch: status=%08x expected=%llu actual=%llu\n", status,
+          static_cast<unsigned long long>(position), static_cast<unsigned long long>(get64(0x10404)));
+      }
+      check(status == 0 && get64(0x10404) == position, "class14 did not report actual handle cursor");
+    };
+    const auto seek = [&](uint32_t handle, uint64_t position) {
+      memory.Write(ctx, 0x10600, &position, sizeof(position));
+      check(runtime.Call(ctx, base, runtime.KernelTarget(226), {handle, 0x10500, 0x10600, 8, 14}) == 0 && get(0x10504) == 0,
+        "position-query seek fixture failed");
+    };
+    const auto read = [&](uint32_t handle, uint32_t length, uint32_t offset = 0) {
+      return runtime.Call(ctx, base, runtime.KernelTarget(219), {handle, 0, 0, 0, 0x10500, 0x10700, length, offset});
+    };
+    const auto write = [&](uint32_t handle, uint32_t length) {
+      memory.Write(ctx, 0x10700, payload.data(), payload.size());
+      return runtime.Call(ctx, base, runtime.KernelTarget(236), {handle, 0, 0, 0, 0x10500, 0x10700, length, 0});
+    };
+    const auto temporaryFile = open("\\Device\\Harddisk0\\Partition1\\DATA", 0xc0100000);
+    const auto temporaryIndependent = open("\\Device\\Harddisk0\\Partition1\\DATA");
+    const auto discFile = open("D:\\default.xbe");
+    const auto discIndependent = open("\\??\\D:\\default.xbe");
+    for (const auto handle : {temporaryFile, discFile}) {
+      expect(handle, 0);
+      check(read(handle, 2) == 0 && get(0x10504) == 2, "position-query real read failed");
+      expect(handle, 2);
+      expect(handle, 2);
+      const auto sharedHandle = handle;
+      check(read(sharedHandle, 1) == 0 && get(0x10504) == 1, "shared numeric handle did not consume real bytes");
+      expect(handle, 3);
+      expect(sharedHandle, 3);
+      expect(handle == temporaryFile ? temporaryIndependent : discIndependent, 0);
+      seek(handle, 5);
+      expect(handle, 5);
+      check(read(handle, 4) == 0 && get(0x10504) == 1, "position-query partial tail read failed");
+      expect(handle, 6);
+      check(read(handle, 1) == 0xc0000011 && get(0x10504) == 0, "position-query EOF fixture failed");
+      expect(handle, 6);
+      check(read(handle, 0) == 0 && get(0x10504) == 0, "position-query empty read failed");
+      expect(handle, 6);
+      for (const uint64_t position : {0x100000123ull, 0x7fffffffffffffffull}) {
+        seek(handle, position);
+        expect(handle, position);
+        check(read(handle, 1) == 0xc0000011 && get(0x10504) == 0, "high cursor wrapped into backing bytes");
+        expect(handle, position);
+      }
+      seek(handle, 2);
+      for (const uint32_t length : {0u, 1u, 7u}) {
+        check(query(handle, length) == 0xc0000004, "short class14 query succeeded");
+        expect(handle, 2);
+      }
+      check(query(handle, 16) == 0 && get64(0x10404) == 2, "larger class14 span changed exact result");
+      for (uint32_t n = 0; n < 13; ++n) {
+        bool refused = false;
+        const auto owner = ctx.host;
+        const auto kpcr = ctx.fs_base;
+        browser::Runtime foreign({}, {});
+        try {
+          if (n == 10) { auto lease = memory.Borrow(); query(handle); }
+          else {
+            if (n == 11) { ctx.host = &foreign; }
+            if (n == 12) { ctx.fs_base ^= 4; }
+            query(handle, n == 8 ? UINT32_MAX : 8,
+              n == 0 ? 0x20000 : n == 2 ? 0x10405 : n == 4 ? 0x10504 : n == 5 ? ctx.esp - 4 : n == 7 ? 0x11ffc : n == 9 ? 0 : 0x10404,
+              n == 1 ? 0x20000 : n == 3 ? 0x10501 : n == 6 ? ctx.esp - 4 : 0x10500);
+          }
+        } catch (const browser::Fault&) { refused = true; }
+        ctx.host = owner; ctx.fs_base = kpcr;
+        check(refused && get64(0x10404) == 0xa5a5a5a5a5a5a5a5ull && get(0x10500) == 0xabcdef && get(0x10504) == 0xabcdef,
+          "invalid class14 span/ownership partially published outputs");
+        expect(handle, 2);
+      }
+      check(read(handle, 1) == 0 && get(0x10504) == 1 && (get(0x10700) & 0xff) == (handle == discFile ? 'O' : 3),
+        "class14 query consumed cursor or changed actual read bytes");
+      expect(handle, 3);
+    }
+    seek(temporaryFile, 1);
+    check(write(temporaryFile, 2) == 0 && get(0x10504) == 2, "position-query real write failed");
+    expect(temporaryFile, 3);
+    check(write(temporaryFile, 0) == 0, "position-query empty write failed");
+    expect(temporaryFile, 3);
+    check(write(discFile, 1) == 0xc0000022, "position-query changed disc write protection");
+    expect(discFile, 3);
+    const uint64_t explicitOffset = 1, currentOffset = UINT64_MAX - 1;
+    memory.Write(ctx, 0x10600, &explicitOffset, 8);
+    check(read(discFile, 2, 0x10600) == 0 && get(0x10504) == 2 && (get(0x10700) & 0xffff) == 0x4f53,
+      "explicit disc read did not preserve indexed bytes");
+    expect(discFile, 3);
+    memory.Write(ctx, 0x10600, &currentOffset, 8);
+    check(read(discFile, 1, 0x10600) == 0 && (get(0x10700) & 0xff) == '1', "FILE_CURRENT disc read lost actual cursor");
+    expect(discFile, 4);
+    const auto beforeMetadata = temporary->Stat("DATA");
+    const auto beforeUsage = temporary->Usage();
+    const auto beforeReads = discReads();
+    const auto beforeClock = clock;
+    for (uint32_t n = 0; n < 3; ++n) { expect(temporaryFile, 3); expect(discFile, 4); }
+    const auto afterMetadata = temporary->Stat("DATA");
+    const auto afterReads = discReads();
+    check(clock == beforeClock && afterMetadata->size == beforeMetadata->size &&
+      afterMetadata->lastAccessTime == beforeMetadata->lastAccessTime && afterMetadata->lastWriteTime == beforeMetadata->lastWriteTime &&
+      afterMetadata->changeTime == beforeMetadata->changeTime && temporary->Usage().allocated == beforeUsage.allocated &&
+      temporary->Usage().entries == beforeUsage.entries && afterReads.executableBytes == beforeReads.executableBytes &&
+      afterReads.executableOperations == beforeReads.executableOperations && afterReads.assetBytes == beforeReads.assetBytes &&
+      afterReads.assetOperations == beforeReads.assetOperations, "class14 query consumed I/O, storage or metadata");
+    check(query(discFile, 56, 0x10404, 0x10500, 34) == 0 && get64(0x1042c) == 6 && get(0x10434) == 1,
+      "class14 changed existing disc class34 metadata");
+    check(query(temporaryFile, 56, 0x10404, 0x10500, 34) == 0 && get64(0x1042c) == 6,
+      "class14 changed existing temporary class34 EOF");
+    for (const uint32_t information : {19u, 20u, 5u}) {
+      check(query(temporaryFile, 8, 0x10404, 0x10500, information) == 0xc00000bb, "class14 broadened unrelated query class");
+    }
+    const auto directory = open("D:\\", 0x100001, 0x21);
+    const auto temporaryDirectory = open("\\Device\\Harddisk0\\Partition1", 0x100001, 0x21);
+    const auto raw = open("\\Device\\Harddisk0\\Partition0", 0xc0100000, 0x10);
+    for (const auto handle : {directory, temporaryDirectory, raw}) {
+      check(query(handle) == 0xc00000bb && close(handle), "class14 broadened directory/raw position contract");
+    }
+    check(query(0x70000004) == 0xc0000008, "class14 accepted foreign handle");
+    for (const auto handle : {temporaryFile, temporaryIndependent, discFile, discIndependent}) {
+      check(close(handle) && query(handle) == 0xc0000008 && !close(handle), "closed class14 handle retained cursor");
+    }
+    const auto cancelledHandle = open("D:\\default.xbe");
+    const std::array<uint32_t, 6> frame{0, cancelledHandle, 0x10500, 0x10404, 8, 14};
+    memory.Write(ctx, ctx.esp, frame.data(), sizeof(frame));
+    put(0x10404, 0xa5a5a5a5); put(0x10408, 0xa5a5a5a5); put(0x10500, 0xabcdef); put(0x10504, 0xabcdef);
+    bool cancelled = false;
+    runtime.Cancel();
+    try { runtime.Kernel(ctx, base, 211); } catch (const browser::Cancelled&) { cancelled = true; }
+    check(cancelled && get64(0x10404) == 0xa5a5a5a5a5a5a5a5ull && get(0x10500) == 0xabcdef && get(0x10504) == 0xabcdef && close(cancelledHandle),
+      "cancelled class14 query partially published outputs");
+    retired = ctx;
+  });
+  if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+  bool refused = false;
+  try { runtime.Kernel(retired, image.memory->Base(), 211); } catch (const browser::Fault&) { refused = true; }
+  check(refused && runtime.ActiveWorkers() == 0, "retired context retained position-query access");
+  std::puts("file-position-query-contracts-ok");
+};
+
+const auto testPositionQueryReadRace = [](std::shared_ptr<const std::vector<uint8_t>> bytes) {
+  for (uint32_t n = 0; n < 3; ++n) {
+    browser::Runtime runtime({}, {});
+    browser::PreparedImage image;
+    image.memory = std::make_unique<browser::Memory>();
+    image.memory->Map(0x10000, 65536); image.memory->Commit(0x10000, 65536);
+    image.memory->Map(0x30000, 4096); image.memory->Commit(0x30000, 4096);
+    image.image.kernel_thunk = 0x10000;
+    std::atomic<bool> reading = false, release = false, querying = false, queryDone = false;
+    std::atomic<uint32_t> sharedHandle = 0, payloadReads = 0;
+    auto disc = std::make_shared<kernel::DiscIndex>();
+    std::string error;
+    check(disc->Open(bytes->size(), [&, bytes](uint64_t at, void* output, uint32_t size) {
+      if (at == 102400) {
+        check(!browser::Memory::HasBorrow(), "disc I/O retained a guest backing lease");
+        ++payloadReads;
+        reading = true;
+        while (!release) { std::this_thread::yield(); }
+      }
+      std::memcpy(output, bytes->data() + at, size);
+      return size;
+    }, error), "paused position-query disc fixture failed");
+    std::weak_ptr<const kernel::DiscIndex> lifetime = disc;
+    auto close = browser::InstallFileProvider(runtime, image, std::move(disc), {});
+    browser::BindImageImports(image, runtime, {});
+    X86Context reader{}; reader.host = &runtime; reader.fs_base = 0x18000; reader.esp = 0x13000;
+    runtime.Launch(reader, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+      auto& memory = *image.memory;
+      const std::string path = "D:\\default.xbe";
+      const std::array<uint32_t, 5> attributes{uint32_t(path.size()) | (uint32_t(path.size()) << 16), 0x11200, 0, 0x11000, 0x40};
+      memory.Write(ctx, 0x11000, attributes.data(), sizeof(attributes));
+      memory.Write(ctx, 0x11200, path.data(), path.size());
+      check(runtime.Call(ctx, base, runtime.KernelTarget(202), {0x11020, 0x100001, 0x11008, 0x11040, 3, 0x20}) == 0,
+        "paused reader open failed");
+      uint32_t handle = 0;
+      memory.Read(ctx, 0x11020, &handle, 4);
+      sharedHandle = handle;
+      const uint32_t sentinel = 0xa5a5a5a5;
+      memory.Write(ctx, 0x11100, &sentinel, 4);
+      const auto result = runtime.Call(ctx, base, runtime.KernelTarget(219), {handle, 0, 0, 0, 0x11040, 0x11100, 3, 0});
+      std::array<uint32_t, 2> status{};
+      memory.Read(ctx, 0x11040, status.data(), sizeof(status));
+      uint32_t output = 0;
+      memory.Read(ctx, 0x11100, &output, 4);
+      check(result == (n == 1 ? 0xc0000008u : 0u) && status[0] == result && status[1] == (result ? 0u : 3u) &&
+        output == (result ? sentinel : 0xa54f5349), "paused read lost close revalidation or real payload");
+    });
+    X86Context querier{}; querier.host = &runtime; querier.fs_base = 0x19000; querier.esp = 0x17000;
+    runtime.Launch(querier, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+      auto& memory = *image.memory;
+      while (!reading) { runtime.Checkpoint(ctx); std::this_thread::yield(); }
+      const std::array<uint32_t, 2> sentinel{0xabcdef, 0xabcdef};
+      memory.Write(ctx, 0x15040, sentinel.data(), sizeof(sentinel));
+      memory.Write(ctx, 0x30000, sentinel.data(), sizeof(sentinel));
+      querying = true;
+      bool refused = false;
+      uint32_t result = 0;
+      try { result = runtime.Call(ctx, base, runtime.KernelTarget(211), {sharedHandle, 0x15040, 0x30000, 8, 14}); }
+      catch (const browser::Fault&) { refused = true; }
+      std::array<uint32_t, 2> status{};
+      memory.Read(ctx, 0x15040, status.data(), sizeof(status));
+      if (n == 2) {
+        check(refused && status == sentinel, "unmapped waiting query partially published IOSB");
+      } else {
+        uint64_t position = 0;
+        memory.Read(ctx, 0x30000, &position, sizeof(position));
+        check(!refused && result == (n == 1 ? 0xc0000008u : 0u) && status[0] == result && status[1] == (result ? 0u : 8u) &&
+          position == (result ? 0x00abcdef00abcdefull : 3ull), "waiting query published stale cursor or closed source");
+      }
+      queryDone = true;
+    });
+    while (!querying) { std::this_thread::yield(); }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    check(!queryDone, "query did not serialize against actual paused disc read");
+    {
+      auto transition = image.memory->Mutate();
+      check(!lifetime.expired(), "paused read/query lost pinned disc lifetime");
+      if (n == 1) { check(close(sharedHandle), "paused disc handle did not close"); }
+      if (n == 2) { image.memory->Decommit(0x30000, 4096); }
+      release = true;
+    }
+    if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+    check(queryDone && payloadReads == 1 && runtime.ActiveWorkers() == 0, "paused query deadlocked or repeated payload I/O");
+    if (n != 1) { check(close(sharedHandle), "position-query shared handle did not close"); }
+  }
+  std::puts("file-position-query-races-ok");
+};
+
 int main() {
+  testOpenDiagnostics();
   testDataExportPreflight();
   testReadCommitBoundary();
   testOverwriteStorage();
@@ -1074,14 +1682,20 @@ int main() {
   std::memcpy(bytes->data() + 65536, "MICROSOFT*XBOX*MEDIA", 20);
   std::memcpy(bytes->data() + 65536 + 0x7ec, "MICROSOFT*XBOX*MEDIA", 20);
   put(65536 + 0x14, 40); put(65536 + 0x18, 64);
+  put(81920, 8u << 16);
   put(81920 + 4, 50); put(81920 + 8, 6);
   (*bytes)[81920 + 13] = 11;
   std::memcpy(bytes->data() + 81920 + 14, "default.xbe", 11);
+  (*bytes)[81920 + 32 + 12] = 0x10; (*bytes)[81920 + 32 + 13] = 6;
+  std::memcpy(bytes->data() + 81920 + 32 + 14, "LEVELS", 6);
   std::memcpy(bytes->data() + 102400, "ISO123", 6);
   auto disc = std::make_shared<kernel::DiscIndex>();
   std::string error;
   check(disc->Open(bytes->size(), [bytes](uint64_t at, void* out, uint32_t size) { std::memcpy(out, bytes->data() + at, size); return size; }, error), "disc fixture invalid");
+  testPositionQueries(disc);
+  testPositionQueryReadRace(bytes);
   testConcurrentProvider(disc);
+  testDirectoryQueries(disc);
   for (uint32_t n = 0; n < 3; ++n) {
     const std::array<X86FuncMapping, 1> mappings = {{{0x11000, entry}}};
     browser::Runtime runtime(mappings, {});

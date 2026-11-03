@@ -1,4 +1,5 @@
 #include "browser/menu-shaders.h"
+#include "browser/menu-pixel-shaders.h"
 
 #include <algorithm>
 #include <cmath>
@@ -8,7 +9,8 @@
 
 namespace browser::menu {
 
-static_assert(sizeof(ShaderConstants) == 3504);
+static_assert(sizeof(ShaderConstants) == 3792);
+static_assert(offsetof(ShaderConstants, pc) == 3504);
 static_assert(offsetof(ShaderConstants, surf) == 3072);
 static_assert(offsetof(ShaderConstants, misc) == 3088);
 static_assert(offsetof(ShaderConstants, tfactor) == 3104);
@@ -42,10 +44,17 @@ const char* kUniform = R"(struct Constants {
   texsize: array<vec4<f32>, 4>,
   wvp: array<vec4<f32>, 4>,
   tm: array<array<vec4<f32>, 4>, 4>,
+  pc: array<vec4<f32>, 18>,
 }
 @group(0) @binding(0) var<uniform> u: Constants;
 fn rowmul(p: vec4<f32>, m: array<vec4<f32>, 4>) -> vec4<f32> {
   return p.x * m[0] + p.y * m[1] + p.z * m[2] + p.w * m[3];
+}
+)";
+
+const char* kVertexHelpers = R"(fn xrcc(v: f32) -> f32 {
+  let magnitude = clamp(1.0 / max(abs(v), 1.0 / 1.84467e19), 5.42101e-20, 1.84467e19);
+  return select(magnitude, -magnitude, (bitcast<u32>(v) & 0x80000000u) != 0u);
 }
 )";
 
@@ -72,7 +81,8 @@ std::string Arg(uint32_t arg, int stage, bool alpha) {
   return "(" + value + ")" + (alpha ? ".a" : ".rgb");
 }
 
-std::string Op(uint32_t op, const std::string& a, const std::string& b, const std::string& c, int stage) {
+std::string Op(uint32_t op, const std::string& a, const std::string& b, const std::string& c,
+  int stage, bool alpha, const std::string& aa) {
   switch (op) {
     case 2: return a;
     case 3: return b;
@@ -89,6 +99,16 @@ std::string Op(uint32_t op, const std::string& a, const std::string& b, const st
     case 14: return "(" + b + " * (1.0 - t" + std::to_string(stage) + ".a) + " + a + " * t" + std::to_string(stage) + ".a)";
     case 15: return "(" + b + " * (1.0 - u.tfactor.a) + " + a + " * u.tfactor.a)";
     case 16: return a + " + " + b + " * (1.0 - t" + std::to_string(stage) + ".a)";
+    case 18: return alpha ? a : a + " + " + b + " * " + aa;
+    case 19: return alpha ? a : a + " * " + b + " + " + aa;
+    case 20: return alpha ? a : a + " + " + b + " * (1.0 - " + aa + ")";
+    case 21: return alpha ? a : "(1.0 - " + a + ") * " + b + " + " + aa;
+    case 22: {
+      const auto x = alpha ? "vec3<f32>(" + a + ", 0.0, 0.0)" : a;
+      const auto y = alpha ? "vec3<f32>(" + b + ", 0.0, 0.0)" : b;
+      const auto dot = "dot((" + x + " - 0.5) * 2.0, (" + y + " - 0.5) * 2.0)";
+      return alpha ? dot : "vec3<f32>(" + dot + ")";
+    }
     case 23: return c + " + " + a + " * " + b;
     case 24: return "(" + b + " * (1.0 - " + c + ") + " + a + " * " + c + ")";
     default: throw std::logic_error("unvalidated texture operation");
@@ -96,7 +116,17 @@ std::string Op(uint32_t op, const std::string& a, const std::string& b, const st
 }
 
 bool SupportedOp(uint32_t op) {
-  return (op >= 2 && op <= 16) || op == 23 || op == 24;
+  return op >= 2 && op <= 24 && op != 17;
+}
+
+bool UsesArgument(uint32_t op, int n, bool alpha) {
+  if (n == 1) {
+    return op != 3;
+  }
+  if (n == 2) {
+    return op != 2 && !(alpha && op >= 18 && op <= 21);
+  }
+  return op == 23 || op == 24;
 }
 
 std::string ValidateArgs(const uint32_t* f, bool alpha) {
@@ -109,7 +139,7 @@ std::string ValidateArgs(const uint32_t* f, bool alpha) {
     return std::string(alpha ? "alpha" : "color") + " operation " + std::to_string(op);
   }
   for (int n = 1; n <= 3; ++n) {
-    if ((n == 1 && op == 3) || (n == 2 && op == 2) || (n == 3 && op != 23 && op != 24)) {
+    if (!UsesArgument(op, n, alpha)) {
       continue;
     }
     const uint32_t arg = f[base + n];
@@ -127,12 +157,196 @@ std::string StageExpression(const uint32_t* f, int stage, bool alpha) {
     return "cur.a";
   }
   const auto arg = [&](int n) {
-    if ((n == 1 && op == 3) || (n == 2 && op == 2) || (n == 3 && op != 23 && op != 24)) {
+    if (!UsesArgument(op, n, alpha)) {
       return std::string("0.0");
     }
     return Arg(f[base + n], stage, alpha);
   };
-  return Op(op, arg(1), arg(2), arg(3), stage);
+  return Op(op, arg(1), arg(2), arg(3), stage, alpha, alpha || !UsesArgument(op, 1, false) ? "0.0" : Arg(f[1], stage, true));
+}
+
+struct VertexToken {
+  const uint32_t* words;
+
+  uint32_t Field(int word, int bit, int length) const {
+    return (words[word] >> bit) & ((1u << length) - 1);
+  }
+};
+
+std::string Register(uint32_t reg) {
+  if (reg > 12) {
+    throw std::invalid_argument("temporary register " + std::to_string(reg));
+  }
+  return reg == 12 ? "oPos" : "R" + std::to_string(reg);
+}
+
+std::string ProgramSource(const VertexToken& k, int source, uint16_t regs) {
+  uint32_t neg = 0, reg = 0, mux = 0;
+  std::array<uint32_t, 4> sw{};
+  if (source == 0) {
+    neg = k.Field(1, 8, 1);
+    reg = k.Field(2, 28, 4);
+    mux = k.Field(2, 26, 2);
+    for (int n = 0; n < 4; ++n) {
+      sw[n] = k.Field(1, 6 - n * 2, 2);
+    }
+  } else if (source == 1) {
+    neg = k.Field(2, 25, 1);
+    reg = k.Field(2, 13, 4);
+    mux = k.Field(2, 11, 2);
+    for (int n = 0; n < 4; ++n) {
+      sw[n] = k.Field(2, 23 - n * 2, 2);
+    }
+  } else {
+    neg = k.Field(2, 10, 1);
+    reg = k.Field(2, 0, 2) << 2 | k.Field(3, 30, 2);
+    mux = k.Field(3, 28, 2);
+    for (int n = 0; n < 4; ++n) {
+      sw[n] = k.Field(2, 8 - n * 2, 2);
+    }
+    if (k.Field(1, 25, 3) >= 2 && k.Field(1, 25, 3) <= 6) {
+      sw.fill(sw[0]);
+    }
+  }
+  std::string value;
+  if (mux == 1) {
+    value = Register(reg);
+  } else if (mux == 2) {
+    const auto input = k.Field(1, 9, 4);
+    value = regs & (1u << input) ? "i.v" + std::to_string(input)
+      : input == 3 ? "vec4<f32>(1.0)" : "vec4<f32>(0.0, 0.0, 0.0, 1.0)";
+  } else {
+    const auto index = k.Field(1, 13, 8);
+    if (!k.Field(3, 1, 1) && index >= 192) {
+      throw std::invalid_argument("constant register " + std::to_string(index));
+    }
+    value = "u.vsc[" + (k.Field(3, 1, 1) ? "clamp(a0 + " + std::to_string(index) + ", 0, 191)" : std::to_string(index)) + "]";
+  }
+  std::string swizzle;
+  for (int n = 0; n < 4; ++n) {
+    swizzle += "xyzw"[sw[n]];
+  }
+  return std::string(neg ? "(-(" : "((") + value + ")." + swizzle + ")";
+}
+
+std::string MacExpression(uint32_t op, const std::string& a, const std::string& b, const std::string& c) {
+  switch (op) {
+    case 1: case 13: return a;
+    case 2: return "select(" + a + " * " + b + ", vec4<f32>(0.0), (" + a + " == vec4<f32>(0.0)) | (" + b + " == vec4<f32>(0.0)))";
+    case 3: return a + " + " + c;
+    case 4: return "(" + MacExpression(2, a, b, c) + " + " + c + ")";
+    case 5: return "vec4<f32>(dot(" + a + ".xyz, " + b + ".xyz))";
+    case 6: return "vec4<f32>(dot(vec4<f32>(" + a + ".xyz, 1.0), " + b + "))";
+    case 7: return "vec4<f32>(dot(" + a + ", " + b + "))";
+    case 8: return "vec4<f32>(1.0, " + a + ".y * " + b + ".y, " + a + ".z, " + b + ".w)";
+    case 9: return "min(" + a + ", " + b + ")";
+    case 10: return "max(" + a + ", " + b + ")";
+    case 11: return "select(vec4<f32>(0.0), vec4<f32>(1.0), " + a + " < " + b + ")";
+    case 12: return "select(vec4<f32>(0.0), vec4<f32>(1.0), " + a + " >= " + b + ")";
+    default: throw std::logic_error("unvalidated vertex MAC operation");
+  }
+}
+
+std::string WriteRegister(const std::string& destination, uint32_t mask, const std::string& value) {
+  std::string out;
+  for (int n = 0; n < 4; ++n) {
+    if (mask & (8u >> n)) {
+      const std::string component(1, "xyzw"[n]);
+      out += "    " + destination + "." + component + " = " + value + "." + component + ";\n";
+    }
+  }
+  return out;
+}
+
+struct VertexTranslation {
+  std::string body;
+  std::string diagnostic;
+};
+
+VertexTranslation TranslateVertex(const gpu::VertexShader& shader, uint16_t regs) {
+  VertexTranslation out;
+  try {
+    if (shader.program_type != 0x2078) {
+      throw std::invalid_argument("program type " + std::to_string(shader.program_type));
+    }
+    if (shader.program.size() % 4 || shader.program.size() > 1024) {
+      throw std::invalid_argument("instruction length " + std::to_string(shader.program.size()));
+    }
+    out.body = "  var a0 = 0;\n  var oPos = vec4<f32>(0.0);\n  var oD0 = vec4<f32>(0.0, 0.0, 0.0, 1.0);\n  var oD1 = vec4<f32>(0.0);\n";
+    for (int n = 0; n < 12; ++n) {
+      out.body += "  var R" + std::to_string(n) + " = vec4<f32>(0.0);\n";
+    }
+    for (int n = 0; n < 4; ++n) {
+      out.body += "  var oT" + std::to_string(n) + " = vec4<f32>(0.0, 0.0, 0.0, 1.0);\n";
+    }
+    bool ended = false;
+    for (size_t n = 0; n < shader.program.size(); n += 4) {
+      const VertexToken k{shader.program.data() + n};
+      const auto mac = k.Field(1, 21, 4);
+      const auto ilu = k.Field(1, 25, 3);
+      if (mac > 13) {
+        throw std::invalid_argument("MAC operation " + std::to_string(mac));
+      }
+      if (ilu != 0 && ilu != 1 && ilu != 3) {
+        throw std::invalid_argument("ILU operation " + std::to_string(ilu));
+      }
+      const auto source = [&](int which) { return ProgramSource(k, which, regs); };
+      out.body += "  {\n";
+      if (mac) {
+        const auto a = source(0);
+        const auto b = mac == 2 || (mac >= 4 && mac <= 12) ? source(1) : "vec4<f32>(0.0)";
+        const auto c = mac == 3 || mac == 4 ? source(2) : "vec4<f32>(0.0)";
+        out.body += "    let mr = " + MacExpression(mac, a, b, c) + ";\n";
+      }
+      if (ilu) {
+        const auto c = source(2);
+        out.body += "    let ir = " + (ilu == 3 ? "vec4<f32>(xrcc(" + c + ".x))" : c) + ";\n";
+      }
+      const auto reg = k.Field(3, 20, 4);
+      if (mac == 13) {
+        out.body += "    a0 = i32(floor(mr.x + 0.001));\n";
+      } else if (mac) {
+        const auto mask = ilu && reg == 1 ? 0 : k.Field(3, 24, 4);
+        if (mask) {
+          out.body += WriteRegister(Register(reg), mask, "mr");
+        }
+      }
+      if (ilu && k.Field(3, 16, 4)) {
+        out.body += WriteRegister(Register(mac ? 1 : reg), k.Field(3, 16, 4), "ir");
+      }
+      const auto mask = k.Field(3, 12, 4);
+      const bool use_ilu = k.Field(3, 2, 1);
+      if (mask && ((use_ilu && ilu) || (!use_ilu && mac && mac != 13))) {
+        if (!k.Field(3, 11, 1)) {
+          throw std::invalid_argument("constant output write");
+        }
+        const auto output = k.Field(3, 3, 8);
+        std::string destination;
+        if (output == 0) {
+          destination = "oPos";
+        } else if (output == 3 || output == 4) {
+          destination = "oD" + std::to_string(output - 3);
+        } else if (output >= 9 && output <= 12) {
+          destination = "oT" + std::to_string(output - 9);
+        } else {
+          throw std::invalid_argument("output register " + std::to_string(output));
+        }
+        out.body += WriteRegister(destination, mask, use_ilu ? "ir" : "mr");
+      }
+      out.body += "  }\n";
+      if (k.Field(3, 0, 1)) {
+        ended = true;
+        break;
+      }
+    }
+    if (!ended) {
+      throw std::invalid_argument("missing end token");
+    }
+  } catch (const std::invalid_argument& error) {
+    out.body.clear();
+    out.diagnostic = "programmable vertex " + std::string(error.what());
+  }
+  return out;
 }
 
 }
@@ -152,6 +366,12 @@ ShaderConstants BuildConstants(const gpu::State& s, uint32_t width, uint32_t hei
   c.misc = {float(s.simple[gpu::kMAlphaRef / 4] & 255), s.simple[gpu::kMAlphaTestEnable / 4] ? float(func - 0x200) : 7.0f,
     0, s.rs[gpu::kRsSpecularEnable] ? 1.0f : 0.0f};
   c.tfactor = Color(s.rs[gpu::kRsTextureFactor]);
+  for (int n = 0; n < 8; ++n) {
+    c.pc[n * 2] = Color(s.simple[(gpu::kMPsConstant0 + n * 4) / 4]);
+    c.pc[n * 2 + 1] = Color(s.simple[(gpu::kMPsConstant1 + n * 4) / 4]);
+  }
+  c.pc[16] = Color(s.simple[gpu::kMPsFinalConstant0 / 4]);
+  c.pc[17] = Color(s.simple[gpu::kMPsFinalConstant1 / 4]);
   c.texsize = texsize;
   for (int n = 0; n < 4; ++n) {
     if (c.texsize[n][0] == 0) {
@@ -201,16 +421,25 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
   if ((s.vs_handle & 1) && !s.vs) {
     return reject("missing owned vertex shader");
   }
-  if ((s.vs_handle & 1) && s.vs && !s.vs->program.empty()) {
-    return reject("programmable vertex microcode");
+  const bool programmable = (s.vs_handle & 1) && s.vs && !s.vs->program.empty();
+  VertexTranslation program;
+  if (programmable) {
+    program = TranslateVertex(*s.vs, regs);
+    if (!program.diagnostic.empty()) {
+      return reject(program.diagnostic);
+    }
   }
+  PixelTranslation pixel;
   if (key.programmable) {
-    return reject("programmable pixel combiners");
+    pixel = TranslatePixel(key);
+    if (!pixel.supported) {
+      return reject("programmable pixel " + pixel.diagnostic);
+    }
   }
   if (s.rs[gpu::kRsFogEnable] || s.rs[gpu::kRsRangeFogEnable]) {
     return reject("fog");
   }
-  if (!pretransformed && (fixed.light || s.rs[gpu::kRsVertexBlend])) {
+  if (!programmable && !pretransformed && (fixed.light || s.rs[gpu::kRsVertexBlend])) {
     return reject("vertex lighting or blend");
   }
   if (s.rs[gpu::kRsPointSpriteEnable] || s.rs[gpu::kRsPointScaleEnable] || s.rs[gpu::kRsWrap0]) {
@@ -219,7 +448,7 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
   if (key.alphatest && (s.simple[gpu::kMAlphaFunc / 4] < 0x200 || s.simple[gpu::kMAlphaFunc / 4] > 0x207)) {
     return reject("alpha comparison " + std::to_string(s.simple[gpu::kMAlphaFunc / 4]));
   }
-  for (int n = 0; n < 4; ++n) {
+  for (int n = 0; n < 4 && !key.programmable; ++n) {
     const auto* f = key.ff[n];
     if (f[0] <= 1) {
       break;
@@ -245,7 +474,7 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
   }
   for (int n = 0; n < 4; ++n) {
     const uint32_t f = fixed.tex[n];
-    if (!pretransformed && (((f >> 4) & 7) || ((f >> 8) & 7) > 4)) {
+    if (!programmable && !pretransformed && (((f >> 4) & 7) || ((f >> 8) & 7) > 4)) {
       return reject("texture coordinate generation or transform count at stage " + std::to_string(n));
     }
   }
@@ -253,6 +482,9 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     return (regs & (1u << reg)) ? "i.v" + std::to_string(reg) : std::string(fallback);
   };
   std::string vertex = kUniform;
+  if (programmable) {
+    vertex += kVertexHelpers;
+  }
   vertex += Varyings(key.flat);
   vertex += "struct VIn {\n";
   for (int n = 0; n < 16; ++n) {
@@ -261,9 +493,13 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     }
   }
   vertex += "}\n@vertex fn vs_main(i: VIn) -> VOut {\n  var o: VOut;\n";
-  if (pretransformed) {
-    vertex += "  let rhw = i.v0;\n  var w = 1.0;\n  if (rhw.w != 0.0) { w = 1.0 / rhw.w; }\n";
-    vertex += "  var p = vec4<f32>(rhw.xy, rhw.z / u.surf.z, w);\n";
+  if (programmable || pretransformed) {
+    if (programmable) {
+      vertex += program.body + "  var p = oPos;\n";
+    } else {
+      vertex += "  let rhw = i.v0;\n  var w = 1.0;\n  if (rhw.w != 0.0) { w = 1.0 / rhw.w; }\n";
+      vertex += "  var p = vec4<f32>(rhw.xy, rhw.z / u.surf.z, w);\n";
+    }
     vertex += "  let magnitude = clamp(abs(p.w), 5.42101e-20, 1.84467e19);\n  p.w = select(magnitude, -magnitude, p.w < 0.0);\n";
     vertex += "  if (abs(p.x - (u.surf.x - 0.5)) < 0.001) { p.x = u.surf.x; }\n  if (abs(p.y - (u.surf.y - 0.5)) < 0.001) { p.y = u.surf.y; }\n";
     vertex += "  o.pos = vec4<f32>((p.x * 2.0 / u.surf.x - 1.0) * p.w, (1.0 - p.y * 2.0 / u.surf.y) * p.w, p.z * u.surf.z * p.w, p.w);\n";
@@ -272,9 +508,13 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     vertex += "  let sp = (vec2<f32>(cp.x, -cp.y) / cp.w + vec2<f32>(1.0)) * 0.5 * u.surf.xy;\n";
     vertex += "  if (abs(sp.x - (u.surf.x - 0.5)) < 0.001) { cp.x = cp.w; }\n  if (abs(sp.y - (u.surf.y - 0.5)) < 0.001) { cp.y = -cp.w; }\n  o.pos = cp;\n";
   }
-  vertex += "  o.d0 = clamp(" + input(3, "vec4<f32>(1.0)") + ", vec4<f32>(0.0), vec4<f32>(1.0));\n";
-  vertex += "  o.d1 = clamp(" + input(4, "vec4<f32>(0.0)") + ", vec4<f32>(0.0), vec4<f32>(1.0));\n";
+  vertex += "  o.d0 = clamp(" + (programmable ? "oD0" : input(3, "vec4<f32>(1.0)")) + ", vec4<f32>(0.0), vec4<f32>(1.0));\n";
+  vertex += "  o.d1 = clamp(" + (programmable ? "oD1" : input(4, "vec4<f32>(0.0)")) + ", vec4<f32>(0.0), vec4<f32>(1.0));\n";
   for (int n = 0; n < 4; ++n) {
+    if (programmable) {
+      vertex += "  o.t" + std::to_string(n) + " = oT" + std::to_string(n) + ";\n";
+      continue;
+    }
     const auto f = fixed.tex[n];
     const auto value = input(9 + int(f & 3), "vec4<f32>(0.0, 0.0, 0.0, 1.0)");
     const auto count = (f >> 8) & 7;
@@ -299,8 +539,13 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     fragment += "@group(0) @binding(" + std::to_string(1 + n * 2) + ") var tex" + name + ": texture_2d<f32>;\n";
     fragment += "@group(0) @binding(" + std::to_string(2 + n * 2) + ") var smp" + name + ": sampler;\n";
   }
-  fragment += "@fragment fn fs_main(i: VOut) -> @location(0) vec4<f32> {\n  var cur = i.d0;\n  var tmp = vec4<f32>(0.0);\n  var v1 = i.d1;\n  if (u.misc.w == 0.0) { v1 = vec4<f32>(0.0, 0.0, 0.0, 1.0); }\n";
-  for (int n = 0; n < 4; ++n) {
+  fragment += "@fragment fn fs_main(i: VOut) -> @location(0) vec4<f32> {\n";
+  if (key.programmable) {
+    fragment += pixel.body;
+  } else {
+    fragment += "  var cur = i.d0;\n  var tmp = vec4<f32>(0.0);\n  var v1 = i.d1;\n  if (u.misc.w == 0.0) { v1 = vec4<f32>(0.0, 0.0, 0.0, 1.0); }\n";
+  }
+  for (int n = 0; n < 4 && !key.programmable; ++n) {
     const auto* f = key.ff[n];
     if (f[0] <= 1) {
       break;
@@ -323,7 +568,9 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     fragment += "  { let rgb = clamp(" + rgb + ", vec3<f32>(0.0), vec3<f32>(1.0)); let alpha = clamp(" + alpha + ", 0.0, 1.0); ";
     fragment += std::string(f[8] == 5 ? "tmp" : "cur") + " = vec4<f32>(rgb, alpha); }\n";
   }
-  fragment += "  var outc = vec4<f32>(clamp(cur.rgb + v1.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), cur.a);\n";
+  if (!key.programmable) {
+    fragment += "  var outc = vec4<f32>(clamp(cur.rgb + v1.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), cur.a);\n";
+  }
   if (key.alphatest) {
     fragment += "  let v = floor(outc.a * 255.0 + 0.5);\n  let r = u.misc.x;\n  let f = u32(u.misc.y);\n";
     fragment += "  let ok = (f == 1u && v < r) || (f == 2u && v == r) || (f == 3u && v <= r) || (f == 4u && v > r) || (f == 5u && v != r) || (f == 6u && v >= r) || f == 7u;\n  if (!ok) { discard; }\n";

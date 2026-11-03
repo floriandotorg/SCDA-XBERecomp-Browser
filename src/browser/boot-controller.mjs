@@ -136,7 +136,7 @@ export const createBootController = ({
     const report = (message) => {
       if (active !== session || session.retired || message?.generation !== session.generation) { return; }
       if (message.ok === false) {
-        void retire(outcome(message.code ?? 'BOOT', message.message ?? 'Guest boot failed.', ['CANCELLED', 'GRAPHICS_CHECKPOINT'].includes(message.code) ? 'stopped' : 'error', guestDiagnostic(message)));
+        void retire(outcome(message.code ?? 'BOOT', message.message ?? 'Guest boot failed.', ['CANCELLED', 'GRAPHICS_CHECKPOINT', 'SINGLE_PLAYER_LAUNCH_REQUEST'].includes(message.code) ? 'stopped' : 'error', guestDiagnostic(message)));
       } else if (message.phase === 'booting' && state.phase === 'validating') {
         publish({ phase: 'booting' });
       } else if (message.phase === 'running' && state.phase === 'booting') {

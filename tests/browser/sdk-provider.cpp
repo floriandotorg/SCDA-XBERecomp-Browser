@@ -25,6 +25,16 @@ void SdkFixtureOriginal(X86Context& ctx, uint8_t* base, uint32_t id) {
     browser::Runtime::From(ctx).Kernel(ctx, base, 44);
     throw std::runtime_error("retained unsupported import returned");
   }
+  if (id == 69 || id == 71) {
+    uint32_t argument = 0;
+    memory.Read(ctx, ctx.esp + 4, &argument, 4);
+    ctx.eax = id == 69 ? (argument == 9 ? 0 : 0x30000 + argument) : argument;
+    ctx.ecx ^= 0x13579bdf;
+    ctx.edx += 17;
+    ctx.xflags ^= 0x41;
+    ctx.esp += id == 69 ? 8 : 12;
+    return;
+  }
   ctx.eax ^= 0x12340000 + id;
   ctx.ecx += id;
   ctx.edx ^= 0xabcdef;
@@ -37,8 +47,13 @@ struct Fixture {
   browser::PreparedImage image;
   browser::Runtime runtime;
   std::shared_ptr<const browser::SdkTrace> trace;
-  explicit Fixture(bool install = true)
-    : runtime(std::array<X86FuncMapping, 3>{{{SDK_FIXTURE_XNET_ADDRESS, SDK_FIXTURE_XNET}, {SDK_FIXTURE_WSA_ADDRESS, SDK_FIXTURE_WSA}, {SDK_FIXTURE_D3D_ADDRESS, SDK_FIXTURE_D3D}}}, {}) {
+  explicit Fixture(bool install = true, X86Func* begin = SDK_FIXTURE_BEGIN, X86Func* end = SDK_FIXTURE_END)
+    : runtime([&] {
+        std::vector<X86FuncMapping> mappings = {{SDK_FIXTURE_XNET_ADDRESS, SDK_FIXTURE_XNET}, {SDK_FIXTURE_WSA_ADDRESS, SDK_FIXTURE_WSA}, {SDK_FIXTURE_D3D_ADDRESS, SDK_FIXTURE_D3D}};
+        if (begin) { mappings.push_back({SDK_FIXTURE_BEGIN_ADDRESS, begin}); }
+        if (end) { mappings.push_back({SDK_FIXTURE_END_ADDRESS, end}); }
+        return mappings;
+      }(), {}) {
     image.memory = std::make_unique<browser::Memory>();
     image.memory->Ensure(0x10000, 4096);
     image.memory->Ensure(0x20000, 8192);
@@ -74,6 +89,181 @@ struct Fixture {
 };
 
 int main() {
+  for (const auto pair : {std::pair<X86Func*, X86Func*>{nullptr, SDK_FIXTURE_END},
+      {SDK_FIXTURE_BEGIN, nullptr}, {SDK_FIXTURE_BEGIN_ORIGINAL, SDK_FIXTURE_END},
+      {SDK_FIXTURE_BEGIN, SDK_FIXTURE_END_ORIGINAL}}) {
+    Fixture fixture(false, pair.first, pair.second);
+    const auto owner = fixture.image.diagnosticRuntime;
+    rejects([&] { browser::InstallSdkProvider(fixture.runtime, fixture.image); });
+    check(fixture.image.diagnosticRuntime == owner && !fixture.runtime.HasPublishedImage(), "signature mapping rejection changed image ownership");
+  }
+  {
+    Fixture fixture(false, nullptr, nullptr);
+    fixture.trace = browser::InstallSdkProvider(fixture.runtime, fixture.image);
+    fixture.Bind();
+    auto ctx = fixture.Context();
+    fixture.runtime.Launch(ctx, fixture.image.memory->Base(), [&](X86Context& current, uint8_t* base) {
+      const auto before = current;
+      const auto calls = originalCalls.load();
+      rejects([&] { SDK_FIXTURE_BEGIN(current, base); });
+      rejects([&] { SDK_FIXTURE_END(current, base); });
+      check(!std::memcmp(&current, &before, sizeof(current)) && calls == originalCalls.load() && fixture.trace->Snapshot().total == 0,
+        "absent signature mappings delegated or mutated state");
+      SDK_FIXTURE_XNET(current, base);
+    });
+    fixture.Join();
+    check(fixture.trace->Snapshot().total == 1, "absent signature mappings changed M3 SDK behavior");
+  }
+  {
+    Fixture fixture;
+    fixture.Bind();
+    std::atomic<uint32_t> ready = 0;
+    for (uint32_t n = 0; n < 2; ++n) {
+      auto ctx = fixture.Context(0x20100 + n * 0x100);
+      fixture.runtime.Launch(ctx, fixture.image.memory->Base(), [&](X86Context& current, uint8_t* base) {
+        const uint32_t marker = (current.fs_base - 0x120100) / 0x100;
+        const uint32_t stack = current.esp;
+        ++ready;
+        while (ready.load() < 2) { std::this_thread::yield(); }
+        for (uint32_t n = 0; n < 40; ++n) {
+          current.esp = stack;
+          std::array<uint32_t, 3> frame = {marker ? 0x3f724u : 0x3f58cu, marker, 0xffffffff};
+          fixture.image.memory->Write(current, stack, frame.data(), sizeof(frame));
+          fixture.runtime.Invoke(current, base, SDK_FIXTURE_BEGIN_ADDRESS);
+          frame[1] = current.eax;
+          current.esp = stack;
+          fixture.image.memory->Write(current, stack, frame.data(), sizeof(frame));
+          fixture.runtime.Invoke(current, base, SDK_FIXTURE_END_ADDRESS);
+        }
+      });
+    }
+    fixture.Join();
+    const auto trace = fixture.trace->Snapshot();
+    check(trace.count == 64 && trace.total == 320, "signature trace lost concurrent entries or exceeded its bound");
+    for (size_t n = 0; n < trace.count; ++n) {
+      const auto& event = trace.events[n];
+      const uint32_t marker = (event.fsBase - 0x120100) / 0x100;
+      check(event.sequence == 257 + n && event.workerId && marker < 2 && event.id >= 69 && event.id <= 72 &&
+        event.returnAddress == (marker ? 0x3f724u : 0x3f58cu) &&
+        event.arguments[0] == (event.id < 71 ? marker : 0x30000 + marker) &&
+        event.arguments[1] == (event.id % 2 ? 0u : 0x30000 + marker) &&
+        std::all_of(event.arguments.begin() + 2, event.arguments.end(), [](uint32_t word) { return word == 0; }),
+        "signature concurrent snapshots mixed workers, results or extra data");
+    }
+  }
+  for (const uint32_t mode : {0u, 1u, 2u, 4u, 8u, 9u, 0xffffffffu}) {
+    Fixture fixture;
+    fixture.Bind();
+    auto ctx = fixture.Context();
+    fixture.runtime.Launch(ctx, fixture.image.memory->Base(), [&](X86Context& current, uint8_t* base) {
+      for (uint32_t n = 0; n < 2; ++n) {
+        current = fixture.Context();
+        const std::array<uint32_t, 3> frame = {n ? 0x3f79au : 0x3f724u, n ? 0x30000u : mode, 0xffffffff};
+        fixture.image.memory->Write(current, current.esp, frame.data(), sizeof(frame));
+        auto expected = current;
+        const auto original = n ? SDK_FIXTURE_END_ORIGINAL : SDK_FIXTURE_BEGIN_ORIGINAL;
+        const auto observed = n ? SDK_FIXTURE_END : SDK_FIXTURE_BEGIN;
+        original(expected, base);
+        const auto calls = originalCalls.load();
+        expectedContext = &current;
+        expectedBase = base;
+        observed(current, base);
+        expectedContext = nullptr;
+        check(originalCalls.load() == calls + 1 && !std::memcmp(&current, &expected, sizeof(current)),
+          "signature wrapper changed original identity, ABI, result or call count");
+      }
+    });
+    fixture.Join();
+    const auto trace = fixture.trace->Snapshot();
+    check(trace.total == 4 && trace.count == 4, "signature entry/return observations missing");
+    for (size_t n = 0; n < 4; ++n) {
+      const auto& event = trace.events[n];
+      check(event.id == 69 + n && event.sequence == n + 1 && event.workerId &&
+        event.behavior == browser::SdkBehavior::Original && event.returnAddress == (n < 2 ? 0x3f724u : 0x3f79au) &&
+        event.esp == ctx.esp && event.argumentCount == (n % 2 ? 2 : 1) &&
+        event.arguments[0] == (n < 2 ? mode : 0x30000u) &&
+        std::all_of(event.presentation.begin(), event.presentation.end(), [](uint32_t word) { return word == 0; }),
+        "signature metadata includes wrong caller, mode, identity or extra data");
+    }
+    check(trace.events[1].arguments[1] == (mode == 9 ? 0 : 0x30000 + mode) && trace.events[3].arguments[1] == 0x30000,
+      "signature trace invented a context or finalizer success");
+  }
+  for (const uint32_t result : {0u, 50u, 0xffffffffu}) {
+    Fixture fixture;
+    fixture.Bind();
+    auto ctx = fixture.Context();
+    const std::array<uint32_t, 3> frame = {0x3f79a, result, 0xffffffff};
+    fixture.image.memory->Write(ctx, ctx.esp, frame.data(), sizeof(frame));
+    fixture.runtime.Launch(ctx, fixture.image.memory->Base(), [&](X86Context& current, uint8_t* base) {
+      SDK_FIXTURE_END(current, base);
+      check(current.eax == result && current.esp == ctx.esp + 12, "finalizer status or stack was rewritten");
+    });
+    fixture.Join();
+    const auto trace = fixture.trace->Snapshot();
+    check(trace.total == 2 && trace.events[1].arguments[1] == result, "finalizer status was normalized to success");
+  }
+  for (const auto observed : {SDK_FIXTURE_BEGIN, SDK_FIXTURE_END}) {
+    Fixture fixture;
+    fixture.Bind();
+    auto ctx = fixture.Context();
+    rejects([&] { observed(ctx, fixture.image.memory->Base()); });
+    fixture.runtime.Launch(ctx, fixture.image.memory->Base(), [&](X86Context& current, uint8_t* base) {
+      const auto unchanged = [&](const auto& action) {
+        const auto before = current;
+        const auto calls = originalCalls.load();
+        const auto total = fixture.trace->Snapshot().total;
+        rejects(action);
+        check(!std::memcmp(&current, &before, sizeof(current)) && calls == originalCalls.load() &&
+          total == fixture.trace->Snapshot().total, "invalid signature admission changed state");
+      };
+      unchanged([&] { observed(current, nullptr); });
+      browser::Memory foreign;
+      unchanged([&] { observed(current, foreign.Base()); });
+      auto alias = current;
+      rejects([&] { observed(alias, base); });
+      browser::Runtime foreignRuntime({}, {});
+      alias.host = &foreignRuntime;
+      rejects([&] { observed(alias, base); });
+      {
+        auto lease = fixture.image.memory->Borrow();
+        unchanged([&] { observed(current, base); });
+      }
+      for (const uint32_t stack : {0x21ffcu, 0x30000u, 0xfffffffcu}) {
+        current.esp = stack;
+        unchanged([&] { observed(current, base); });
+      }
+      current = fixture.Context();
+      fixture.image.importsBound = false;
+      unchanged([&] { observed(current, base); });
+      fixture.image.importsBound = true;
+      fixture.image.boundRuntime = &foreignRuntime;
+      unchanged([&] { observed(current, base); });
+      fixture.image.boundRuntime = &fixture.runtime;
+      auto memory = std::move(fixture.image.memory);
+      fixture.image.memory = std::make_unique<browser::Memory>();
+      unchanged([&] { observed(current, base); });
+      fixture.image.memory = std::move(memory);
+      fixture.runtime.Cancel();
+      unchanged([&] { observed(current, base); });
+    });
+    fixture.Join();
+  }
+  for (const auto observed : {SDK_FIXTURE_BEGIN, SDK_FIXTURE_END}) {
+    Fixture fixture;
+    fixture.Bind();
+    auto ctx = fixture.Context();
+    ctx.eax = 0xdeadbeef;
+    const auto before = ctx;
+    const auto calls = originalCalls.load();
+    fixture.runtime.Launch(ctx, fixture.image.memory->Base(), [&](X86Context& current, uint8_t* base) { observed(current, base); });
+    bool trapped = false;
+    try { fixture.Join(); }
+    catch (const browser::UnsupportedImport& fault) {
+      trapped = fault.ordinal == 44 && fault.context && !std::memcmp(fault.context.get(), &before, sizeof(before));
+    }
+    check(trapped && originalCalls.load() == calls + 1 && fixture.trace->Snapshot().count == 1,
+      "signature original fault swallowed, duplicated or given a return event");
+  }
   for (uint32_t n = 0; n < 3; ++n) {
     browser::Memory memory;
     browser::Runtime runtime({}, {});
@@ -138,6 +328,10 @@ int main() {
     fixture.Bind();
     auto ctx = fixture.Context();
     fixture.runtime.Launch(ctx, fixture.image.memory->Base(), [&](X86Context& current, uint8_t* base) {
+      check(browser::Runtime::ObserveSdkEntry(current, base, 66) && browser::Runtime::ObserveSdkEntry(current, base, 67),
+        "SDK release observations without a graphics owner did not delegate");
+      check(browser::Runtime::ObserveSdkEntry(current, base, 68), "SDK overlay boundary without a graphics owner did not delegate");
+      rejects([&] { browser::Runtime::ObserveSdkEntry(current, base, 73); });
       const auto unchanged = [&](const auto& action) {
         const auto before = current;
         const auto calls = originalCalls.load();
@@ -483,7 +677,7 @@ int main() {
     fixture.trace = browser::InstallSdkProvider(fixture.runtime, fixture.image);
     check(fixture.trace->Snapshot().total == 0, "rejected foreign image partially installed SDK binding");
   }
-  for (const uint32_t entry : {SDK_FIXTURE_XNET_ADDRESS, SDK_FIXTURE_WSA_ADDRESS, SDK_FIXTURE_D3D_ADDRESS}) {
+  for (const uint32_t entry : {SDK_FIXTURE_XNET_ADDRESS, SDK_FIXTURE_WSA_ADDRESS, SDK_FIXTURE_D3D_ADDRESS, SDK_FIXTURE_BEGIN_ADDRESS, SDK_FIXTURE_END_ADDRESS}) {
     Fixture fixture(false);
     fixture.image.image.entry = entry;
     rejects([&] { browser::InstallSdkProvider(fixture.runtime, fixture.image); });

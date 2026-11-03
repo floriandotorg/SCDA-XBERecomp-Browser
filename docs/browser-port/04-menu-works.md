@@ -1,6 +1,12 @@
 # M4: The real menu works
 
-Status: **active, incomplete, not accepted**. The opt-in WebGPU service, owned transport, portable state capture, fixed-function shader/texture subset, backend bridge and keyboard/route foundations have focused synthetic coverage. The actual title still stops at the explicit unsupported `D3DDevice_SetRenderState_Simple` frontend boundary before a game frame. No real menu, navigation or single-player mission boundary is accepted. See [M4 evidence and remaining work](m4-evidence.md).
+Status: **accepted** for the build recorded below. See the [boot compatibility and loading follow-up](m4-evidence.md#boot-compatibility-and-loading-regression-follow-up) for subsequent fixes and the distinction between accepted sources and older served artifacts.
+
+The genuine `default.xbe` menu renders through WebGPU with readable text, imagery and selection highlights. Agent-browser acceptance covers Start, arrow navigation, confirmation, Back, temporary profile creation, Solo and New Game on Normal difficulty. A clean run reaches `SINGLE_PLAYER_LAUNCH_REQUEST` with a verified original dispatch, completed front-buffer persistence, zero WebGPU validation errors and zero remaining guest workers. The host stops at this boundary; mission execution belongs to M5.
+
+The clean Solo menu held at 28 GPU service resources over 81.07 seconds. Five real shader pairs and five pipelines were observed; the focused browser fixtures also pass 68 numerical shader pipelines and GPU service/lifecycle checks. Menu builds provide a quota-accounted 32 MiB temporary profile volume. The cache remains 64 MiB and the Wasm heap remains capped at 256 MiB. Refresh and restart discard temporary profiles.
+
+The final frozen-source browser suite passes 419/419 across 119 files, with all 515 recorded runtime, tool, configuration and test source files unchanged. See [M4 acceptance evidence](m4-evidence.md#current-accepted-evidence) for the exact scope, measurements and reproduction steps. No missing external prerequisite remains.
 
 Previous: [M3: Game boot](03-game-boots.md). Next: [M5: First 3D mission](05-first-3d.md).
 
@@ -13,8 +19,9 @@ A browser drawn replacement menu, prerecorded video, rendered triangle or clear 
 ## Entry requirements
 
 * M3 accepted with a trace of the real graphics boundary.
-* The chosen browser exposes WebGPU under the local serving configuration.
+* The chosen browser exposes WebGPU under the local serving configuration. The current tail-enabled rendering build also requires WebAssembly tail-call support, checked before runtime creation or ISO reads.
 * A portable snapshot of required Xbox render state exists or is extracted during the first package.
+No missing user-supplied signing-key prerequisite has been established. The reached `XboxSignatureKey` export is a browser implementation and native-parity audit task, not currently an external entry requirement. Preserve real signing and comparison behavior; do not force signature checks to succeed.
 
 ## P4.1: WebGPU backend and callback topology
 
@@ -95,12 +102,12 @@ Acceptance:
 
 ## Exit checklist
 
-* [ ] P4.1 through P4.4 accepted.
-* [ ] Real menu is visible and navigable.
-* [ ] Shader, texture and state handling pass focused synthetic tests.
-* [ ] Every exercised readback operation is real, not a successful stub.
-* [ ] No menu path WebGPU validation errors remain.
-* [ ] Single player selection reaches the next stage's boundary.
+* [x] P4.1 through P4.4 accepted.
+* [x] Real menu is visible and navigable.
+* [x] Shader, texture and state handling pass focused synthetic tests.
+* [x] Every exercised readback operation is real, not a successful stub.
+* [x] No menu path WebGPU validation errors remain.
+* [x] Single player selection reaches the next stage's boundary.
 
 ## Evidence
 

@@ -1,9 +1,70 @@
 #include "browser/timer-provider.h"
 #include "browser/dpc-provider.h"
+#include <algorithm>
 #include <array>
 #include <bit>
 
 namespace browser {
+namespace {
+
+std::array<uint8_t, 16> UtcTimeFields(int64_t ticks) {
+  constexpr int64_t ticksPerDay = 864000000000ll;
+  int64_t days = ticks / ticksPerDay;
+  int64_t remainder = ticks % ticksPerDay;
+  if (remainder < 0) {
+    --days;
+    remainder += ticksPerDay;
+  }
+  const int64_t milliseconds = remainder / 10000;
+  const int64_t z = days - 134774 + 719468;
+  const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  const int64_t dayOfEra = z - era * 146097;
+  const int64_t yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365;
+  int64_t year = yearOfEra + era * 400;
+  const int64_t dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100);
+  const int64_t marchMonth = (5 * dayOfYear + 2) / 153;
+  const int64_t day = dayOfYear - (153 * marchMonth + 2) / 5 + 1;
+  const int64_t month = marchMonth + (marchMonth < 10 ? 3 : -9);
+  year += month <= 2;
+  const int64_t weekday = ((days + 1) % 7 + 7) % 7;
+  const std::array<int64_t, 8> fields = {year, month, day, milliseconds / 3600000,
+    milliseconds / 60000 % 60, milliseconds / 1000 % 60, milliseconds % 1000, weekday};
+  std::array<uint8_t, 16> bytes;
+  for (size_t n = 0; n < fields.size(); ++n) {
+    const uint16_t value = uint16_t(fields[n]);
+    bytes[n * 2] = uint8_t(value);
+    bytes[n * 2 + 1] = uint8_t(value >> 8);
+  }
+  return bytes;
+}
+
+}
+
+void TimerQueue::TimeToTimeFields(X86Context& context, uint8_t* base) {
+  if (context.host != &runtime_ || !image_.memory || image_.memory.get() != memory_ ||
+      !image_.importsBound || image_.boundRuntime != &runtime_ || base != memory_->Base() ||
+      !runtime_.OwnsCurrentContext(context) || Memory::HasBorrow()) {
+    throw Fault(context, 305, 0, "time fields conversion requires its owned image worker without a backing lease");
+  }
+  runtime_.Checkpoint(context);
+  const uint64_t stackEnd = uint64_t(context.esp) + 12;
+  if (stackEnd > UINT32_MAX) { throw Fault(context, context.esp, 12, "time fields conversion frame overflow"); }
+  auto lease = memory_->Borrow();
+  std::array<uint8_t, 12> frameBytes;
+  memory_->Read(context, context.esp, frameBytes.data(), frameBytes.size());
+  std::array<uint32_t, 3> frame{};
+  for (size_t n = 0; n < frameBytes.size(); ++n) { frame[n / 4] |= uint32_t(frameBytes[n]) << (n % 4 * 8); }
+  if (!frame[1] || !frame[2]) { throw Fault(context, 0, 0, "time fields conversion requires non-null input and output"); }
+  std::array<uint8_t, 8> input;
+  memory_->Read(context, frame[1], input.data(), input.size());
+  memory_->CheckRange(context, frame[2], 16);
+  uint64_t bits = 0;
+  for (size_t n = 0; n < input.size(); ++n) { bits |= uint64_t(input[n]) << (n * 8); }
+  const auto fields = UtcTimeFields(std::bit_cast<int64_t>(bits));
+  runtime_.Checkpoint(context);
+  memory_->Write(context, frame[2], fields.data(), fields.size());
+  context.esp = uint32_t(stackEnd);
+}
 
 void TimerQueue::RequireWorker(const X86Context& context) const {
   if (context.host != &runtime_ || !image_.importsBound || image_.boundRuntime != &runtime_ ||
@@ -124,8 +185,10 @@ std::optional<TimerExpiration> TimerQueue::TakeExpired(const X86Context& context
 void TimerQueue::Drive(X86Context& context, uint8_t* base) {
   RequireWorker(context);
   if (base != image_.memory->Base()) { throw Fault(context, 149, 0, "expiry driver requires its image backing"); }
-  if (tickInstalled_ || clockObserver_) {
+  {
     std::lock_guard lock(lock_);
+    const bool pending = std::any_of(schedules_.begin(), schedules_.end(), [](const auto& schedule) { return schedule.has_value(); });
+    if (!tickInstalled_ && !clockObserver_ && !pending) { return; }
     const uint64_t now = runtime_.TimerTime(context);
     runtime_.Checkpoint(context);
     if (tickInstalled_) {
@@ -133,8 +196,11 @@ void TimerQueue::Drive(X86Context& context, uint8_t* base) {
       memory_->Write(context, 0xc0002000, &milliseconds, sizeof(milliseconds));
     }
     if (clockObserver_) { clockObserver_(context, now); }
+    const bool expired = std::any_of(schedules_.begin(), schedules_.end(), [now](const auto& schedule) {
+      return schedule && schedule->expiration.deadline <= now;
+    });
+    if (!expired) { return; }
   }
-  if (!Pending()) { return; }
   uint8_t irql = 0;
   image_.memory->Read(context, context.fs_base + 0x24, &irql, 1);
   if (irql >= 2) { return; }
@@ -241,6 +307,7 @@ void InstallTimerClockObserver(Runtime& runtime, PreparedImage& image, const std
 std::shared_ptr<TimerQueue> InstallTimerProvider(Runtime& runtime, PreparedImage& image) {
   auto queue = std::make_shared<TimerQueue>(runtime, image);
   runtime.RegisterKernel(113, [queue](X86Context& context, uint8_t* base) { queue->Initialize(context, base); });
+  runtime.RegisterKernel(305, [queue](X86Context& context, uint8_t* base) { queue->TimeToTimeFields(context, base); });
   return queue;
 }
 

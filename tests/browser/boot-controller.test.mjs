@@ -2,6 +2,23 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createBootController } from '../../src/browser/boot-controller.mjs';
 
+test('verified single player launch stops at the stage boundary and retires the runtime', async () => {
+  const { controller, source, runtimes } = fixture();
+  await controller.select(source);
+  const boot = controller.start();
+  await flush();
+  const runtime = runtimes[0];
+  runtime.context.report({ generation: runtime.context.generation, ok: false, code: 'SINGLE_PLAYER_LAUNCH_REQUEST',
+    message: 'Single player launch requested.', entryEntered: true, entryReturned: true, ordinal: 0, threadId: 20 });
+  await flush();
+  runtime.teardown.resolve();
+  await boot;
+  assert.equal(controller.state.phase, 'stopped');
+  assert.equal(controller.state.code, 'SINGLE_PLAYER_LAUNCH_REQUEST');
+  assert.equal(controller.state.source, source);
+  assert.equal(runtime.terminated, 1);
+});
+
 test('graphics checkpoint is stopped diagnostics, not a running game or host failure', async () => {
   const { controller, source, runtimes } = fixture();
   await controller.select(source);

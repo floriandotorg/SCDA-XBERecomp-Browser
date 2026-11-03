@@ -28,7 +28,11 @@ class SilentAudioSink {
 public:
   static constexpr uint32_t kCapacityFrames = audio::kRate;
   SilentAudioSink(Runtime& runtime, PreparedImage& image);
+  bool BelongsTo(Runtime& runtime, PreparedImage& image) const;
   void Submit(const X86Context& context, std::span<const float> samples);
+  // Submit with an externally supplied timer sample: the only safe feed path from inside the timer clock
+  // observer, where sampling TimerTime again would recurse into the driving queue.
+  void SubmitAtTime(const X86Context& context, uint64_t now100ns, std::span<const float> samples);
   void Advance(const X86Context& context, uint64_t now100ns);
   void Pause(const X86Context& context, bool paused);
   SilentAudioSnapshot Snapshot() const;

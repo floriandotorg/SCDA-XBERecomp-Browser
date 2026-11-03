@@ -15,17 +15,60 @@ mkdirSync(directory, { recursive: true });
 test('boot owner pairs retained dispatch and image, rejects missing exports and resets isolated sessions', async () => {
   const identity = 'c3'.repeat(32);
   writeFileSync(`${directory}/build_identity.h`, `#pragma once\n#define BROWSER_BUILD_ID "${identity}"\n`);
-  writeFileSync(`${directory}/image_symbols.h`, '#pragma once\n#define SYM_XNetStartup 00011040\n#define SYM_WSAStartup 00011080\n#define SYM_Direct3D_CreateDevice 000110C0\n#define SYM_D3D_Device 00020000\n#define SYM_D3D_pDevice 00023000\n#define SYM_D3D_InitDefaultState 00011000\n');
+  const audioEntries = [
+    'IDirectSound_Release', 'IDirectSoundBuffer_Unlock', 'IDirectSoundBuffer_Release', 'DirectSoundUseFullHRTF',
+    'CDirectSoundStream_AddRef', 'CDirectSoundStream_Release', 'CDirectSoundStream_GetInfo', 'CDirectSoundStream_Discontinuity',
+    'CDirectSoundStream_Flush', 'CDirectSoundStream_GetStatus', 'CDirectSoundStream_Process', 'CDirectSoundStream_Pause',
+    'CDirectSoundStream_FlushEx', 'CDirectSoundStream_SetVolume', 'CDirectSoundStream_SetFilter', 'CDirectSoundStream_SetHeadroom',
+    'CDirectSoundStream_SetMixBinVolumes', 'IDirectSound_GetSpeakerConfig', 'IDirectSound_SetEffectData', 'IDirectSound_EnableHeadphones',
+    'IDirectSound_SetMixBinHeadroom', 'IDirectSoundBuffer_SetVolume', 'IDirectSoundBuffer_SetFilter', 'IDirectSoundBuffer_SetHeadroom',
+    'IDirectSoundBuffer_SetMixBinVolumes', 'IDirectSoundBuffer_Play', 'IDirectSoundBuffer_Stop', 'IDirectSoundBuffer_SetLoopRegion',
+    'IDirectSoundBuffer_GetStatus', 'IDirectSoundBuffer_GetCurrentPosition', 'IDirectSoundBuffer_SetCurrentPosition', 'IDirectSoundBuffer_Lock',
+    'DirectSoundDoWork', 'XAudioDownloadEffectsImage', 'CDirectSoundStream_SetFrequency', 'CDirectSoundStream_SetMixBins',
+    'CDirectSoundStream_SetMaxDistance', 'CDirectSoundStream_SetMinDistance', 'CDirectSoundStream_SetPosition', 'CDirectSoundStream_SetVelocity',
+    'CDirectSoundStream_SetI3DL2Source', 'IDirectSoundBuffer_SetFrequency', 'IDirectSoundBuffer_SetMixBins', 'IDirectSoundBuffer_SetMaxDistance',
+    'IDirectSoundBuffer_SetMinDistance', 'IDirectSoundBuffer_SetPosition', 'IDirectSoundBuffer_SetVelocity', 'IDirectSoundBuffer_SetI3DL2Source',
+    'IDirectSoundBuffer_SetBufferData', 'IDirectSound_CommitDeferredSettings', 'IDirectSound_CreateSoundBuffer', 'IDirectSound_SetDopplerFactor',
+    'IDirectSound_SetOrientation', 'IDirectSound_SetPosition', 'IDirectSound_SetRolloffFactor', 'IDirectSound_SetVelocity',
+    'IDirectSound_SetI3DL2Listener', 'DirectSoundCreate', 'DirectSoundCreateBuffer', 'DirectSoundCreateStream',
+  ];
+  const audioAddress = (name) => 0x14000 + audioEntries.indexOf(name) * 0x10;
+  const audioSymbols = audioEntries.map((name) =>
+    `#define SYM_${name} ${audioAddress(name).toString(16).toUpperCase().padStart(8, '0')}\n#define HAS_${name} 1`);
+  writeFileSync(`${directory}/image_symbols.h`, '#pragma once\n#define SYM_XNetStartup 00011040\n#define SYM_WSAStartup 00011080\n#define SYM_Direct3D_CreateDevice 000110C0\n#define SYM_D3D_Device 00020000\n#define SYM_D3D_pDevice 00023000\n#define SYM_D3D_InitDefaultState 00011000\n' +
+    audioSymbols.join('\n') + '\n' +
+    '#define SYM_CDirectSoundStream_SetFormat FFFF0000\n#define HAS_CDirectSoundStream_SetFormat 0\n' +
+    '#define SYM_IDirectSound_SetDistanceFactor FFFF0008\n#define HAS_IDirectSound_SetDistanceFactor 0\n' +
+    '#define SYM_DSound_StreamVtable 000121C0\n#define HAS_DSound_StreamVtable 1\n' +
+    '#define SYM_DSound_StreamVtable2 00012200\n#define HAS_DSound_StreamVtable2 1\n' +
+    '#define SYM_DSound_HrtfFilters 0006B000\n#define HAS_DSound_HrtfFilters 1\n' +
+    '#define SYM_DSound_HrtfIndex 0006B100\n#define HAS_DSound_HrtfIndex 1\n');
+  const streamVtable = [
+    'CDirectSoundStream_AddRef', 'CDirectSoundStream_Release', 'CDirectSoundStream_GetInfo', 'CDirectSoundStream_GetStatus',
+    'CDirectSoundStream_Process', 'CDirectSoundStream_Discontinuity', 'CDirectSoundStream_Flush',
+  ].map(audioAddress).concat([0x11040, 0x11080, 0x110c0, 0x11040, 0x11080]);
   writeFileSync(`${directory}/metadata.cpp`, `#include "browser/cpu_runtime.h"
+#include "browser/audio-entries.h"
 #include "cpu/x86_ops.h"
 #include <cstring>
+#include <emscripten/emscripten.h>
+#include <new>
+#include <stdexcept>
+uint32_t failureMode = 0;
+extern "C" EMSCRIPTEN_KEEPALIVE void fixture_failure_mode(uint32_t mode) { failureMode = mode; }
 X86_FUNC(sub_00011040);
 X86_FUNC(sub_00011080);
 X86_FUNC(sub_000110C0);
 X86_FUNC(__imp__sub_000110C0) { ctx.esp += 28; }
 X86_FUNC(__imp__sub_00011040) { ctx.esp += 8; }
 X86_FUNC(__imp__sub_00011080) { ctx.esp += 12; }
+#define FIXTURE_AUDIO_DECL(name, id, args) X86_FUNC(BROWSER_AUDIO_GUEST(name));
+BROWSER_AUDIO_ENTRIES(FIXTURE_AUDIO_DECL)
+#define FIXTURE_AUDIO_ORIGINAL(name, id, args) X86_FUNC(BROWSER_AUDIO_ORIGINAL(name)) { ctx.esp += 4; }
+BROWSER_AUDIO_ENTRIES(FIXTURE_AUDIO_ORIGINAL)
 const auto entry = [](X86Context& context, uint8_t* base) {
+  if (failureMode == 1) { throw std::bad_alloc(); }
+  if (failureMode == 2) { throw std::logic_error("synthetic host logic failure"); }
   auto& memory = browser::Memory::From(base);
   memory.Read(context, 0x120f0, &context.ebx, 4);
   if (context.ebx != 0xc0000010) { throw std::runtime_error("incorrect launch data cell target"); }
@@ -65,13 +108,16 @@ const auto entry = [](X86Context& context, uint8_t* base) {
   sub_00011080(context, base);
   context.esp = savedStack + 8;
 };
-const X86FuncMapping X86FuncMappings[] = {{0x11000, entry}, {0x11040, sub_00011040}, {0x11080, sub_00011080}, {0x110c0, sub_000110C0}, {0, nullptr}};
+#define FIXTURE_AUDIO_MAP(name, id, args) { BROWSER_AUDIO_ADDRESS(name), BROWSER_AUDIO_GUEST(name) },
+const X86FuncMapping X86FuncMappings[] = {{0x11000, entry}, {0x11040, sub_00011040}, {0x11080, sub_00011080}, {0x110c0, sub_000110C0},
+  BROWSER_AUDIO_ENTRIES(FIXTURE_AUDIO_MAP)
+  {0, nullptr}};
 const uint32_t X86Continuations[] = {0};
 const uint32_t X86ImageBase = 0x10000, X86ImageEnd = 0x13000, X86EntryPoint = 0x11000;
 `);
   const build = spawnSync('em++', ['-std=c++20', '-O1', '-pthread', '-fwasm-exceptions', '-DX86_COMPACT_MEMORY', '-Isrc', `-I${directory}`,
     'src/browser/boot-wasm.cpp', 'src/browser/disc-wasm.cpp', 'src/kernel/disc_index.cpp',
-    'src/browser/image.cpp', 'src/browser/sdk-provider.cpp', 'src/browser/diagnostic-graphics.cpp', 'src/browser/silent-audio.cpp', 'src/browser/kernel-provider.cpp', 'src/browser/thread-provider.cpp', 'src/browser/platform-profile.cpp', 'src/browser/shutdown-provider.cpp', 'src/browser/dpc-provider.cpp', 'src/browser/timer-provider.cpp', 'src/browser/cpu_runtime.cpp', 'src/browser/virtual-memory.cpp', 'src/browser/contiguous-memory.cpp', 'src/browser/string-provider.cpp', 'src/browser/section-provider.cpp', 'src/browser/file-provider.cpp', 'src/browser/temporary-filesystem.cpp', 'src/browser/raw-cache.cpp', 'src/browser/cache-fatx.cpp', 'src/kernel/crypto.cpp', `${directory}/metadata.cpp`,
+    'src/browser/image.cpp', 'src/browser/sdk-provider.cpp', 'src/browser/diagnostic-graphics.cpp', 'src/browser/diagnostic-shaders.cpp', 'src/browser/push-state.cpp', 'src/browser/silent-audio.cpp', 'src/browser/audio-core.cpp', 'src/browser/audio-effects.cpp', 'src/browser/audio-provider.cpp', 'src/browser/kernel-provider.cpp', 'src/browser/thread-provider.cpp', 'src/browser/synchronization-provider.cpp', 'src/browser/dispatcher.cpp', 'src/browser/dispatcher-handles.cpp', 'src/browser/dispatcher-object-abi.cpp', 'src/browser/guest-wait.cpp', 'src/browser/platform-profile.cpp', 'src/browser/shutdown-provider.cpp', 'src/browser/dpc-provider.cpp', 'src/browser/timer-provider.cpp', 'src/browser/cpu_runtime.cpp', 'src/browser/virtual-memory.cpp', 'src/browser/contiguous-memory.cpp', 'src/browser/string-provider.cpp', 'src/browser/section-provider.cpp', 'src/browser/file-provider.cpp', 'src/browser/temporary-filesystem.cpp', 'src/browser/raw-cache.cpp', 'src/browser/cache-fatx.cpp', 'src/kernel/crypto.cpp', `${directory}/metadata.cpp`,
     '--no-entry', '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=node', '-sFILESYSTEM=0',
     '-sINITIAL_MEMORY=134217728', '-sALLOW_MEMORY_GROWTH=1', '-sEXPORTED_RUNTIME_METHODS=HEAPU8', '-o', `${directory}/boot.mjs`,
   ], { encoding: 'utf8', timeout: 120000, env: { ...process.env, TMPDIR: directory } });
@@ -116,8 +162,19 @@ const uint32_t X86ImageBase = 0x10000, X86ImageEnd = 0x13000, X86EntryPoint = 0x
     assert.equal(module._mount_disc(size), 0);
     assert.equal(find(), 0);
   }
+  const writeStreamVtables = (bytes) => {
+    const view = new DataView(bytes.buffer);
+    for (const [slot, target] of streamVtable.entries()) {
+      view.setUint32(0x7c0 + slot * 4, target, true);
+      view.setUint32(0x800 + slot * 4, target, true);
+    }
+    return bytes;
+  };
   const prepare = (entry = 0x11000) => {
-    const bytes = inventedImage();
+    const bytes = new Uint8Array(0x900);
+    bytes.set(inventedImage());
+    writeStreamVtables(bytes);
+    new DataView(bytes.buffer).setUint32(0x288, 0x300, true);
     const address = module._image_allocate(bytes.length);
     module.HEAPU8.set(bytes, address);
     return module._image_prepare(0x10000, 0x13000, entry);
@@ -159,10 +216,11 @@ const uint32_t X86ImageBase = 0x10000, X86ImageEnd = 0x13000, X86EntryPoint = 0x
     assert.equal(module._image_entry_mapped(), 0);
     assert.equal(module._image_fault_ordinal(), 0);
   }
-  const supported = new Uint8Array(0x800);
+  const supported = new Uint8Array(0x900);
   supported.set(inventedImage());
+  writeStreamVtables(supported);
   const imports = new DataView(supported.buffer);
-  imports.setUint32(0x288, 0x200, true);
+  imports.setUint32(0x288, 0x300, true);
   imports.setUint32(0x158, 0x120a0 ^ 0x5b6d40b6, true);
   imports.setUint32(0x60c, 0, true);
   for (const [n, ordinal] of [277, 291, 294, 161, 252, 253, 129, 15, 17, 23, 301, 24, 346, 340, 322, 324, 47, 107, 113, 184, 164, 165, 171, 178, 289, 279, 67, 190, 202, 211, 218, 236, 255, 187, 258, 149, 327, 328, 40, 219, 196, 128, 200, 203, 215, 326, 217, 156, 126, 323, 181, 41, 42, 335, 336, 337, 338, 339, 166, 226, 199, 2, 356, 0].entries()) {
@@ -223,6 +281,23 @@ const uint32_t X86ImageBase = 0x10000, X86ImageEnd = 0x13000, X86EntryPoint = 0x
     module._image_reset();
     assert.equal(module._image_audio_info(0), 0);
     assert.equal(module._image_graphics_checkpoint(), 0);
+  }
+  for (const [mode, expected] of [[1, 'bad_alloc'], [2, 'synthetic host logic failure']]) {
+    const address = module._image_allocate(supported.length);
+    module.HEAPU8.set(supported, address);
+    assert.equal(module._image_prepare(0x10000, 0x13000, 0x11000), 1);
+    assert.equal(module._image_bind(), 1);
+    module._fixture_failure_mode(mode);
+    assert.equal(module._image_execute(), 0);
+    const start = module._image_fault_message() >>> 0;
+    const length = module._image_fault_message_size();
+    const message = new TextDecoder().decode(module.HEAPU8.subarray(start, start + length));
+    assert.ok(message.includes(expected), message);
+    assert.equal(module._image_fault_ordinal(), 0);
+    assert.equal(module._image_entered(), 1);
+    assert.equal(module._image_returned(), 0);
+    assert.equal(module._image_active_workers(), 0);
+    module._image_reset();
   }
   assert.equal(prepare(), 1);
   assert.equal(module._image_allocate(0), 0);

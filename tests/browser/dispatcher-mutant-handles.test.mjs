@@ -16,7 +16,7 @@ for (const platform of ['native', 'wasm']) {
       : ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'];
     const build = spawnSync(platform === 'wasm' ? 'em++' : 'clang++', [
       '-std=c++20', '-O1', '-g', '-pthread', '-DX86_PORTABLE_RUNTIME', '-DX86_COMPACT_MEMORY', '-Isrc',
-      'tests/browser/dispatcher-mutant-handles.cpp', 'src/browser/dispatcher-handles.cpp', 'src/browser/dispatcher-wait-abi.cpp', 'src/browser/guest-wait.cpp', 'src/browser/dispatcher.cpp', 'src/browser/cpu_runtime.cpp', ...flags, '-o', output,
+      'tests/browser/dispatcher-mutant-handles.cpp', 'src/browser/dispatcher-handles.cpp', 'src/browser/dispatcher-wait-abi.cpp', 'src/browser/dispatcher-object-abi.cpp', 'src/browser/guest-wait.cpp', 'src/browser/dispatcher.cpp', 'src/browser/cpu_runtime.cpp', ...flags, '-o', output,
     ], { encoding: 'utf8', timeout: 120000 });
     assert.equal(build.status, 0, build.stderr);
     const execution = platform === 'wasm'

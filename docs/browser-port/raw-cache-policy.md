@@ -25,9 +25,13 @@ The observed synchronous alert open admits generic read, generic write and synch
 
 Data export 40, `HalDiskCachePartitionCount`, reports **one** cache partition. Cache table index zero maps to **Partition3**, separately from the ordinary temporary **Partition1** namespace. Neither raw device is an alias for Partition1 or the selected optical source.
 
-The virtual cache partition owns **16 MiB** of raw backing and has a **256 entry** namespace bound. Namespace allocation units are **16 KiB**. The formatter's geometry queries return a virtual geometry of 1,024 cylinders, one track per cylinder, 32 sectors per track and 512 bytes per sector, with fixed media type 12. The partition record reports offset zero, length 16 MiB, partition number three and no physical partition type, boot or recognized filesystem claim. These are coherent virtual bounds, not physical Xbox geometry.
+The virtual cache partition has a **64 MiB** byte extent and a **256 entry** namespace bound. Namespace allocation units are **16 KiB**. `CacheFatx::Capacity` is the capacity source; `RawCache::PartitionCapacity` aliases it, and device geometry and partition length derive from it. The formatter's geometry queries return a virtual geometry of 4,096 cylinders, one track per cylinder, 32 sectors per track and 512 bytes per sector, with fixed media type 12. The partition record reports offset zero, length 64 MiB, partition number three and no physical partition type, boot or recognized filesystem claim. These are coherent virtual bounds, not physical Xbox geometry.
 
-Before formatting, the exclusive Partition3 raw handle admits the observed read/write and synchronize access with synchronous alert mode and no intermediate buffering (`0x18`). Its implemented data operation is an explicit offset write: a nonempty sector aligned length at most **64 KiB**, a sector aligned offset and a complete range within 16 MiB. Unsupported raw reads fail explicitly. Successful writes retain the actual bytes in owned backing.
+This extends the existing approved disposable virtual cache policy, not an authentic disk claim or an authorization workaround. The prior 16 MiB cache could not contain an individually exercised source asset, independently of ISO authentication or drive-key policy. Partition1/profile storage retains its separate **16 MiB** quota and **256 entry** bound. The global production Wasm heap still starts at **64 MiB** and is capped at **256 MiB**; independent quotas do not promise that every volume and every other allocation can be filled simultaneously.
+
+Constructing the cache owner or installing a disc-only file provider allocates no raw partition bytes. The first valid exclusive raw open transactionally allocates exactly 64 MiB of zero-initialized backing before publishing the handle state. Allocation failure returns `STATUS_INSUFFICIENT_RESOURCES` with no open state or backing published; duplicate and post-mount opens are rejected without allocating. Closing an unmounted raw handle preserves its actual bytes for a later open. `RawBackingBytes()` reports the real owned vector size, including zero before first open and after namespace handoff.
+
+Before formatting, the exclusive Partition3 raw handle admits the observed read/write and synchronize access with synchronous alert mode and no intermediate buffering (`0x18`). Its implemented data operation is an explicit offset write: a nonempty sector aligned length at most **64 KiB**, a sector aligned offset and a complete range within 64 MiB. Unsupported raw reads fail explicitly. Successful writes retain the actual bytes in owned backing.
 
 ## Virtual device descriptors
 
@@ -42,13 +46,15 @@ Partition3 begins zero filled and unformatted. The genuine guest queries geometr
 The observed dismount control validates those real bytes before sealing raw transfers. The supported initial format has:
 
 * A 4 KiB header with FATX magic, 32 sectors per cluster, root cluster one and a zero field at header bytes 16 and 17.
-* A 4 KiB FAT16 allocation table beginning with `FFF8 FFFF`, with the remaining entries zero.
-* A 16 KiB root cluster filled with `FF` bytes.
-* 1,023 complete usable clusters after the header and FAT, with one cluster charged to the root. A fresh mounted namespace therefore reports **1,023 total and 1,022 free allocation units**.
+* A **12 KiB FAT16** allocation table at byte offset 4,096, beginning with `FFF8 FFFF`, with the remaining entries zero. The retained formatter computes `roundUp4096((partitionBytes / clusterBytes + 1) * 2)`: at 64 MiB the unrounded size is 8,194 bytes, not 8,192 bytes. The additional reserved entry therefore requires a third 4 KiB table block.
+* A 16 KiB root cluster at byte offset **16,384**, filled with `FF` bytes.
+* **4,095 complete usable clusters** after the header and FAT, with one cluster charged to the root. A fresh mounted namespace therefore reports **4,095 total and 4,094 free allocation units**, or **67,092,480 namespace bytes** including the root allocation. Namespace quota never borrows header or FAT space.
 
 Dismount is not treated as mount. Only after the raw handle closes may a namespace root open perform checked lazy mount of that validated empty format. Failed validation, premature root access and transfers through a sealed handle return errors without publishing a formatted namespace.
 
-The lifecycle is deliberately one way. After mounting, all raw reopen and transfer requests are refused for that runtime. Namespace operations retain real bytes and enforce allocation accounting in the owned temporary filesystem. The retained format bytes are not advertised as a live raw representation of later namespace changes. This explicit exclusion avoids stale raw views; it is not a general FATX implementation, remount facility or arbitrary disk image reader.
+The lifecycle is deliberately one way. After validating the guest format and constructing the owned namespace successfully, mount publishes that namespace and releases the 64 MiB raw backing while holding the lifecycle lock. Failed validation, incomplete dismount or namespace allocation failure preserves the raw bytes and publishes no namespace, so corrected formatting or mount can be retried. Repeated and concurrent mounts share the same namespace and do not recreate raw storage.
+
+After mounting, all raw reopen and transfer requests are refused for that runtime. Namespace operations retain real bytes and enforce allocation accounting in the owned temporary filesystem. Raw backing is not retained alongside the populated namespace and is not advertised as a live representation of later namespace changes. This explicit exclusion avoids duplicate 64 MiB storage and stale raw views; it is not a general FATX implementation, remount facility or arbitrary disk image reader.
 
 Partition1 and Partition3 remain separate volumes even for identical relative paths. Root relative handles and the guest created `Z:` alias resolve to Partition3's own mounted namespace, not to Partition1. Writes cannot reach the ISO or another session.
 
@@ -67,5 +73,7 @@ Secure implementation, native sanitizer and threaded Wasm contracts now pass. Th
 ## Validation requirements
 
 Meaningful native sanitizer and threaded Wasm contracts must cover exact transfer bounds, invalid output atomicity, rights, sharing, foreign sessions, cancellation, fresh state and isolation. The integrated target must authenticate its retained generated bodies and matching build artifacts before execution. Real ISO traces must identify the next actually exercised boundary and show complete worker and I/O teardown.
+
+Focused native ASan/UBSan and threaded Wasm contracts mirror the retained formatter's FAT16 sizing formula, reject obsolete smaller FAT placements, track raw allocation release and injected namespace allocation failure, and copy generated nonproprietary files above the former per-volume budget. The tests verify every copied byte, true sizes, exact quota exhaustion, unchanged data after overfull failure, and fresh-session isolation. These focused contracts do not themselves execute the retained guest formatter; authenticated integrated continuation must still validate that path with the rebuilt fingerprint.
 
 The current raw cache implementation is not acceptance of all M3 tasks, guest asset streaming, firmware reboot or graphics initialization.

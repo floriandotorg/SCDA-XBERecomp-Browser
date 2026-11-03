@@ -15,6 +15,7 @@ class FileProvider {
   RawCache rawCache_;
   std::mutex lock_;
   DiscReadSnapshot discReads_;
+  std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic_;
   struct DiscFile {
     std::shared_ptr<const kernel::DiscIndex> owner;
     const kernel::DiscIndex::Entry* entry;
@@ -37,6 +38,10 @@ class FileProvider {
     uint64_t position = 0;
     bool alertable = false;
     std::shared_ptr<DiscFile> disc;
+    std::vector<TemporaryFilesystem::DirectoryEntry> entries;
+    std::string pattern;
+    size_t nextEntry = 0;
+    bool listed = false;
   };
   std::map<uint32_t, File> files_;
   std::map<uint32_t, std::string> links_;
@@ -70,13 +75,14 @@ class FileProvider {
     return false;
   }
 
-  uint32_t ReadName(const X86Context& ctx, uint32_t address, std::string& path) {
+  uint32_t ReadName(const X86Context& ctx, uint32_t address, std::string& path, std::string* originalPath = nullptr) {
     std::array<uint32_t, 2> descriptor;
     image_.memory->Read(ctx, address, descriptor.data(), sizeof(descriptor));
     const uint32_t length = descriptor[0] & 0xffff, maximum = descriptor[0] >> 16;
     if (!length || length > maximum || length > 240 || !descriptor[1]) { return 0xc0000033; }
     path.resize(length);
     image_.memory->Read(ctx, descriptor[1], path.data(), length);
+    if (originalPath) { *originalPath = path; }
     for (char& value : path) {
       if (uint8_t(value) < 0x20 || uint8_t(value) >= 0x7f || value == '/') { return 0xc0000033; }
       if (value >= 'a' && value <= 'z') { value -= 'a' - 'A'; }
@@ -116,13 +122,19 @@ public:
   }
 
   FileProvider(Runtime& runtime, PreparedImage& image, std::shared_ptr<const kernel::DiscIndex> disc,
-      std::shared_ptr<TemporaryFilesystem> temporary)
+      std::shared_ptr<TemporaryFilesystem> temporary, std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic)
     : runtime_(runtime), image_(image), disc_(std::move(disc)),
-      temporary_(temporary ? std::move(temporary) : std::make_shared<TemporaryFilesystem>()) {}
+      temporary_(temporary ? std::move(temporary) : std::make_shared<TemporaryFilesystem>()),
+      fileOpenDiagnostic_(std::move(fileOpenDiagnostic)) {}
 
   DiscReadSnapshot DiscReads() {
     std::lock_guard lock(lock_);
     return discReads_;
+  }
+
+  bool Contains(uint32_t handle) {
+    std::lock_guard lock(lock_);
+    return links_.contains(handle) || files_.contains(handle);
   }
 
   bool Close(uint32_t handle) {
@@ -161,8 +173,8 @@ public:
     memory.CheckRange(ctx, statusOutput, 8);
     std::array<uint32_t, 3> object;
     memory.Read(ctx, attributes, object.data(), sizeof(object));
-    std::string path;
-    uint32_t status = ReadName(ctx, object[1], path);
+    std::string path, originalPath;
+    uint32_t status = ReadName(ctx, object[1], path, fileOpenDiagnostic_ ? &originalPath : nullptr);
     std::lock_guard lock(lock_);
     bool temporary = false;
     bool raw = false;
@@ -170,10 +182,12 @@ public:
     bool directory = false;
     bool createEntry = false;
     bool overwriteEntry = false;
-    const bool overwrite = create && disposition == 5 && options == 0x64 && access == 0x40100080;
+    const bool overwrite = create && disposition == 5 && (options == 0x60 || options == 0x64) && access == 0x40100080;
     const bool noReadCache = create && disposition == 1 && options == 0x6c && access == 0x80100080 && frame[6] == 0x80;
-    if (!status && create && (allocation || (frame[6] & ~0x94u) || disposition < 1 || (disposition > 3 && !overwrite))) { status = 0xc00000bb; }
-    if (!status && create && !overwrite && !noReadCache && !(options & 1) && options != 0x22 &&
+    const bool readMetadata = create && disposition == 3 && options == 0x60 && access == 0x80100080 && frame[6] == 4;
+    const bool writeOpenIf = create && disposition == 3 && options == 0x60 && access == 0x40100080 && frame[6] == 0x80;
+    if (!status && create && ((allocation && (options != 0x22 || (disposition != 2 && disposition != 3))) || (frame[6] & ~0x94u) || disposition < 1 || (disposition > 3 && !overwrite))) { status = 0xc00000bb; }
+    if (!status && create && !overwrite && !noReadCache && !readMetadata && !writeOpenIf && !(options & 1) && options != 0x22 &&
         (disposition != 1 || (options != 0x60 && options != 0x64) || !(access & 0x80000001u) || (access & ~0x80120089u))) { status = 0xc00000bb; }
     if (!status && create && !(options & 1) && (frame[6] & 0x10)) { status = 0xc000000d; }
     const uint32_t allowedOptions = (create ? 0x804067u : 0x804079u) | (noReadCache ? 8u : 0u);
@@ -206,9 +220,14 @@ public:
     }
     auto storage = cache ? rawCache_.Partition(RawCache::FirstPartition)->Filesystem() : temporary_;
     if (!status && !raw && (options & 0x18) && (!noReadCache || temporary)) { status = 0xc00000bb; }
+    if (!status && !raw && (options & 1) && path.size() > 1 && path.back() == '\\' && path[path.size() - 2] != '\\') {
+      path.pop_back();
+    }
     if (!status && !raw && !ValidPath(path)) { status = 0xc0000033; }
     if (!status && raw && (create || access != (cache ? 0x100003u : 0xc0100000u) ||
         options != (cache ? 0x18u : 0x10u) || (cache && share))) { status = 0xc00000bb; }
+    if (!status && allocation && (!temporary || raw || (options & 1))) { status = 0xc00000bb; }
+    if (!status && allocation >> 63) { status = 0xc000000d; }
     const uint32_t allowedAccess = temporary || raw ? 0xc012019fu : 0x80120089u;
     if (!status && (access & ~allowedAccess)) { status = 0xc0000022; }
     if (!status && create && !temporary && disposition != 1) { status = 0xc0000022; }
@@ -266,7 +285,7 @@ public:
     runtime_.Checkpoint(ctx);
     if (!status && raw && cache) { status = rawCache_.Partition(RawCache::FirstPartition)->OpenRaw(); }
     const uint32_t fileAttributes = overwrite && !frame[6] ? 0x80 : frame[6];
-    if (!status && createEntry) { status = directory ? storage->CreateDirectory(path) : storage->CreateFile(path, fileAttributes); }
+    if (!status && createEntry) { status = directory ? storage->CreateDirectory(path) : storage->CreateFile(path, fileAttributes, allocation); }
     if (!status && overwriteEntry) { status = storage->OverwriteFile(path, fileAttributes); }
     if (!status) {
       const uint32_t handle = nextHandle_;
@@ -281,6 +300,11 @@ public:
     memory.Write(ctx, statusOutput, result.data(), sizeof(result));
     ctx.eax = status;
     ctx.esp += frameSize;
+    if (fileOpenDiagnostic_) {
+      try {
+        fileOpenDiagnostic_({std::move(originalPath), path.substr(0, 240), status, object[0], disposition, options, access, create ? frame[6] : 0, allocation});
+      } catch (...) {}
+    }
   }
 
   void OpenLink(X86Context& ctx, uint8_t* base) {
@@ -518,6 +542,126 @@ public:
     return true;
   }
 
+  void QueryDirectory(X86Context& ctx, uint8_t* base) {
+    RequireOwner(ctx, base);
+    auto& memory = *image_.memory;
+    auto transition = memory.Mutate();
+    runtime_.Checkpoint(ctx);
+    std::array<uint32_t, 11> frame;
+    if (uint64_t(ctx.esp) + sizeof(frame) > UINT32_MAX) { throw Fault(ctx, ctx.esp, sizeof(frame), "directory frame overflow"); }
+    memory.Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+    const uint32_t statusOutput = frame[5], output = frame[6], length = frame[7];
+    const auto overlaps = [](uint32_t address, uint32_t size, uint32_t other, uint32_t otherSize) {
+      return size && otherSize && uint64_t(address) < uint64_t(other) + otherSize && uint64_t(other) < uint64_t(address) + size;
+    };
+    if (!statusOutput || (statusOutput & 3) || (!output && length) || (output & 3) ||
+        overlaps(statusOutput, 8, ctx.esp, sizeof(frame)) || overlaps(output, length, statusOutput, 8) ||
+        overlaps(output, length, ctx.esp, sizeof(frame))) { throw Fault(ctx, output, length, "invalid directory output spans"); }
+    memory.CheckRange(ctx, statusOutput, 8);
+    if (length) { memory.CheckRange(ctx, output, length); }
+    std::lock_guard lock(lock_);
+    const auto file = files_.find(frame[1]);
+    uint32_t status = 0, information = 0;
+    if (file == files_.end()) { status = 0xc0000008; }
+    else if (!file->second.directory) { status = 0xc0000024; }
+    else if (!file->second.reads) { status = 0xc0000022; }
+    else if (!file->second.synchronous || file->second.alertable || frame[2] || frame[3] || frame[4] || frame[8] != 1) { status = 0xc00000bb; }
+    else if (length > (1u << 20)) { status = 0xc000000d; }
+    else if (length < 64) { status = 0xc0000004; }
+    const bool first = !status && !file->second.listed;
+    const bool refresh = !status && (first || (frame[10] & 0xff));
+    std::string pattern = first ? "*" : !status ? file->second.pattern : "";
+    if (first && frame[9]) {
+      std::array<uint32_t, 2> descriptor;
+      if (overlaps(frame[9], 8, statusOutput, 8) || overlaps(frame[9], 8, output, length)) {
+        throw Fault(ctx, frame[9], 8, "directory pattern descriptor overlaps output");
+      }
+      memory.Read(ctx, frame[9], descriptor.data(), sizeof(descriptor));
+      const uint32_t patternLength = descriptor[0] & 0xffff;
+      if (overlaps(descriptor[1], patternLength, statusOutput, 8) || overlaps(descriptor[1], patternLength, output, length)) {
+        throw Fault(ctx, descriptor[1], patternLength, "directory pattern bytes overlap output");
+      }
+      status = ReadName(ctx, frame[9], pattern);
+      if (!status && (pattern == "." || pattern == ".." || pattern.find_first_of("\\/:\"<>") != std::string::npos)) { status = 0xc0000033; }
+    }
+    const auto matches = [&](const std::string& name) {
+      size_t n = 0, p = 0, star = std::string::npos, mark = 0;
+      while (n < name.size()) {
+        char value = name[n];
+        if (value >= 'a' && value <= 'z') { value -= 'a' - 'A'; }
+        if (p < pattern.size() && (pattern[p] == '?' || pattern[p] == value)) { ++p; ++n; }
+        else if (p < pattern.size() && pattern[p] == '*') { star = p; ++p; mark = n; }
+        else if (star != std::string::npos) { p = star + 1; n = ++mark; }
+        else { return false; }
+      }
+      while (p < pattern.size() && pattern[p] == '*') { ++p; }
+      return p == pattern.size();
+    };
+    std::vector<TemporaryFilesystem::DirectoryEntry> snapshot;
+    if (!status && refresh) {
+      if (file->second.temporary) {
+        const auto storage = Storage(file->second);
+        auto entries = storage ? storage->List(file->second.path) : std::nullopt;
+        if (!entries) { status = 0xc000003a; }
+        else { snapshot = std::move(*entries); }
+      } else {
+        const auto* parent = disc_ ? disc_->Find(file->second.path) : nullptr;
+        if (!parent || !parent->dir) { status = 0xc000003a; }
+        else if (parent->children.size() > 4096) { status = 0xc000009a; }
+        else {
+          snapshot.reserve(parent->children.size());
+          for (const auto& entry : parent->children) {
+            const auto time = disc_->Time();
+            snapshot.push_back({entry.name, {entry.dir, entry.dir ? 0 : entry.size, entry.dir ? 0x10u : 0x80u,
+              time, time, time, time}});
+          }
+        }
+      }
+      if (!status) {
+        std::erase_if(snapshot, [&](const auto& entry) { return !matches(entry.name); });
+        std::sort(snapshot.begin(), snapshot.end(), [](const auto& left, const auto& right) { return left.name < right.name; });
+      }
+    }
+    std::vector<uint8_t> result;
+    bool advance = false;
+    if (!status) {
+      const auto& entries = refresh ? snapshot : file->second.entries;
+      const auto next = refresh ? 0 : file->second.nextEntry;
+      if (next >= entries.size()) { status = first ? 0xc000000f : 0x80000006; }
+      else {
+        const auto& entry = entries[next];
+        const auto& metadata = entry.metadata;
+        const uint32_t needed = 64 + uint32_t(entry.name.size());
+        if (length >= needed || first) {
+          information = std::min(length, needed);
+          result.resize(information);
+          const auto put = [&](size_t at, const auto& value) { std::memcpy(result.data() + at, &value, sizeof(value)); };
+          const uint32_t unit = file->second.temporary ? TemporaryFilesystem::AllocationUnit : 4096;
+          const uint64_t allocation = metadata.directory ? (file->second.temporary ? unit : 0) :
+            (file->second.temporary ? metadata.allocationSize : ((metadata.size + unit - 1) / unit) * unit);
+          put(8, metadata.creationTime); put(16, metadata.lastAccessTime); put(24, metadata.lastWriteTime); put(32, metadata.changeTime);
+          put(40, metadata.size); put(48, allocation); put(56, metadata.attributes); put(60, uint32_t(entry.name.size()));
+          std::memcpy(result.data() + 64, entry.name.data(), information - 64);
+          if (length < needed) { status = 0x80000005; }
+          else { advance = true; }
+        }
+      }
+    }
+    runtime_.Checkpoint(ctx);
+    if (information) { memory.Write(ctx, output, result.data(), information); }
+    const std::array<uint32_t, 2> ioStatus = {status, information};
+    memory.Write(ctx, statusOutput, ioStatus.data(), sizeof(ioStatus));
+    if (refresh && (status == 0 || status == 0x80000005 || status == 0xc000000f || status == 0x80000006)) {
+      file->second.entries = std::move(snapshot);
+      file->second.pattern = std::move(pattern);
+      file->second.nextEntry = 0;
+      file->second.listed = true;
+    }
+    if (advance) { ++file->second.nextEntry; }
+    ctx.eax = status;
+    ctx.esp += sizeof(frame);
+  }
+
   void Transfer(X86Context& ctx, uint8_t* base, bool read = false) {
     if (read && DiscTransfer(ctx, base)) { return; }
     RequireOwner(ctx, base);
@@ -651,87 +795,121 @@ public:
   void Query(X86Context& ctx, uint8_t* base, bool volume) {
     RequireOwner(ctx, base);
     auto& memory = *image_.memory;
-    auto transition = memory.Mutate();
-    runtime_.Checkpoint(ctx);
-    std::array<uint32_t, 6> frame;
-    if (uint64_t(ctx.esp) + sizeof(frame) > UINT32_MAX) { throw Fault(ctx, ctx.esp, sizeof(frame), "volume query frame overflow"); }
-    memory.Read(ctx, ctx.esp, frame.data(), sizeof(frame));
-    const uint32_t handle = frame[1], statusOutput = frame[2], output = frame[3], length = frame[4], information = frame[5];
+    std::array<uint32_t, 6> frame{};
+    std::shared_ptr<DiscFile> selected;
     const auto overlaps = [](uint32_t first, uint32_t size, uint32_t second, uint32_t count) {
       return uint64_t(first) < uint64_t(second) + count && uint64_t(second) < uint64_t(first) + size;
     };
-    if (!output || !statusOutput || (output & 3) || (statusOutput & 3) ||
-        overlaps(output, length, statusOutput, 8) || overlaps(output, length, ctx.esp, sizeof(frame)) ||
-        overlaps(statusOutput, 8, ctx.esp, sizeof(frame))) {
-      throw Fault(ctx, output, length, "invalid volume query output spans");
-    }
-    memory.CheckRange(ctx, output, length);
-    memory.CheckRange(ctx, statusOutput, 8);
-    std::lock_guard lock(lock_);
-    uint32_t status = 0;
-    const auto file = files_.find(handle);
-    if (file == files_.end()) { status = 0xc0000008; }
-    else if (file->second.raw || (volume && !file->second.temporary) || information != (volume ? 3u : 34u)) { status = 0xc00000bb; }
-    const uint32_t outputSize = volume ? 24 : 56;
-    if (!status && length < outputSize) { status = 0xc0000004; }
-    std::array<uint32_t, 14> outputBytes{};
-    if (!status && volume) {
-      const auto usage = Storage(file->second)->Usage();
-      outputBytes[0] = uint32_t(usage.capacity / TemporaryFilesystem::AllocationUnit);
-      outputBytes[2] = uint32_t((usage.capacity - usage.allocated) / TemporaryFilesystem::AllocationUnit);
-      outputBytes[4] = TemporaryFilesystem::AllocationUnit / 512;
-      outputBytes[5] = 512;
-    }
-    if (!status && !volume && !file->second.temporary) {
-      const auto& source = file->second.disc;
-      if (!source || !source->entry) { throw Fault(ctx, handle, 0, "disc metadata lost its owned source"); }
-      const uint64_t size = source->entry->dir ? 0 : source->entry->size;
-      const uint64_t allocation = ((size + 4095) / 4096) * 4096;
-      outputBytes[8] = uint32_t(allocation);
-      outputBytes[9] = uint32_t(allocation >> 32);
-      outputBytes[10] = uint32_t(size);
-      outputBytes[11] = uint32_t(size >> 32);
-      outputBytes[12] = source->entry->dir ? 0x11 : 1;
-    }
-    if (!status && !volume && file->second.temporary) {
-      const auto metadata = Storage(file->second)->Stat(file->second.path);
-      if (!metadata) { status = 0xc0000034; }
-      else {
-        const auto put = [&](uint32_t index, uint64_t value) { outputBytes[index] = uint32_t(value); outputBytes[index + 1] = uint32_t(value >> 32); };
-        put(0, metadata->creationTime);
-        put(2, metadata->lastAccessTime);
-        put(4, metadata->lastWriteTime);
-        put(6, metadata->changeTime);
-        put(8, metadata->directory ? TemporaryFilesystem::AllocationUnit : ((metadata->size + TemporaryFilesystem::AllocationUnit - 1) / TemporaryFilesystem::AllocationUnit) * TemporaryFilesystem::AllocationUnit);
-        put(10, metadata->size);
-        outputBytes[12] = metadata->attributes;
+    const auto validate = [&] {
+      const uint32_t statusOutput = frame[2], output = frame[3], length = frame[4];
+      if (!output || !statusOutput || (output & 3) || (statusOutput & 3) ||
+          overlaps(output, length, statusOutput, 8) || overlaps(output, length, ctx.esp, sizeof(frame)) ||
+          overlaps(statusOutput, 8, ctx.esp, sizeof(frame))) {
+        throw Fault(ctx, output, length, "invalid volume query output spans");
+      }
+      memory.CheckRange(ctx, output, length);
+      memory.CheckRange(ctx, statusOutput, 8);
+    };
+    const auto publish = [&](uint32_t status, const void* bytes, uint32_t size) {
+      if (!status) { memory.Write(ctx, frame[3], bytes, size); }
+      const std::array<uint32_t, 2> result = {status, status ? 0u : size};
+      memory.Write(ctx, frame[2], result.data(), sizeof(result));
+      ctx.eax = status;
+      ctx.esp += sizeof(frame);
+    };
+    {
+      auto transition = memory.Mutate();
+      runtime_.Checkpoint(ctx);
+      if (uint64_t(ctx.esp) + sizeof(frame) > UINT32_MAX) { throw Fault(ctx, ctx.esp, sizeof(frame), "volume query frame overflow"); }
+      memory.Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+      validate();
+      const uint32_t handle = frame[1], length = frame[4], information = frame[5];
+      const bool position = !volume && information == 14;
+      std::lock_guard lock(lock_);
+      uint32_t status = 0;
+      const auto file = files_.find(handle);
+      if (file == files_.end()) { status = 0xc0000008; }
+      else if (file->second.raw || (position && file->second.directory) || (volume && !file->second.temporary) ||
+          (!position && information != (volume ? 3u : 34u))) { status = 0xc00000bb; }
+      const uint32_t outputSize = position ? 8 : volume ? 24 : 56;
+      if (!status && length < outputSize) { status = 0xc0000004; }
+      if (!status && position && !file->second.temporary) {
+        selected = file->second.disc;
+        if (!selected || !selected->entry) { throw Fault(ctx, handle, 0, "disc position lost its owned source"); }
+      } else {
+        std::array<uint32_t, 14> outputBytes{};
+        if (!status && position) {
+          outputBytes[0] = uint32_t(file->second.position);
+          outputBytes[1] = uint32_t(file->second.position >> 32);
+        }
+        if (!status && volume) {
+          const auto usage = Storage(file->second)->Usage();
+          outputBytes[0] = uint32_t(usage.capacity / TemporaryFilesystem::AllocationUnit);
+          outputBytes[2] = uint32_t((usage.capacity - usage.allocated) / TemporaryFilesystem::AllocationUnit);
+          outputBytes[4] = TemporaryFilesystem::AllocationUnit / 512;
+          outputBytes[5] = 512;
+        }
+        if (!status && !volume && !position && !file->second.temporary) {
+          const auto& source = file->second.disc;
+          if (!source || !source->entry) { throw Fault(ctx, handle, 0, "disc metadata lost its owned source"); }
+          const uint64_t size = source->entry->dir ? 0 : source->entry->size;
+          const uint64_t allocation = ((size + 4095) / 4096) * 4096;
+          outputBytes[8] = uint32_t(allocation);
+          outputBytes[9] = uint32_t(allocation >> 32);
+          outputBytes[10] = uint32_t(size);
+          outputBytes[11] = uint32_t(size >> 32);
+          outputBytes[12] = source->entry->dir ? 0x11 : 1;
+        }
+        if (!status && !volume && !position && file->second.temporary) {
+          const auto metadata = Storage(file->second)->Stat(file->second.path);
+          if (!metadata) { status = 0xc0000034; }
+          else {
+            const auto put = [&](uint32_t index, uint64_t value) { outputBytes[index] = uint32_t(value); outputBytes[index + 1] = uint32_t(value >> 32); };
+            put(0, metadata->creationTime);
+            put(2, metadata->lastAccessTime);
+            put(4, metadata->lastWriteTime);
+            put(6, metadata->changeTime);
+            put(8, metadata->directory ? TemporaryFilesystem::AllocationUnit : metadata->allocationSize);
+            put(10, metadata->size);
+            outputBytes[12] = metadata->attributes;
+          }
+        }
+        runtime_.Checkpoint(ctx);
+        publish(status, outputBytes.data(), outputSize);
+        return;
       }
     }
+    std::unique_lock serial(selected->io);
+    auto transition = memory.Mutate();
+    RequireOwner(ctx, base);
     runtime_.Checkpoint(ctx);
-    if (!status) { memory.Write(ctx, output, outputBytes.data(), outputSize); }
-    const std::array<uint32_t, 2> result = {status, status ? 0u : outputSize};
-    memory.Write(ctx, statusOutput, result.data(), sizeof(result));
-    ctx.eax = status;
-    ctx.esp += sizeof(frame);
+    validate();
+    std::lock_guard lock(lock_);
+    const auto file = files_.find(frame[1]);
+    const uint32_t status = file == files_.end() || file->second.disc != selected ? 0xc0000008 : 0;
+    runtime_.Checkpoint(ctx);
+    publish(status, &selected->position, sizeof(selected->position));
   }
 };
 }
 
 std::function<bool(uint32_t)> InstallFileProvider(Runtime& runtime, PreparedImage& image,
     std::shared_ptr<const kernel::DiscIndex> disc, std::shared_ptr<TemporaryFilesystem> temporary, std::vector<KernelDataExport>* dataExports,
-    std::function<DiscReadSnapshot()>* discReads) {
+    std::function<DiscReadSnapshot()>* discReads, std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic,
+    std::function<bool(uint32_t)>* ownsHandle) {
   runtime.Checkpoint({});
   if (!image.memory || image.importsBound || runtime.ActiveWorkers() || !image.diagnosticImports.empty() || image.boundRuntime || image.diagnosticRuntime || runtime.KernelTarget(202) ||
       (dataExports && std::any_of(dataExports->begin(), dataExports->end(), [](const auto& entry) { return entry.ordinal == 40 || entry.ordinal == 326; }))) {
     throw Fault({}, 202, 0, "file provider requires an unpublished stopped image");
   }
-  auto provider = std::make_shared<FileProvider>(runtime, image, std::move(disc), std::move(temporary));
+  auto provider = std::make_shared<FileProvider>(runtime, image, std::move(disc), std::move(temporary), std::move(fileOpenDiagnostic));
   if (dataExports) { provider->InstallData(*dataExports); }
   runtime.RegisterKernel(67, [provider](X86Context& ctx, uint8_t* base) { provider->CreateAlias(ctx, base); });
   runtime.RegisterKernel(190, [provider](X86Context& ctx, uint8_t* base) { provider->Open(ctx, base, true); });
   runtime.RegisterKernel(196, [provider](X86Context& ctx, uint8_t* base) { provider->DeviceControl(ctx, base); });
   runtime.RegisterKernel(200, [provider](X86Context& ctx, uint8_t* base) { provider->DeviceControl(ctx, base, true); });
   runtime.RegisterKernel(202, [provider](X86Context& ctx, uint8_t* base) { provider->Open(ctx, base); });
+  runtime.RegisterKernel(207, [provider](X86Context& ctx, uint8_t* base) { provider->QueryDirectory(ctx, base); });
   runtime.RegisterKernel(219, [provider](X86Context& ctx, uint8_t* base) { provider->Transfer(ctx, base, true); });
   runtime.RegisterKernel(236, [provider](X86Context& ctx, uint8_t* base) { provider->Transfer(ctx, base); });
   runtime.RegisterKernel(203, [provider](X86Context& ctx, uint8_t* base) { provider->OpenLink(ctx, base); });
@@ -740,6 +918,7 @@ std::function<bool(uint32_t)> InstallFileProvider(Runtime& runtime, PreparedImag
   runtime.RegisterKernel(218, [provider](X86Context& ctx, uint8_t* base) { provider->Query(ctx, base, true); });
   runtime.RegisterKernel(226, [provider](X86Context& ctx, uint8_t* base) { provider->SetInformation(ctx, base); });
   if (discReads) { *discReads = [provider] { return provider->DiscReads(); }; }
+  if (ownsHandle) { *ownsHandle = [provider](uint32_t handle) { return provider->Contains(handle); }; }
   return [provider](uint32_t handle) { return provider->Close(handle); };
 }
 

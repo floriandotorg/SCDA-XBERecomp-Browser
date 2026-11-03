@@ -11,6 +11,16 @@ mkdirSync(directory, { recursive: true });
 writeFileSync(`${directory}/image_symbols.h`, '#pragma once\n#define SYM_XNetStartup 00F11000\n#define SYM_WSAStartup 00F12000\n#define SYM_Direct3D_CreateDevice 00F13000\n');
 writeFileSync(`${directory}/sdk-fixture.h`, `#pragma once
 #include "cpu/x86_ops.h"
+#define SDK_FIXTURE_BEGIN_ADDRESS 0x000534B8
+#define SDK_FIXTURE_END_ADDRESS 0x0005351A
+#define SDK_FIXTURE_BEGIN sub_000534B8
+#define SDK_FIXTURE_END sub_0005351A
+#define SDK_FIXTURE_BEGIN_ORIGINAL __imp__sub_000534B8
+#define SDK_FIXTURE_END_ORIGINAL __imp__sub_0005351A
+X86_FUNC(SDK_FIXTURE_BEGIN);
+X86_FUNC(SDK_FIXTURE_END);
+X86_FUNC(SDK_FIXTURE_BEGIN_ORIGINAL);
+X86_FUNC(SDK_FIXTURE_END_ORIGINAL);
 #define SDK_FIXTURE_D3D_ADDRESS 0x00F13000
 #define SDK_FIXTURE_D3D sub_00F13000
 #define SDK_FIXTURE_D3D_ORIGINAL __imp__sub_00F13000
@@ -32,6 +42,10 @@ void SdkFixtureOriginal(X86Context&, uint8_t*, uint32_t);
 X86_FUNC(__imp__sub_00F11000) { SdkFixtureOriginal(ctx, base, 1); }
 X86_FUNC(__imp__sub_00F12000) { SdkFixtureOriginal(ctx, base, 2); }
 X86_FUNC(__imp__sub_00F13000) { SdkFixtureOriginal(ctx, base, 3); }
+X86_FUNC(__imp__sub_000534B8) { SdkFixtureOriginal(ctx, base, 69); }
+X86_FUNC(__imp__sub_0005351A) { SdkFixtureOriginal(ctx, base, 71); }
+X86_WEAK_FUNC(sub_000534B8, __imp__sub_000534B8)
+X86_WEAK_FUNC(sub_0005351A, __imp__sub_0005351A)
 X86_WEAK_FUNC(sub_00F13000, __imp__sub_00F13000)
 X86_WEAK_FUNC(sub_00F11000, __imp__sub_00F11000)
 X86_WEAK_FUNC(sub_00F12000, __imp__sub_00F12000)
@@ -71,6 +85,7 @@ const sessionFixture = () => {
     _image_fault_message_size: () => 0, _image_register: () => 0, _image_progress_address: () => 4,
     _image_entry_mapped: () => 1, _image_active_workers: () => 0, _image_backing: () => 4096, _image_reset: () => {},
     _image_disc_reads_words: () => 8, _image_disc_reads_word: () => 0,
+    _image_sdk_trace_count: () => 0, _image_sdk_trace_word: () => 0,
     _image_audio_info: field => [48000, 6, 48000, 0, 0, 0, 0, 0, 0, 0][field],
     _image_graphics_checkpoint: () => 0,
     _image_graphics_info: () => 0, _image_graphics_event_word: () => 0, _image_graphics_resource_word: () => 0,
@@ -101,6 +116,54 @@ test('actual boot session result carries distinct bounded SDK entries without ch
   ]);
 });
 
+test('graphics protocol errors preserve guest outcome and independently bounded file diagnostics', async () => {
+  const { options, data, module, messages } = sessionFixture();
+  module._image_graphics_info = (field) => [0, 0, 0, 0, 0, 16385][field];
+  module._image_file_open_count = () => 1;
+  module._image_file_open_word = (_, field) => [0xc0000033, 0, 1, 0, 0, 0, 0, 0][field];
+  module._image_file_open_path = (_, field) => field === 0 ? 384 : 448;
+  const heap = new Uint8Array(new SharedArrayBuffer(512));
+  heap.set(module.HEAPU8);
+  module.HEAPU8 = heap;
+  heap.set(new TextEncoder().encode('movies\\\\intro.bik'), 384);
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'GRAPHICS_PROTOCOL');
+  assert.match(messages[0].message, /commandWords=16385/);
+  assert.equal(messages[0].underlyingGuestCode, 'UNSUPPORTED_EXPORT');
+  assert.equal(messages[0].underlyingGuestMessage, '');
+  assert.equal(messages[0].graphics, undefined);
+  assert.equal(messages[0].entryReturned, true);
+  assert.deepEqual(messages[0].kernelCalls, []);
+  assert.deepEqual(messages[0].fileOpens, [{ status: 0xc0000033, root: 0, disposition: 1, options: 0,
+    access: 0, attributes: 0, allocationBytes: '0', originalPath: 'movies\\\\intro.bik', resolvedPath: '' }]);
+});
+
+test('graphics protocol errors expose malformed secondary file diagnostics instead of inventing an empty trace', async () => {
+  const { options, data, module, messages } = sessionFixture();
+  module._image_graphics_info = (field) => [0, 0, 0, 0, 0, 16385][field];
+  module._image_file_open_count = () => 33;
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'GRAPHICS_PROTOCOL');
+  assert.equal(messages[0].underlyingGuestCode, 'UNSUPPORTED_EXPORT');
+  assert.equal(messages[0].fileOpens, undefined);
+  assert.equal(messages[0].fileOpensError.code, 'GRAPHICS_PROTOCOL');
+  assert.match(messages[0].fileOpensError.message, /malformed/);
+});
+
+test('retirement during secondary file diagnostics suppresses preserved guest evidence', async () => {
+  const { options, data, module, messages } = sessionFixture();
+  module._image_graphics_info = (field) => [0, 0, 0, 0, 0, 16385][field];
+  module._image_file_open_count = () => {
+    Atomics.store(data.ownership, 0, 2);
+    return 0;
+  };
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'CANCELLED');
+  assert.equal(messages[0].underlyingGuestCode, undefined);
+  assert.equal(messages[0].fileOpens, undefined);
+  assert.equal(messages[0].registers, undefined);
+});
+
 test('device trace preserves raw presentation and six scalar arguments', async () => {
   const { options, data, module, messages } = sessionFixture();
   const words = [1, 0, 1, 0, 3, 1, 2, 3, 4, 6, 0, 13, 0, 1, 2, 3, 4, 5,
@@ -123,6 +186,42 @@ test('diagnostic CPU device admission remains distinct from original physical in
   assert.equal(messages[0].sdkCalls[0].behavior, 'Diagnostic');
   assert.equal(messages[0].sdkCalls[0].presentation.width, 640);
   assert.equal(messages[0].ordinal, 44);
+});
+
+test('signature decoder names only bounded observed entry and return metadata', async () => {
+  const { options, data, module, messages } = sessionFixture();
+  const records = [
+    [69, 0x3f724, [1]], [70, 0x3f724, [1, 0x30000]],
+    [71, 0x3f79a, [0x30000]], [72, 0x3f79a, [0x30000, 0x80090006]],
+  ].map(([id, caller, args], index) => [index + 1, 0, 1, 0, id, 2, 3, 0x20100, caller, args.length, 0, 0,
+    ...args, ...Array(19 - args.length).fill(0)]);
+  module._image_sdk_trace_count = () => records.length;
+  module._image_sdk_trace_word = (index, field) => records[index][field];
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'UNSUPPORTED_EXPORT');
+  assert.deepEqual(messages[0].sdkCalls.map(({ name, phase, arguments: args, returnAddress }) => ({ name, phase, args, returnAddress })), [
+    { name: 'XCalculateSignatureBegin', phase: 'entry', args: [1], returnAddress: 0x3f724 },
+    { name: 'XCalculateSignatureBegin', phase: 'return', args: [1, 0x30000], returnAddress: 0x3f724 },
+    { name: 'XCalculateSignatureEnd', phase: 'entry', args: [0x30000], returnAddress: 0x3f79a },
+    { name: 'XCalculateSignatureEnd', phase: 'return', args: [0x30000, 0x80090006], returnAddress: 0x3f79a },
+  ]);
+});
+
+test('signature decoder rejects extra fields, replacement behavior and wrong counts', async () => {
+  for (const id of [69, 70, 71, 72]) {
+    for (const mutate of [words => { words[10] = 1; }, words => { words[10] = 2; },
+      words => { ++words[9]; }, words => { words[11] = 13; }, words => { words[18] = 1; },
+      words => { words[14] = 0xdeadbeef; }]) {
+      const { options, data, module, messages } = sessionFixture();
+      const words = [1, 0, 1, 0, id, 2, 3, 4, 5, id % 2 ? 1 : 2, 0, 0, ...Array(19).fill(0)];
+      mutate(words);
+      module._image_sdk_trace_count = () => 1;
+      module._image_sdk_trace_word = (index, field) => words[field];
+      await createBootSession(options)({ data });
+      assert.equal(messages[0].code, 'SDK_TRACE');
+      assert.equal(messages[0].sdkCalls, undefined);
+    }
+  }
 });
 
 test('SDK diagnostic decoding rejects unbounded malformed or unidentified entries', async () => {

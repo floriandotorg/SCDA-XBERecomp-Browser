@@ -217,7 +217,7 @@ const auto contracts = [] {
       "retirement race publishes exact completion only on success");
     memory.Commit(0x11000, 0x1000);
   }
-  std::array<uint32_t, 126> capacity{};
+  std::array<uint32_t, browser::kDispatcherCapacity - 2> capacity{};
   for (auto& handle : capacity) { handle = handles.Duplicate(alias); }
   writeWord(memory, ctx, output, sentinel);
   reject(194, {output, 0, 1});

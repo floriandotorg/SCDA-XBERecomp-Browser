@@ -74,7 +74,9 @@ std::unique_ptr<PreparedImage> PrepareImage(std::vector<uint8_t> authenticatedBy
 void DeclareDiagnosticImport(PreparedImage& prepared, Runtime& runtime, uint32_t ordinal, bool data) {
   runtime.Checkpoint({});
   if (!prepared.memory || prepared.importsBound || runtime.ActiveWorkers() || !ordinal || ordinal >= 400 ||
-      (prepared.diagnosticRuntime && prepared.diagnosticRuntime != &runtime)) {
+      (prepared.diagnosticRuntime && prepared.diagnosticRuntime != &runtime) ||
+      (prepared.threadProviderRuntime && prepared.threadProviderRuntime != &runtime) ||
+      (prepared.synchronizationProviderRuntime && prepared.synchronizationProviderRuntime != &runtime)) {
     throw Fault({}, ordinal, 0, "diagnostic imports require an unpublished stopped image");
   }
   const auto imported = std::find_if(prepared.imports.begin(), prepared.imports.end(),
@@ -116,6 +118,12 @@ std::vector<BoundImport> InspectImageImports(PreparedImage& prepared, Runtime& r
   runtime.Checkpoint({});
   if (prepared.diagnosticRuntime && prepared.diagnosticRuntime != &runtime) {
     throw Fault({}, 0, 0, "diagnostic imports belong to a different runtime");
+  }
+  if (prepared.threadProviderRuntime && prepared.threadProviderRuntime != &runtime) {
+    throw Fault({}, 259, 0, "thread provider belongs to a different runtime");
+  }
+  if (prepared.synchronizationProviderRuntime && prepared.synchronizationProviderRuntime != &runtime) {
+    throw Fault({}, 192, 0, "synchronization provider belongs to a different runtime");
   }
   if (runtime.ActiveWorkers() || prepared.importsBound || !prepared.memory || dataExports.size() > 399) {
     throw std::runtime_error("image imports require an unpublished stopped runtime");
@@ -184,6 +192,10 @@ void BindImageImports(PreparedImage& prepared, Runtime& runtime, std::span<const
   });
 }
 
+ImageThreadRetirement::~ImageThreadRetirement() {
+  if (image.threadRetirement) { image.threadRetirement(context.fs_base); }
+}
+
 void ExecuteImageEntry(PreparedImage& prepared, Runtime& runtime, ImageExecution& execution) {
   if (execution.entered || !prepared.threads.empty()) { throw Fault({}, 0, 0, "initial image thread already prepared"); }
   if (!prepared.tlsCallbacks.empty()) {
@@ -192,10 +204,12 @@ void ExecuteImageEntry(PreparedImage& prepared, Runtime& runtime, ImageExecution
   if (!runtime.Find(prepared.image.entry)) { throw Fault({}, prepared.image.entry, 0, "generated entry body is absent"); }
   const auto thread = PrepareImageThread(prepared, runtime, 0x10, prepared.image.stack_commit);
   runtime.Launch(thread.context, prepared.memory->Base(), [&](X86Context& context, uint8_t* base) {
+    ImageThreadRetirement retirement{prepared, context};
     execution.entered = true;
     try {
-      runtime.Call(context, base, prepared.image.entry, {0});
+      const uint32_t status = runtime.Call(context, base, prepared.image.entry, {0});
       runtime.Checkpoint(context);
+      CompleteImageThread(prepared, runtime, context, status);
       execution.returned = true;
       execution.context = context;
     } catch (...) {
@@ -221,10 +235,25 @@ uint32_t ImageExecutionThreadId(const PreparedImage& prepared, const ImageExecut
   return 0;
 }
 
+void CompleteImageThread(PreparedImage& prepared, Runtime& runtime, const X86Context& context, uint32_t status) {
+  if (!runtime.OwnsCurrentContext(context) || !prepared.importsBound || prepared.boundRuntime != &runtime) {
+    throw Fault(context, context.fs_base, 0, "thread completion requires its owned image worker");
+  }
+  std::lock_guard lock(prepared.threadLock);
+  const auto thread = std::find_if(prepared.threads.begin(), prepared.threads.end(),
+    [&](const auto& entry) { return entry.kpcr == context.fs_base; });
+  if (thread == prepared.threads.end()) { throw Fault(context, context.fs_base, 0, "thread completion storage is absent"); }
+  auto lease = prepared.memory->Borrow();
+  prepared.memory->CheckRange(context, thread->ethread, 0x124);
+  const uint32_t signal = 1;
+  prepared.memory->Write(context, thread->ethread + 0x120, &status, 4);
+  prepared.memory->Write(context, thread->ethread + 4, &signal, 4);
+}
+
 static ImageThread prepareImageThread(PreparedImage& prepared, Runtime& runtime, uint32_t id, uint32_t stackSize) {
   runtime.Checkpoint({});
   if (!prepared.memory || !prepared.importsBound || prepared.boundRuntime != &runtime ||
-      prepared.threads.size() >= 2 || !id || id % 4 || stackSize > (16u << 20)) {
+      prepared.threads.size() >= kImageThreadCapacity || !id || id % 4 || stackSize > kImageThreadStackBudget) {
     throw Fault({}, id, stackSize, "thread preparation requires its bound image and bounded storage");
   }
   for (const auto& thread : prepared.threads) {
@@ -247,15 +276,18 @@ static ImageThread prepareImageThread(PreparedImage& prepared, Runtime& runtime,
       throw Fault({}, indexAddress, 4, "thread TLS index was modified");
     }
   }
-  prepared.threads.reserve(2);
-  const uint32_t region = 0xd0000000 + uint32_t(prepared.threads.size()) * 0x02000000;
+  prepared.threads.reserve(kImageThreadCapacity);
+  const uint32_t region = prepared.threads.empty() ? kImageThreadRegionBase : prepared.threads.back().stackTop + 4096;
   const uint32_t stackSpan = (std::max(stackSize, 0x10000u) + tlsSize + 4095) & ~4095u;
-  const uint32_t regionSize = 0x3000 + stackSpan;
+  const uint32_t regionSize = kImageThreadSlotFloor + stackSpan;
+  if (uint64_t(region) + regionSize > kImageThreadRegionCeiling) {
+    throw Fault({}, region, regionSize, "image thread address capacity exhausted");
+  }
   ImageThread thread{};
   thread.id = id;
   thread.kpcr = region + 0x1000;
   thread.ethread = thread.kpcr + 0x400;
-  thread.stackLimit = region + 0x3000;
+  thread.stackLimit = region + kImageThreadSlotFloor;
   thread.stackTop = thread.stackLimit + stackSpan;
   thread.tls = thread.stackTop - tlsSize;
   thread.tlsData = hasTls ? thread.tls + 4 : 0;
@@ -287,6 +319,7 @@ static ImageThread prepareImageThread(PreparedImage& prepared, Runtime& runtime,
     write(thread.kpcr + 0x20, thread.kpcr + 0x28);
     write(thread.kpcr + 0x28, thread.ethread);
     write(thread.ethread, 0x00800006);
+    write(thread.ethread + 0x120, 0x103);
     write(thread.ethread + 0x1c, thread.stackTop);
     write(thread.ethread + 0x20, thread.stackLimit);
     write(thread.ethread + 0x28, thread.tls);

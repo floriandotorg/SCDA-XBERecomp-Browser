@@ -23,9 +23,9 @@ struct Session {
     image.memory->Ensure(0xfffff000, 4096);
     browser::InstallStringProvider(runtime, image);
     image.image.kernel_thunk = 0x10000;
-    const std::array<uint32_t, 3> imports = {0x80000121, 0x80000117, 0};
+    const std::array<uint32_t, 4> imports = {0x80000121, 0x80000117, 0x8000013c, 0};
     image.memory->Write({}, 0x10000, imports.data(), sizeof(imports));
-    image.imports = {{0x10000, 289}, {0x10004, 279}};
+    image.imports = {{0x10000, 289}, {0x10004, 279}, {0x10008, 316}};
     browser::BindImageImports(image, runtime, {});
   }
 
@@ -230,12 +230,101 @@ struct EqualSession : Session {
   }
 };
 
+void UpperContracts() {
+  Session session;
+  auto& runtime = session.runtime;
+  auto& image = session.image;
+  check(runtime.KernelTarget(316) == 0xfe0004f0, "actual ordinal 316 RtlUpperChar is unavailable");
+  X86Context context{};
+  context.host = &runtime;
+  context.fs_base = 0x90000;
+  context.eax = 0x12345678;
+  const auto frame = [&](X86Context& ctx, uint32_t value, uint32_t stack = 0x20f00) {
+    ctx.esp = stack;
+    ctx.last_icall = runtime.KernelTarget(316);
+    const std::array<uint32_t, 2> words = {0x12345678, value};
+    image.memory->Write(ctx, stack, words.data(), sizeof(words));
+  };
+  const auto reject = [&](X86Context& ctx, uint8_t* base, bool cancellation = false) {
+    const auto previous = ctx;
+    std::array<uint8_t, 4096> before{}, after{};
+    image.memory->Read(ctx, 0x20000, before.data(), before.size());
+    bool refused = false;
+    try { runtime.Invoke(ctx, base, runtime.KernelTarget(316)); }
+    catch (const browser::Cancelled&) { refused = cancellation; }
+    catch (const browser::Fault&) { refused = !cancellation; }
+    image.memory->Read(ctx, 0x20000, after.data(), after.size());
+    check(refused && before == after && std::memcmp(&previous, &ctx, sizeof(ctx)) == 0,
+      "rejected RtlUpperChar mutated memory or CPU state");
+  };
+  frame(context, 'a');
+  reject(context, image.memory->Base());
+  runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+    for (uint32_t n = 0; n < 256; ++n) {
+      for (const uint32_t high : {0u, 0xffffff00u, 0x12345600u}) {
+        frame(ctx, high | n);
+        const auto previous = ctx;
+        std::array<uint8_t, 4096> before{}, after{};
+        image.memory->Read(ctx, 0x20000, before.data(), before.size());
+        runtime.Invoke(ctx, base, runtime.KernelTarget(316));
+        auto expected = previous;
+        expected.eax = n >= 'a' && n <= 'z' ? n - ('a' - 'A') : n;
+        expected.esp += 8;
+        image.memory->Read(ctx, 0x20000, after.data(), after.size());
+        check(before == after && std::memcmp(&expected, &ctx, sizeof(ctx)) == 0,
+          "RtlUpperChar return, memory or stdcall state incorrect");
+      }
+    }
+    ctx.esp = 0x20f00;
+    const auto saved = ctx;
+    check(runtime.Call(ctx, base, runtime.KernelTarget(316), {0xffffff61}) == 'A' &&
+      std::memcmp(&saved, &ctx, sizeof(ctx)) == 0, "RtlUpperChar retained call stack contract failed");
+    frame(ctx, 'z', 0x20ffd);
+    runtime.Invoke(ctx, base, runtime.KernelTarget(316));
+    check(ctx.eax == 'Z' && ctx.esp == 0x21005, "cross-page frame failed");
+    for (const uint32_t stack : {0x21ffcu, 0x22000u, 0x60000u, 0xfffffffcu}) {
+      ctx.esp = stack;
+      reject(ctx, base);
+    }
+    frame(ctx, 'a');
+    browser::Runtime foreign({}, {});
+    auto alien = ctx;
+    alien.host = &foreign;
+    reject(alien, base);
+    alien = ctx;
+    alien.fs_base += 0x1000;
+    reject(alien, base);
+    reject(ctx, nullptr);
+    browser::Memory foreignMemory;
+    reject(ctx, foreignMemory.Base());
+    {
+      auto lease = image.memory->Borrow();
+      reject(ctx, base);
+    }
+    image.importsBound = false;
+    reject(ctx, base);
+    image.importsBound = true;
+    image.boundRuntime = &foreign;
+    reject(ctx, base);
+    image.boundRuntime = &runtime;
+    auto retainedMemory = std::move(image.memory);
+    image.memory = std::make_unique<browser::Memory>();
+    image.memory->Ensure(0x20000, 4096);
+    reject(ctx, base);
+    image.memory = std::move(retainedMemory);
+    runtime.Cancel();
+    reject(ctx, base, true);
+  });
+  if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+  check(!runtime.ActiveWorkers(), "upper character retained workers");
+}
+
 void EqualContracts() {
   EqualSession session;
   auto& runtime = session.runtime;
   auto& image = session.image;
   check(runtime.KernelTarget(279) == 0xfe00045c, "actual ordinal 279 RtlEqualString is unavailable");
-  check(!runtime.KernelTarget(270) && !runtime.KernelTarget(316), "string provider enabled unrelated exports");
+  check(!runtime.KernelTarget(270), "string provider enabled unrelated exports");
   X86Context context{};
   context.host = &runtime;
   context.fs_base = 0x90000;
@@ -469,7 +558,7 @@ void ConcurrentWorkers() {
 
 int main() {
   try {
-    for (uint32_t n = 0; n < 3; ++n) { EqualContracts(); Contracts(); }
+    for (uint32_t n = 0; n < 3; ++n) { UpperContracts(); EqualContracts(); Contracts(); }
     CoherentEquality();
     ConcurrentWorkers();
     std::puts("string-provider-contracts-ok");

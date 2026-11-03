@@ -482,7 +482,7 @@ void timerContracts(Runtime& runtime, Dispatcher& dispatcher, const X86Context& 
     check(timers.Wait(ctx, timer, 0ms) == Dispatcher::WaitResult::Signaled && !timers.CancelTimer(timer), "immediate periodic expiry at clock ceiling cannot wrap");
     fault([&] { timers.SetTimer(timer, 1); }, "deadline beyond clock ceiling rejects");
     timers.Destroy(timer);
-    std::array<uint32_t, 128> objects{};
+    std::array<uint32_t, browser::kDispatcherCapacity> objects{};
     for (size_t n = 0; n < objects.size(); ++n) { objects[n] = timers.CreateTimer(false); }
     fault([&] { timers.CreateTimer(true); }, "timers share dispatcher object budget");
     for (const auto object : objects) { timers.Destroy(object); }
@@ -784,7 +784,7 @@ int main() {
     dispatcher.Destroy(semaphore);
     check(dispatcher.ActiveObjects() == 0 && dispatcher.ActiveWaiters() == 0, "completed operations leave no live state");
     {
-      std::array<uint32_t, 128> objects{};
+      std::array<uint32_t, browser::kDispatcherCapacity> objects{};
       for (size_t n = 0; n < objects.size(); ++n) { objects[n] = dispatcher.CreateEvent(false, false); }
       fault([&] { dispatcher.CreateEvent(false, false); }, "live object ceiling enforced");
       for (const auto object : objects) { dispatcher.Destroy(object); }

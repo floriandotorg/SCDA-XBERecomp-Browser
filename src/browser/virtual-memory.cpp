@@ -17,10 +17,59 @@ class VirtualMemory {
     uint32_t protect;
   };
   std::vector<Reservation> reservations_;
+  std::vector<Reservation> stacks_;
 public:
   explicit VirtualMemory(Memory& memory) {
     reservations_.reserve(reservationLimit);
+    stacks_.reserve(reservationLimit);
     memory.Map(arenaBase, capacity);
+  }
+
+  void Stack(Runtime& runtime, Memory& memory, X86Context& ctx, uint32_t ordinal) {
+    if (Memory::HasBorrow()) { throw Fault(ctx, ctx.esp, 0, "kernel stack service requires no backing lease"); }
+    const uint64_t stackEnd = uint64_t(ctx.esp) + 12;
+    if (stackEnd > UINT32_MAX) { throw Fault(ctx, ctx.esp, 12, "kernel stack frame overflow"); }
+    auto mutation = memory.Mutate();
+    runtime.Checkpoint(ctx);
+    std::array<uint32_t, 3> frame;
+    memory.Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+    uint32_t result = 0;
+    if (ordinal == 169) {
+      if (frame[1] <= (16u << 20) && stacks_.size() < reservationLimit) {
+        const uint32_t size = ((frame[1] + 0xffff) & ~0xffffu) + 0x10000;
+        uint32_t address = 0xc8000000;
+        auto position = stacks_.begin();
+        while (position != stacks_.end()) {
+          if (uint64_t(address) + size <= position->base) { break; }
+          address = position->base + position->size;
+          ++position;
+        }
+        if (uint64_t(address) + size <= 0xd0000000) {
+          memory.Map(address, size);
+          try {
+            if (size > 0x10000) { memory.Commit(address + 0x10000, size - 0x10000); }
+            stacks_.insert(position, {address, size, 4});
+          } catch (...) {
+            memory.Discard(address, size);
+            throw;
+          }
+          result = address + size;
+        }
+      }
+    } else {
+      const auto position = std::find_if(stacks_.begin(), stacks_.end(), [&](const auto& stack) {
+        return stack.base + stack.size == frame[1];
+      });
+      if (position != stacks_.end()) {
+        if (uint64_t(ctx.esp) < uint64_t(position->base) + position->size && stackEnd > position->base) {
+          throw Fault(ctx, ctx.esp, 12, "kernel stack deletion overlaps its service frame");
+        }
+        memory.Discard(position->base, position->size);
+        stacks_.erase(position);
+      }
+    }
+    ctx.eax = result;
+    ctx.esp = uint32_t(stackEnd);
   }
 
   void Statistics(Runtime& runtime, Memory& memory, X86Context& ctx, PreparedImage& image,
@@ -57,6 +106,7 @@ public:
       uint32_t reserved = 0;
       for (const auto& reservation : reservations_) { reserved += reservation.size; }
       uint32_t stackPages = 0;
+      for (const auto& stack : stacks_) { stackPages += memory.CommittedPages(stack.base, stack.size); }
       for (const auto& thread : image.threads) {
         if (thread.stackTop < thread.stackLimit) { throw Fault(ctx, 181, 0, "invalid prepared thread stack range"); }
         stackPages += memory.CommittedPages(thread.stackLimit, thread.stackTop - thread.stackLimit);
@@ -211,8 +261,10 @@ public:
     uint32_t base, size;
     memory.Read(ctx, frame[1], &base, 4);
     memory.Read(ctx, frame[3], &size, 4);
-    if (frame[2] || (frame[5] != 4 && !(frame[4] == 0x2000 && frame[5] == 1)) ||
-        (frame[4] != 0x1000 && frame[4] != 0x2000 && frame[4] != 0x3000)) {
+    const uint32_t allocation = frame[4] & ~0x100000u;
+    const bool topDown = frame[4] & 0x100000;
+    if (frame[2] || (frame[5] != 4 && !(allocation == 0x2000 && frame[5] == 1)) ||
+        (allocation != 0x1000 && allocation != 0x2000 && allocation != 0x3000)) {
       throw Fault(ctx, frame[4], 0, "unsupported virtual allocation mode");
     }
     runtime.Checkpoint(ctx);
@@ -229,10 +281,20 @@ public:
         status = 0xc0000017;
       } else {
         if (!base) {
-          address = arenaBase;
-          for (const auto& reservation : reservations_) {
-            if (uint64_t(address) + length <= reservation.base) { break; }
-            address = (reservation.base + reservation.size + 0xffff) & ~0xffffu;
+          if (topDown) {
+            address = uint32_t((uint64_t(arenaBase) + capacity - length) & ~uint64_t(0xffff));
+            for (auto position = reservations_.rbegin(); position != reservations_.rend(); ++position) {
+              if (address >= uint64_t(position->base) + position->size) { break; }
+              if (uint64_t(address) + length > position->base) {
+                address = uint32_t((uint64_t(position->base) - length) & ~uint64_t(0xffff));
+              }
+            }
+          } else {
+            address = arenaBase;
+            for (const auto& reservation : reservations_) {
+              if (uint64_t(address) + length <= reservation.base) { break; }
+              address = (reservation.base + reservation.size + 0xffff) & ~0xffffu;
+            }
           }
         }
         if (address < arenaBase || uint64_t(address) + length > uint64_t(arenaBase) + capacity) {
@@ -280,7 +342,7 @@ public:
 namespace {
 
 void Install(Runtime& runtime, Memory& memory, PreparedImage* image, QueryContiguousMemoryUsage contiguousUsage) {
-  if (runtime.ActiveWorkers() || runtime.KernelTarget(184) || runtime.KernelTarget(199) || runtime.KernelTarget(217) || Memory::HasBorrow() ||
+  if (runtime.ActiveWorkers() || runtime.KernelTarget(169) || runtime.KernelTarget(170) || runtime.KernelTarget(184) || runtime.KernelTarget(199) || runtime.KernelTarget(217) || Memory::HasBorrow() ||
       (image && (runtime.KernelTarget(181) || (runtime.KernelTarget(165) && !contiguousUsage)))) {
     throw Fault({}, 184, 0, "virtual memory installation requires an unused stopped runtime");
   }
@@ -301,6 +363,12 @@ void Install(Runtime& runtime, Memory& memory, PreparedImage* image, QueryContig
     validate(ctx, base);
     allocations->Invoke(runtime, memory, ctx);
   });
+  for (const uint32_t ordinal : {169u, 170u}) {
+    runtime.RegisterKernel(ordinal, [&runtime, &memory, allocations, validate, ordinal](X86Context& ctx, uint8_t* base) {
+      validate(ctx, base);
+      allocations->Stack(runtime, memory, ctx, ordinal);
+    });
+  }
   runtime.RegisterKernel(199, [&runtime, &memory, allocations, validate](X86Context& ctx, uint8_t* base) {
     validate(ctx, base);
     allocations->Release(runtime, memory, ctx);

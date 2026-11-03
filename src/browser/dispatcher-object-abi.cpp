@@ -1,4 +1,5 @@
 #include "browser/dispatcher-object-abi.h"
+#include <algorithm>
 #include <bit>
 
 namespace browser {
@@ -42,7 +43,8 @@ void InvokeDispatcherObject(DispatcherHandles& handles, Memory& memory, X86Conte
   if (creating) {
     if (frame[2]) { throw Fault(ctx, frame[2], 0, "dispatcher object attributes are not implemented"); }
     if ((ordinal == 189 || ordinal == 194) && frame[3] > 1) { throw Fault(ctx, frame[3], 0, "invalid guest dispatcher type"); }
-    if (ordinal == 192 && (frame[3] & 0xFF) && !ctx.thread_handle) {
+    if (ordinal == 192 && frame[3] > 1) { throw Fault(ctx, frame[3], 0, "unsupported mutant ownership flags"); }
+    if (ordinal == 192 && frame[3] && !ctx.thread_handle) {
       throw Fault(ctx, 0, 0, "initial mutant ownership requires a nonzero context owner");
     }
   }
@@ -89,19 +91,37 @@ void InvokeDispatcherObject(DispatcherHandles& handles, Memory& memory, X86Conte
       additional = uint32_t(information.limit);
       break;
     }
-    case 221: result = uint32_t(handles.ReleaseMutant(frame[1], ctx.thread_handle)); break;
+    case 221: {
+      try {
+        handles.ReleaseMutant(frame[1], ctx.thread_handle);
+        result = 0;
+      } catch (const DispatcherError& error) {
+        if (error.status != 0xc0000046) { throw; }
+        if (output) {
+          try { WriteWord(memory, ctx, output, uint32_t(std::max(handles.QueryMutant(frame[1], ctx.thread_handle).count, 0))); }
+          catch (const Fault&) {}
+        }
+        throw;
+      }
+      break;
+    }
     case 222: result = uint32_t(handles.ReleaseSemaphore(frame[1], std::bit_cast<int32_t>(frame[2]))); break;
     case 225: result = uint32_t(handles.SetEvent(frame[1])); break;
     case 229: result = handles.SetTimerGuestState(frame[1], dueTime, std::bit_cast<int32_t>(frame[7])).signaled; break;
   }
-  if (output) {
-    if (byteOutput) {
-      const uint8_t value = uint8_t(result);
-      memory.Write(ctx, output, &value, 1);
-    } else {
-      WriteWord(memory, ctx, output, result);
-      if (querying) { WriteWord(memory, ctx, output + 4, additional); }
+  try {
+    if (output) {
+      if (byteOutput) {
+        const uint8_t value = uint8_t(result);
+        memory.Write(ctx, output, &value, 1);
+      } else {
+        WriteWord(memory, ctx, output, result);
+        if (querying) { WriteWord(memory, ctx, output + 4, additional); }
+      }
     }
+  } catch (...) {
+    if (creating) { handles.RollbackCreate(result); }
+    throw;
   }
   ctx.eax = 0;
   ctx.esp = uint32_t(stackEnd);

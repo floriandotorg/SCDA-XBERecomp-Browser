@@ -1,4 +1,5 @@
 #include "browser/sdk-provider.h"
+#include "browser/audio-entries.h"
 #include "cpu/x86_ops.h"
 #include "image_symbols.h"
 #include <algorithm>
@@ -12,6 +13,49 @@
 X86_FUNC(SDK_ORIGINAL(XNetStartup));
 X86_FUNC(SDK_ORIGINAL(WSAStartup));
 X86_FUNC(SDK_ORIGINAL(Direct3D_CreateDevice));
+#if defined(__APPLE__)
+X86_FUNC(__imp__sub_000534B8) __attribute__((weak_import));
+X86_FUNC(__imp__sub_0005351A) __attribute__((weak_import));
+#else
+X86_FUNC(__imp__sub_000534B8) __attribute__((weak));
+X86_FUNC(__imp__sub_0005351A) __attribute__((weak));
+#endif
+
+namespace {
+
+constexpr uint32_t kSignatureBeginAddress = 0x000534B8;
+constexpr uint32_t kSignatureEndAddress = 0x0005351A;
+
+struct SignatureObservation;
+thread_local SignatureObservation* signatureObservation = nullptr;
+
+struct SignatureObservation {
+  X86Context& context;
+  uint8_t* base;
+  uint32_t id;
+  std::function<void(uint32_t)> returned;
+  SignatureObservation* previous = signatureObservation;
+  SignatureObservation(X86Context& context, uint8_t* base, uint32_t id) : context(context), base(base), id(id) {
+    signatureObservation = this;
+  }
+  ~SignatureObservation() { signatureObservation = previous; }
+};
+
+}
+
+X86_FUNC(sub_000534B8) {
+  SignatureObservation observation(ctx, base, 69);
+  browser::Runtime::ObserveSdkEntry(ctx, base, observation.id);
+  __imp__sub_000534B8(ctx, base);
+  observation.returned(ctx.eax);
+}
+
+X86_FUNC(sub_0005351A) {
+  SignatureObservation observation(ctx, base, 71);
+  browser::Runtime::ObserveSdkEntry(ctx, base, observation.id);
+  __imp__sub_0005351A(ctx, base);
+  observation.returned(ctx.eax);
+}
 
 X86_FUNC(SDK_GUEST(XNetStartup)) {
   if (browser::Runtime::ObserveSdkEntry(ctx, base, 1)) {
@@ -54,8 +98,16 @@ SdkTrace::SnapshotData SdkTrace::Snapshot() const {
 }
 
 std::shared_ptr<const SdkTrace> InstallSdkProvider(Runtime& runtime, PreparedImage& image, SdkPolicy policy,
-  std::shared_ptr<SdkGraphics> graphics, std::shared_ptr<SdkGraphics> input, std::shared_ptr<SdkGraphics> launch, std::shared_ptr<SdkGraphics> route) {
-  if ((route && !route->BelongsTo(runtime, image)) || (launch && !launch->BelongsTo(runtime, image)) || (input && !input->BelongsTo(runtime, image)) || (graphics && !graphics->BelongsTo(runtime, image)) || !image.memory || image.importsBound || image.boundRuntime || Memory::HasBorrow() ||
+  std::shared_ptr<SdkGraphics> graphics, std::shared_ptr<SdkGraphics> input, std::shared_ptr<SdkGraphics> launch,
+  std::shared_ptr<SdkGraphics> route, std::shared_ptr<SdkGraphics> audio) {
+  const auto signatureBegin = runtime.Find(kSignatureBeginAddress);
+  const auto signatureEnd = runtime.Find(kSignatureEndAddress);
+  const bool signatures = signatureBegin || signatureEnd;
+  if ((signatures && (signatureBegin != sub_000534B8 || signatureEnd != sub_0005351A ||
+        !__imp__sub_000534B8 || !__imp__sub_0005351A ||
+        image.image.entry == kSignatureBeginAddress || image.image.entry == kSignatureEndAddress)) ||
+      (route && !route->BelongsTo(runtime, image)) || (launch && !launch->BelongsTo(runtime, image)) || (input && !input->BelongsTo(runtime, image)) || (graphics && !graphics->BelongsTo(runtime, image)) ||
+      (audio && !audio->BelongsTo(runtime, image)) || !image.memory || image.importsBound || image.boundRuntime || Memory::HasBorrow() ||
       (image.diagnosticRuntime && image.diagnosticRuntime != &runtime) ||
       image.image.entry == SDK_ADDRESS(XNetStartup) || image.image.entry == SDK_ADDRESS(WSAStartup) ||
       image.image.entry == SDK_ADDRESS(Direct3D_CreateDevice) ||
@@ -66,10 +118,48 @@ std::shared_ptr<const SdkTrace> InstallSdkProvider(Runtime& runtime, PreparedIma
   }
   auto trace = std::make_shared<SdkTrace>();
   auto* memory = image.memory.get();
-  runtime.InstallSdkObserver(*memory, [trace, memory, &image, &runtime, policy, graphics, input, launch, route](X86Context& ctx, uint32_t id, uint64_t workerId) {
-    if (image.memory.get() != memory || !image.importsBound || image.boundRuntime != &runtime || id == 0 || id > 65) {
+  auto sharedAudio = std::move(audio);
+  runtime.InstallSdkObserver(*memory, [trace, memory, &image, &runtime, policy, graphics, input, launch, route, signatures, sharedAudio](X86Context& ctx, uint32_t id, uint64_t workerId) {
+    if (image.memory.get() != memory || !image.importsBound || image.boundRuntime != &runtime || id == 0 || id == 70 ||
+        id > (sharedAudio ? BROWSER_AUDIO_LAST_ID : 71)) {
       throw Fault(ctx, ctx.esp, 0, "SDK observer belongs to a stale or unpublished image");
     }
+    if (id >= BROWSER_AUDIO_FIRST_ID) {
+      if (!sharedAudio) {
+        throw Fault(ctx, ctx.esp, 0, "audio entry observed without the installed audio provider");
+      }
+      return sharedAudio->Dispatch(ctx, memory->Base(), id);
+    }
+    if (id == 69 || id == 71) {
+      auto* observation = signatureObservation;
+      if (!signatures || !observation || &observation->context != &ctx || observation->base != memory->Base() || observation->id != id || observation->returned) {
+        throw Fault(ctx, ctx.esp, 0, "signature observation requires its exact retained entry");
+      }
+      std::array<uint32_t, 2> frame{};
+      {
+        auto lease = memory->Borrow();
+        memory->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+      }
+      runtime.Checkpoint(ctx);
+      SdkTrace::Event event;
+      event.workerId = workerId;
+      event.id = id;
+      event.fsBase = ctx.fs_base;
+      event.threadHandle = ctx.thread_handle;
+      event.esp = ctx.esp;
+      event.returnAddress = frame[0];
+      event.argumentCount = 1;
+      event.arguments[0] = frame[1];
+      observation->returned = [trace, event](uint32_t result) mutable {
+        ++event.id;
+        event.argumentCount = 2;
+        event.arguments[1] = result;
+        trace->Record(event);
+      };
+      trace->Record(event);
+      return true;
+    }
+    if (id == 66 || id == 67) { return graphics ? graphics->Dispatch(ctx, memory->Base(), id) : true; }
     if (id == 65) { return route ? route->Dispatch(ctx, memory->Base(), id) : true; }
     if (id == 64) { return launch ? launch->Dispatch(ctx, memory->Base(), id) : true; }
     if (id >= 40 && id <= 44) {

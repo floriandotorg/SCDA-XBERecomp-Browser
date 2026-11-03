@@ -105,7 +105,7 @@ int main() {
   check(runtime.KernelTarget(129), "DPC IRQL provider target absent");
   check(runtime.KernelTarget(252), "offline link provider target absent");
   check(runtime.KernelTarget(253), "offline PHY initialization target absent");
-  check(!runtime.KernelTarget(160), "unimplemented service registered");
+  check(runtime.KernelTarget(160), "KfRaiseIrql provider target absent");
   constexpr uint32_t cs = 0x12000;
   X86Context first{}, second{};
   first.host = &runtime;
@@ -284,6 +284,7 @@ int main() {
   initializePhy(boundaryPhy);
   check(boundaryPhy.eax == 0x801f0001 && boundaryPhy.esp == 0x16000, "PHY frame ending at mapping boundary rejected");
   const auto lower = [&](X86Context& ctx) { runtime.Invoke(ctx, memory.Base(), runtime.KernelTarget(161)); };
+  const auto raise = [&](X86Context& ctx) { runtime.Invoke(ctx, memory.Base(), runtime.KernelTarget(160)); };
   const auto irql = [&](const X86Context& ctx) {
     uint8_t value;
     memory.Read(ctx, ctx.fs_base + 0x24, &value, 1);
@@ -385,15 +386,96 @@ int main() {
     fault([&] { lower(invalid); });
     check(invalid.esp == address && irql(first) == 2, "invalid fastcall stack changed state");
   }
+  for (uint32_t level = 0; level <= 31; ++level) {
+    for (uint32_t target = level; target <= 31; ++target) {
+      auto request = first;
+      request.eax = 0xabcdef01;
+      request.ecx = 0xaabbcc00 + target;
+      request.edx = 0x87654321;
+      request.esi = 0x11223344;
+      request.edi = 0x55667788;
+      request.ebp = 0x99aabbcc;
+      request.cf = 1;
+      put(memory, first.fs_base + 0x24, 0xaabbcc00 + level);
+      put(memory, second.fs_base + 0x24, 0x11223307);
+      put(memory, request.esp, 0xfffffff0);
+      std::array<uint8_t, 0x6000> before, after;
+      memory.Read({}, 0x10000, before.data(), before.size());
+      raise(request);
+      memory.Read({}, 0x10000, after.data(), after.size());
+      before[first.fs_base + 0x24 - 0x10000] = uint8_t(target);
+      check(request.eax == level && request.esp == first.esp + 4, "KfRaiseIrql lost previous level or exact one word cleanup");
+      check(request.ecx == 0xaabbcc00 + target && request.edx == 0x87654321 && request.ebx == first.ebx &&
+        request.esi == 0x11223344 && request.edi == 0x55667788 && request.ebp == 0x99aabbcc &&
+        request.fs_base == first.fs_base && request.cf == 1, "KfRaiseIrql clobbered unrelated state");
+      check(before == after && irql(second) == 7, "KfRaiseIrql changed bytes outside current KPCR IRQL");
+      request.esp = first.esp;
+      request.ecx = level;
+      lower(request);
+      check(irql(first) == level, "KfRaiseIrql result could not restore previous level");
+    }
+  }
+  put(memory, first.fs_base + 0x24, 0xaabbcc02);
+  for (const uint32_t argument : {0u, 1u, 32u, 255u, 0xaabbcc20u, 0xd203f1c2u}) {
+    auto invalid = first;
+    invalid.eax = 0xabcdef01;
+    invalid.ecx = argument;
+    put(memory, invalid.esp, 0xfffffff0);
+    fault([&] { raise(invalid); });
+    check(invalid.eax == 0xabcdef01 && invalid.ecx == argument && invalid.esp == first.esp &&
+      word(memory, first.fs_base + 0x24) == 0xaabbcc02, "invalid KfRaiseIrql published state");
+  }
+  put(memory, first.fs_base + 0x24, 32);
+  first.ecx = 31;
+  fault([&] { raise(first); });
+  check(irql(first) == 32 && first.esp == 0x14000, "invalid current IRQL changed KfRaiseIrql state");
+  put(memory, first.fs_base + 0x24, 2);
+  for (const uint32_t address : {0u, 0x10001u, 0x16000u, 0xfffffffcu}) {
+    auto invalid = first;
+    invalid.fs_base = address;
+    invalid.ecx = 3;
+    fault([&] { raise(invalid); });
+    check(invalid.esp == first.esp && irql(first) == 2, "invalid KPCR changed KfRaiseIrql state");
+  }
+  for (const uint32_t address : {0x16000u, 0x15ffeu, 0xfffffffcu}) {
+    auto invalid = first;
+    invalid.esp = address;
+    invalid.ecx = 3;
+    fault([&] { raise(invalid); });
+    check(invalid.esp == address && irql(first) == 2, "invalid KfRaiseIrql stack changed state");
+  }
+  auto boundaryRaise = first;
+  boundaryRaise.esp = 0x15ffc;
+  boundaryRaise.ecx = 0xffffff03;
+  put(memory, boundaryRaise.esp, 0xfffffff0);
+  raise(boundaryRaise);
+  check(boundaryRaise.eax == 2 && boundaryRaise.esp == 0x16000 && irql(first) == 3, "KfRaiseIrql return frame at mapping boundary rejected");
+  put(memory, first.fs_base + 0x24, 0xaabbcc00);
+  first.esp = 0x14000;
+  first.ecx = 2;
+  raise(first);
+  check(first.eax == 0 && irql(first) == 2, "raise to DPC level failed");
+  first.esp = 0x14000;
+  raiseDpc(first);
+  check(first.eax == 2 && irql(first) == 2, "DPC raise after KfRaiseIrql changed level");
+  first.esp = 0x14000;
+  first.ecx = 0;
+  lower(first);
+  check(irql(first) == 0, "lower after KfRaiseIrql failed");
+  first.esp = 0x14000;
+  put(memory, first.fs_base + 0x24, 2);
   memory.Map(0x20000, 0x1000);
   auto uncommitted = first;
   uncommitted.fs_base = 0x20000;
   fault([&] { lower(uncommitted); });
+  fault([&] { raise(uncommitted); });
   Runtime foreign({}, {});
   auto foreignContext = first;
   foreignContext.host = &foreign;
   fault([&] { lower(foreignContext); });
   fault([&] { runtime.Kernel(first, nullptr, 161); });
+  fault([&] { raise(foreignContext); });
+  fault([&] { runtime.Kernel(first, nullptr, 160); });
   fault([&] { raiseDpc(foreignContext); });
   fault([&] { runtime.Kernel(first, nullptr, 129); });
   fault([&] { link(foreignContext); });
@@ -479,6 +561,11 @@ int main() {
   retiredDpc.eax = 0xabcdef01;
   fault([&] { raiseDpc(retiredDpc); });
   check(retiredDpc.esp == first.esp && retiredDpc.eax == 0xabcdef01 && irql(first) == 2, "retired runtime published DPC IRQL");
+  auto retiredRaise = first;
+  retiredRaise.eax = 0xabcdef01;
+  retiredRaise.ecx = 3;
+  fault([&] { raise(retiredRaise); });
+  check(retiredRaise.esp == first.esp && retiredRaise.eax == 0xabcdef01 && irql(first) == 2, "retired runtime published raised IRQL");
   first.ecx = 0;
   fault([&] { lower(first); });
   check(irql(first) == 2 && first.esp == 0x14000, "retired runtime changed IRQL");

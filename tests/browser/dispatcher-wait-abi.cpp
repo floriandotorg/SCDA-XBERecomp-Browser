@@ -66,7 +66,7 @@ const auto contracts = [] {
   frame(memory, ctx, {first, 0x100, timeoutAddress});
   invoke(233);
   check(ctx.eax == 0 && ctx.esp == stack + 16, "single wait decodes low BOOLEAN byte and returns with three argument stdcall cleanup");
-  frame(memory, ctx, {first, 1, 0, timeoutAddress});
+  frame(memory, ctx, {first, 0xD203F501, 0xFFFFFF00, timeoutAddress});
   invoke(234);
   check(ctx.eax == 0x102 && ctx.esp == stack + 20, "extended single wait accepts nonalertable user mode and cleans four arguments");
   handles.ReleaseSemaphore(second, 1);
@@ -75,7 +75,7 @@ const auto contracts = [] {
   check(ctx.eax == 1 && ctx.esp == stack + 28, "multiple wait decodes WaitAny as one and preserves original index");
   handles.SetEvent(first);
   handles.ReleaseSemaphore(second, 1);
-  frame(memory, ctx, {2, arrayAddress, 0, 1, 0, timeoutAddress});
+  frame(memory, ctx, {2, arrayAddress, 0, 0xD203F501, 0xFFFFFF00, timeoutAddress});
   invoke(235);
   check(ctx.eax == 0 && ctx.esp == stack + 28, "WaitAll zero consumes full set and returns success");
   {

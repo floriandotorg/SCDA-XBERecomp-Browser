@@ -141,6 +141,7 @@ D3DDevice_SetVertexShaderConstantNotInlineFast       = 0x49E900
 D3DDevice_SetViewport                                = 0x49AE90
 D3DDevice_Swap                                       = 0x49CC50
 D3DDevice_SwitchTexture                              = 0
+D3DResource_Release                                 = 0x49BD80
 D3DResource_BlockUntilNotBusy                        = 0x49BF20
 D3DResource_IsBusy                                   = 0x49BE60
 Direct3D_CreateDevice                                = 0x49D210

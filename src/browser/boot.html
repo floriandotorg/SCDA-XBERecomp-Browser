@@ -24,7 +24,7 @@
     <input id="iso" type="file" accept=".iso,application/x-iso9660-image" aria-describedby="selected privacy">
     <p id="selected">No ISO selected.</p>
     <p id="privacy">Selection is kept only for this page session. Stop preserves it for another attempt.</p>
-    <p>Cache, profile, and save storage is temporary and discarded when you select Stop or reload the page. Durable saves are not available yet. The selected ISO remains read only.</p>
+    <p>Storage is temporary: a 64 MiB virtual cache (including filesystem metadata), a separate 16 MiB profile/save volume, and at most 256 entries per volume. These are virtual limits, not physical console geometry. The shared Wasm heap is capped at 256 MiB, so all quotas may not fit simultaneously. Stop or reload discards writes. Durable saves are not available. The selected ISO remains read only.</p>
     <div role="group" aria-label="Guest controls">
       <button id="boot" type="button" disabled>Boot</button>
       <button id="stop" type="button" disabled>Stop</button>

@@ -566,7 +566,46 @@ void ReleaseContracts() {
   }
 }
 
+void KernelStackContracts() {
+  browser::Runtime runtime({}, {});
+  browser::Memory memory;
+  memory.Map(0x10000, 4096);
+  memory.Commit(0x10000, 4096);
+  browser::InstallVirtualMemory(runtime, memory);
+  check(runtime.KernelTarget(169) && runtime.KernelTarget(170), "kernel stack exports absent");
+  X86Context context{};
+  context.host = &runtime;
+  context.esp = 0x10000;
+  const auto call = [&](uint32_t ordinal, uint32_t value, uint32_t second = 0) {
+    const std::array<uint32_t, 3> frame{0xfffffff0, value, second};
+    memory.Write({}, context.esp, frame.data(), sizeof(frame));
+    auto request = context;
+    request.ebx = 0xabcdef01;
+    runtime.Invoke(request, memory.Base(), runtime.KernelTarget(ordinal));
+    check(request.esp == context.esp + 12 && request.ebx == 0xabcdef01, "kernel stack service clobbered ABI");
+    return request.eax;
+  };
+  const auto backing = memory.BackingBytes();
+  const uint32_t first = call(169, 0x1001);
+  check(first && first % 0x10000 == 0 && memory.IsCommitted(first - 0x10000), "kernel stack did not round and commit real pages");
+  uint32_t word = 1;
+  memory.Read({}, first - 4, &word, 4);
+  check(word == 0, "kernel stack was not zero initialized");
+  fault([&] { memory.Read({}, first - 0x10004, &word, 4); });
+  const uint32_t second = call(169, 0x20000, 1);
+  check(second > first && memory.IsCommitted(first - 4), "kernel stacks overlap");
+  check(call(169, UINT32_MAX) == 0, "oversized kernel stack was admitted");
+  const auto occupied = memory.BackingBytes();
+  check(call(170, first - 4) == 0 && memory.BackingBytes() == occupied, "unknown stack deletion changed live storage");
+  check(call(170, first, 1) == 0 && !memory.IsCommitted(first - 4), "kernel stack deletion retained committed pages");
+  check(call(169, 0x1001) == first, "released kernel stack extent was not reusable");
+  call(170, first);
+  call(170, second);
+  check(memory.BackingBytes() == backing, "kernel stack deletion retained backing");
+}
+
 int main() {
+  KernelStackContracts();
   ReleaseContracts();
   QueryContracts();
   for (uint32_t n = 0; n < 3; ++n) {
@@ -618,7 +657,7 @@ int main() {
     check(call(0x70000000, 1, 0x1000)[0] == 0xc0000018, "unowned commit did not return conflicting addresses");
     check(call(0, 0, 0x3000) == std::array<uint32_t, 3>{0xc000000d, 0, 0}, "zero size published outputs");
     check(call(0xfffff000, 0x2000, 0x3000)[0] == 0xc000000d, "overflow accepted");
-    for (const uint32_t type : {0u, 0x4000u, 0x103000u}) { fault([&] { call(0, 0x1000, type); }); }
+    for (const uint32_t type : {0u, 0x4000u, 0x203000u, 0x100000u}) { fault([&] { call(0, 0x1000, type); }); }
     for (const uint32_t protect : {0u, 1u, 2u, 0x104u, 0x40u}) { fault([&] { call(0, 0x1000, 0x3000, protect); }); }
     fault([&] { call(0, 0x1000, 0x3000, 4, 1); });
     fault([&] { call(0, 0x1000, 0x2000, 2); });
@@ -634,6 +673,14 @@ int main() {
     check(combined[0] == 0 && combined[1] == reserved[1] + 0x20000 && memory.IsCommitted(combined[1]), "failed requests consumed address space or reserve and commit failed");
     const auto implicit = call(0, 1, 0x1000);
     check(implicit[0] == 0 && memory.IsCommitted(implicit[1]) && implicit[1] != combined[1], "null base commit did not reserve");
+    const auto high = call(0, 0x1001, 0x103000);
+    check(high == std::array<uint32_t, 3>{0, 0x10ff0000, 0x2000} && memory.IsCommitted(high[1]), "top down allocation did not use the highest aligned gap");
+    const auto lower = call(0, 0x1000, 0x102000, 1);
+    check(lower == std::array<uint32_t, 3>{0, 0x10fe0000, 0x1000} && !memory.IsCommitted(lower[1]), "top down reservation overlapped a higher allocation or committed pages");
+    check(call(lower[1], 0x1000, 0x101000)[0] == 0 && memory.IsCommitted(lower[1]), "top down flag changed explicit commit semantics");
+    const auto specified = call(0x10fc0000, 0x1000, 0x103000);
+    check(specified == std::array<uint32_t, 3>{0, 0x10fc0000, 0x1000}, "top down ignored an explicit base");
+    check(call(0, 16u << 20, 0x103000)[0] == 0xc0000017, "top down exhaustion overlapped live reservations");
     for (const uint32_t stack : {0x11ff0u, 0x12000u, 0xfffffff0u}) {
       auto invalid = context;
       invalid.esp = stack;

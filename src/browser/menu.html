@@ -23,14 +23,14 @@
     <input id="iso" type="file" accept=".iso,application/x-iso9660-image" aria-describedby="selected privacy">
     <p id="selected">No ISO selected.</p>
     <p id="privacy">Your ISO stays on this device and is read only. Stop keeps the selection for another attempt.</p>
-    <p>Cache, profiles and saves are temporary. Stop, restart and refresh discard them. Durable saves are not available.</p>
+    <p>Storage is temporary: a 64 MiB virtual cache (including filesystem metadata), a separate 32 MiB profile/save volume, and at most 256 entries per volume. These are virtual limits, not physical console geometry. The shared Wasm heap is capped at 256 MiB, so all quotas may not fit simultaneously. Stop, restart and refresh discard writes. Durable saves are not available.</p>
     <div role="group" aria-label="Host controls">
       <button id="boot" type="button" disabled>Start</button>
       <button id="stop" type="button" disabled>Stop</button>
     </div>
     <p id="status" role="status" aria-live="polite" aria-atomic="true">Select an ISO to begin.</p>
     <p id="detail" role="alert" aria-atomic="true"></p>
-    <p id="keys">Game keys: arrows navigate, Enter is Start, Space or Z confirms, Escape or Backspace returns. Focus the canvas to play. Switching windows releases held buttons.</p>
+    <p id="keys">Game keys: arrows navigate, Enter is Start, Space or Z confirms, Escape or Backspace returns. X and Y press those controller buttons; Q/E press Black/White and [/] press the left/right triggers. Focus the canvas to play. Switching windows or focusing host controls releases held buttons.</p>
     <canvas id="game" width="640" height="480" tabindex="0" aria-label="Original game output" aria-describedby="keys"></canvas>
     <details>
       <summary>WebGPU diagnostics</summary>

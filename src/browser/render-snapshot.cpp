@@ -137,6 +137,13 @@ uint32_t HeaderWord(const RenderResourceSnapshot& resource, size_t offset) {
   return value;
 }
 
+uint32_t PhysicalAddress(uint32_t address) {
+  if ((address >= 0x80000000 && address < 0x84000000) || (address >= 0xf0000000 && address < 0xf4000000)) {
+    return address & 0x03ffffff;
+  }
+  return address;
+}
+
 void ValidateShader(const gpu::VertexShader& shader, const RenderSnapshotLimits& limits) {
   require(shader.decl.size() <= limits.maxShaderWords && shader.program.size() <= limits.maxShaderWords &&
     shader.constants.size() <= limits.maxShaderConstants, "render snapshot shader budget exceeded");
@@ -166,20 +173,22 @@ void Validate(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits
       const uint32_t expected = kind == RenderResourceKind::VertexBuffer ? 0 : kind == RenderResourceKind::IndexBuffer ? 0x10000 : kind == RenderResourceKind::Texture ? 0x40000 : 0x50000;
       require(type == expected, "render resource header type mismatch");
       const uint32_t data = HeaderWord(resource, 4);
-      const auto physical = [](uint32_t address) {
-        if ((address >= 0x80000000 && address < 0x84000000) || (address >= 0xf0000000 && address < 0xf4000000)) {
-          return address & 0x03ffffff;
-        }
-        return address;
-      };
-      require(physical(data) == physical(resource.payloadAddress), "render resource payload does not match header data");
+      require(PhysicalAddress(data) == PhysicalAddress(resource.payloadAddress), "render resource payload does not match header data");
     }
     bytes += resource.header.size() + resource.payload.size();
     require(bytes <= limits.maxTotalBytes, "render snapshot total resource budget exceeded");
     for (const auto& other : snapshot.resources) {
       if (&other == &resource) { break; }
-      require(other.id != resource.id, "duplicate render resource identity");
       require(!resource.headerAddress || other.headerAddress != resource.headerAddress, "duplicate render resource header");
+      if (other.id == resource.id) {
+        const auto storageView = [](RenderResourceKind value) {
+          return value == RenderResourceKind::Texture || value == RenderResourceKind::Surface;
+        };
+        require(storageView(other.kind) && storageView(resource.kind) && other.version == resource.version &&
+          PhysicalAddress(other.payloadAddress) == PhysicalAddress(resource.payloadAddress) && other.payload == resource.payload &&
+          (HeaderWord(other, 12) & ~8u) == (HeaderWord(resource, 12) & ~8u) && HeaderWord(other, 16) == HeaderWord(resource, 16),
+          "conflicting render resource storage identity");
+      }
     }
   }
   const auto bound = [&](uint32_t address, RenderResourceKind kind) {
@@ -196,7 +205,8 @@ void Validate(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits
   if (snapshot.state.index_data) {
     require(std::any_of(snapshot.resources.begin(), snapshot.resources.end(), [&](const auto& resource) {
       return (resource.kind == RenderResourceKind::IndexBuffer || resource.kind == RenderResourceKind::IndexData) &&
-        snapshot.state.index_data >= resource.payloadAddress && uint64_t(snapshot.state.index_data) < uint64_t(resource.payloadAddress) + resource.payload.size();
+        PhysicalAddress(snapshot.state.index_data) >= PhysicalAddress(resource.payloadAddress) &&
+        uint64_t(PhysicalAddress(snapshot.state.index_data)) < uint64_t(PhysicalAddress(resource.payloadAddress)) + resource.payload.size();
     }), "bound index data missing from snapshot");
   }
 }

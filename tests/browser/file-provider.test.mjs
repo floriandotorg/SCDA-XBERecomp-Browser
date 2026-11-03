@@ -8,7 +8,7 @@ const directory = resolve('out/file-provider-tests');
 mkdirSync(directory, { recursive: true });
 writeFileSync(`${directory}/run.mjs`, "import create from './files.mjs'; await create();\n");
 for (const platform of ['native', 'wasm']) {
-  test(`${platform} temporary files enforce create, metadata, writes, quota, cancellation and ISO denial`, () => {
+  test(`${platform} files enforce actual position queries, metadata, writes, quota, cancellation and ISO denial`, () => {
     const wasm = platform === 'wasm';
     const output = `${directory}/${wasm ? 'files.mjs' : 'native'}`;
     const flags = wasm
@@ -20,6 +20,8 @@ for (const platform of ['native', 'wasm']) {
     assert.equal(build.status, 0, build.stderr);
     const run = spawnSync(wasm ? process.execPath : output, wasm ? [`${directory}/run.mjs`] : [], { encoding: 'utf8', timeout: 30000 });
     assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stdout, /file-position-query-contracts-ok/);
+    assert.match(run.stdout, /file-position-query-races-ok/);
     assert.match(run.stdout, /file-provider-contracts-ok/);
   });
 }

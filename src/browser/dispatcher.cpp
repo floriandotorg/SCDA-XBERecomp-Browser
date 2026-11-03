@@ -8,7 +8,7 @@ std::shared_ptr<Dispatcher::Object>& Dispatcher::Find(uint32_t id) {
   for (auto& object : objects_) {
     if (object && object->id == id) { return object; }
   }
-  throw Fault({}, id, 0, "unknown dispatcher object");
+  throw DispatcherError(0xc0000008, id, "unknown dispatcher object");
 }
 
 uint32_t Dispatcher::Create(Kind kind, int32_t signal, int32_t limit, uint32_t owner) {
@@ -28,6 +28,19 @@ uint32_t Dispatcher::Create(Kind kind, int32_t signal, int32_t limit, uint32_t o
 
 uint32_t Dispatcher::CreateEvent(bool notification, bool signaled) {
   return Create(notification ? Kind::NotificationEvent : Kind::SynchronizationEvent, signaled ? 1 : 0, 1);
+}
+
+uint32_t Dispatcher::CreateThread() { return Create(Kind::Thread, 0, 1); }
+
+void Dispatcher::CompleteThread(uint32_t id) {
+  {
+    std::lock_guard lock(lock_);
+    auto& object = Find(id);
+    if (object->kind != Kind::Thread || object->signal) { throw Fault({}, id, 0, "invalid or repeated dispatcher thread completion"); }
+    object->signal = 1;
+    if (object->unreferenced) { object->destroyed = true; object.reset(); }
+  }
+  if (!Disconnected()) { runtime_.Wake(); }
 }
 
 uint32_t Dispatcher::CreateSemaphore(int32_t initial, int32_t limit) {
@@ -110,6 +123,13 @@ Dispatcher::TimerState Dispatcher::CancelTimerState(uint32_t id) {
   return previous;
 }
 
+void Dispatcher::RefreshTime(const X86Context& ctx) {
+  if (!runtimeClock_) { return; }
+  const auto sample = runtime_.TimerTime(ctx);
+  if (sample < timerTime_) { throw Fault(ctx, 0, 0, "dispatcher clock regressed"); }
+  timerTime_ = sample;
+}
+
 void Dispatcher::AdvanceTime(uint64_t elapsedTicks) {
   std::lock_guard lock(lock_);
   runtime_.Checkpoint({});
@@ -140,7 +160,7 @@ int32_t Dispatcher::ReleaseMutant(uint32_t id, uint32_t owner) {
   auto& reference = Find(id);
   auto& object = *reference;
   if (object.kind != Kind::Mutant || owner == 0 || object.owner != owner) {
-    throw Fault({}, id, 0, "mutant release requires its nonzero owner");
+    throw DispatcherError(0xc0000046, id, "mutant release requires its nonzero owner");
   }
   const int32_t previous = object.signal;
   if (++object.signal == 1) {
@@ -234,13 +254,13 @@ Dispatcher::MutantInformation Dispatcher::QueryMutant(uint32_t id, uint32_t owne
 void Dispatcher::RetireUnreferenced(uint32_t id) {
   std::lock_guard lock(lock_);
   auto& object = Find(id);
-  if (object->kind == Kind::Mutant && object->owner != 0) {
+  if ((object->kind == Kind::Mutant && object->owner != 0) || (object->kind == Kind::Thread && !object->signal)) {
     object->unreferenced = true;
     return;
   }
   object->destroyed = true;
   object.reset();
-  runtime_.Wake();
+  if (!Disconnected()) { runtime_.Wake(); }
 }
 
 void Dispatcher::Destroy(uint32_t id) {
@@ -248,7 +268,7 @@ void Dispatcher::Destroy(uint32_t id) {
   auto& object = Find(id);
   object->destroyed = true;
   object.reset();
-  runtime_.Wake();
+  if (!Disconnected()) { runtime_.Wake(); }
 }
 
 Dispatcher::WaitResult Dispatcher::Wait(const X86Context& ctx, uint32_t id, std::chrono::milliseconds timeout, uint32_t owner) {
@@ -286,15 +306,16 @@ Dispatcher::WaitOutcome Dispatcher::WaitImpl(const X86Context& ctx, std::span<co
   if (ids.empty() || ids.size() > 64 || (mode != WaitMode::Any && mode != WaitMode::All)) {
     throw Fault(ctx, 0, ids.size(), "invalid dispatcher wait set or mode");
   }
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  auto deadline = std::chrono::steady_clock::now() + timeout;
   std::array<std::shared_ptr<Object>, 64> objects{};
   const size_t count = ids.size();
   std::optional<uint64_t> guestDeadline;
   {
     std::lock_guard lock(lock_);
     runtime_.Checkpoint(ctx);
+    RefreshTime(ctx);
     if (guestClock && guestTimeout) { guestDeadline = GuestDeadline(ctx, *guestTimeout); }
-    if (waiters_ >= 2) { throw Fault(ctx, 0, 0, "dispatcher waiter capacity exhausted"); }
+    if (waiters_ >= runtime_.WorkerCapacity()) { throw Fault(ctx, 0, 0, "dispatcher waiter capacity exhausted"); }
     for (size_t n = 0; n < count; ++n) {
       objects[n] = Find(ids[n]);
       if (objects[n]->kind == Kind::Mutant && owner == 0) { throw Fault(ctx, ids[n], 0, "mutant wait requires a nonzero owner"); }
@@ -316,6 +337,7 @@ Dispatcher::WaitOutcome Dispatcher::WaitImpl(const X86Context& ctx, std::span<co
     {
       std::lock_guard lock(lock_);
       runtime_.Checkpoint(ctx);
+      RefreshTime(ctx);
       size_t ready = 0;
       size_t selected = 0;
       for (size_t n = 0; n < count; ++n) {
@@ -339,7 +361,7 @@ Dispatcher::WaitOutcome Dispatcher::WaitImpl(const X86Context& ctx, std::span<co
         for (size_t n = 0; n < count; ++n) {
           if (mode == WaitMode::All || n == selected) {
             auto& object = *objects[n];
-            if (object.kind != Kind::NotificationEvent && object.kind != Kind::NotificationTimer) { --object.signal; }
+            if (object.kind != Kind::NotificationEvent && object.kind != Kind::NotificationTimer && object.kind != Kind::Thread) { --object.signal; }
             if (object.kind == Kind::Mutant) {
               object.owner = owner;
               object.abandoned = false;
@@ -353,8 +375,12 @@ Dispatcher::WaitOutcome Dispatcher::WaitImpl(const X86Context& ctx, std::span<co
       sequence = runtime_.Sequence();
     }
     const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) { return {guestClock ? WaitResult::WatchdogExpired : WaitResult::TimedOut, std::nullopt}; }
-    runtime_.Wait(ctx, sequence, std::chrono::ceil<std::chrono::milliseconds>(deadline - now));
+    if (now >= deadline) {
+      if (!guestClock || hostWatchdog_) { return {guestClock ? WaitResult::WatchdogExpired : WaitResult::TimedOut, std::nullopt}; }
+      deadline = now + timeout;
+    }
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
+    runtime_.Wait(ctx, sequence, runtimeClock_ ? std::min(remaining, std::chrono::milliseconds(1)) : remaining);
   }
 }
 

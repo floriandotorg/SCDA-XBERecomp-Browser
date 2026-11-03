@@ -12,7 +12,7 @@ class RawCache {
 public:
   static constexpr uint32_t PartitionCount = 1;
   static constexpr uint32_t FirstPartition = 3;
-  static constexpr uint64_t PartitionCapacity = 16 * 1024 * 1024;
+  static constexpr uint64_t PartitionCapacity = CacheFatx::Capacity;
   static constexpr uint64_t MetadataOffset = 0x800;
   static constexpr uint32_t SectorSize = 512;
   static constexpr uint32_t MaximumTransfer = SectorSize;

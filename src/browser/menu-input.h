@@ -8,7 +8,8 @@ public:
   enum Button : uint32_t {
     Up = 1, Down = 2, Left = 4, Right = 8,
     Forward = 16, Backward = 32, StrafeLeft = 64, StrafeRight = 128,
-    Start = 256, Confirm = 512, Back = 1024
+    Start = 256, Confirm = 512, Back = 1024,
+    X = 2048, Y = 4096, Black = 8192, White = 16384, LeftTrigger = 32768, RightTrigger = 65536
   };
   MenuInput(Runtime& runtime, PreparedImage& image);
   bool BelongsTo(Runtime& runtime, PreparedImage& image) const override;

@@ -53,7 +53,8 @@ struct Fixture {
 const auto controlled = [] {
   for (uint32_t n = 0; n < 3; ++n) {
     std::atomic<uint64_t> source = 900000;
-    Fixture fixture([&] { return source.load(); });
+    std::atomic<uint32_t> samples = 0;
+    Fixture fixture([&] { ++samples; return source.load(); });
     fixture.Install();
     fixture.Bind();
     check(fixture.exports.size() == 1 && fixture.exports[0].ordinal == 156 && fixture.exports[0].size == 4,
@@ -77,6 +78,10 @@ const auto controlled = [] {
       constexpr uint32_t timer = 0x10100;
       const std::array<uint32_t, 10> initialized = {0x000a0008, 0, timer + 8, timer + 8};
       fixture.image.memory->Write(ctx, timer, initialized.data(), sizeof(initialized));
+      fixture.queue->Arm(ctx, timer, -216000000000ll, 0);
+      const auto beforeSamples = samples.load();
+      for (uint32_t n = 0; n < 200; ++n) { fixture.runtime.Poll(ctx, base); }
+      check(samples.load() - beforeSamples == 200, "future timer polling redundantly sampled the clock");
       fixture.queue->Arm(ctx, timer, -10000, 0);
       const uint8_t elevated = 2;
       fixture.image.memory->Write(ctx, ctx.fs_base + 0x24, &elevated, 1);

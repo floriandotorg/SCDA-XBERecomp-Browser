@@ -8,7 +8,7 @@ const directory = resolve('out/menu-route-tests');
 mkdirSync(directory, { recursive: true });
 writeFileSync(`${directory}/run.mjs`, "import create from './route.mjs'; await create();\n");
 for (const platform of ['native', 'wasm']) {
-  test(`${platform} native menu route rejects unsupported modes before dispatch`, () => {
+  test(`${platform} menu route and bounded true-return mission observation contracts`, () => {
     const wasm = platform === 'wasm';
     const output = `${directory}/${wasm ? 'route.mjs' : 'native'}`;
     const flags = wasm

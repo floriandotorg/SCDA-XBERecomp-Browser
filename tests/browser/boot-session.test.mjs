@@ -65,6 +65,207 @@ const executedFixture = () => {
   return result;
 };
 
+test('caught guest faults preserve bounded stderr without changing the guest error', async () => {
+  const { options, data, module, messages } = executedFixture();
+  options.create = async ({ printErr }) => {
+    module._image_fault_ordinal = () => 0;
+    module._image_execute = () => {
+      for (let n = 0; n < 20; ++n) { printErr(`[browser-memory-fault] ${n}:` + 's'.repeat(600)); }
+      return 0;
+    };
+    return module;
+  };
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'GUEST_FAULT');
+  assert.equal(messages[0].wasmDiagnostics.stderr.length, 16);
+  assert.match(messages[0].wasmDiagnostics.stderr[0], /^\[browser-memory-fault\] 4:/);
+  assert.ok(messages[0].wasmDiagnostics.stderr.every(line => line.length === 512));
+  assert.equal(messages[0].wasmDiagnostics.stderrTruncated, true);
+});
+
+test('factory abort hooks preserve the real abort reason behind an opaque runtime failure', async () => {
+  const { options, data, messages, calls } = fixture();
+  options.create = async ({ onAbort, printErr }) => {
+    printErr('Assertion failed: a runtime invariant was violated');
+    onAbort('Assertion failed: a runtime invariant was violated');
+    throw Object.assign(new WebAssembly.RuntimeError('unreachable'), { code: 'OPAQUE_TRAP' });
+  };
+  await createBootSession(options)({ data });
+  assert.deepEqual(messages, [{
+    ok: false, generation: 1, code: 'WASM_ABORT', message: 'Assertion failed: a runtime invariant was violated',
+    wasmDiagnostics: {
+      abortReason: 'Assertion failed: a runtime invariant was violated', caughtMessage: 'unreachable',
+      stderr: ['Assertion failed: a runtime invariant was violated'], stderrTruncated: false,
+    },
+  }]);
+  assert.deepEqual(calls, ['close']);
+});
+
+test('an observed abort cannot proceed into guest APIs even if the factory does not throw', async () => {
+  const { options, data, module, messages, calls } = fixture();
+  options.create = async ({ onAbort }) => { onAbort('factory aborted without throwing'); return module; };
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'WASM_ABORT');
+  assert.equal(messages[0].message, 'factory aborted without throwing');
+  assert.deepEqual(calls, ['reset', 'close']);
+});
+
+test('abort diagnostics bound reason, caught context, stderr entry sizes and retained entry count', async () => {
+  const { options, data, messages } = fixture();
+  options.create = async ({ onAbort, printErr }) => {
+    for (let n = 0; n < 100; ++n) { printErr(`${n}:` + 's'.repeat(10000)); }
+    onAbort('r'.repeat(100000));
+    onAbort('a later abort must not replace the first reason');
+    throw new WebAssembly.RuntimeError('e'.repeat(100000));
+  };
+  await createBootSession(options)({ data });
+  const result = messages[0];
+  assert.equal(result.code, 'WASM_ABORT');
+  assert.equal(result.message, 'r'.repeat(2048));
+  assert.equal(result.wasmDiagnostics.abortReason, result.message);
+  assert.equal(result.wasmDiagnostics.caughtMessage, 'e'.repeat(2048));
+  assert.equal(result.wasmDiagnostics.stderr.length, 16);
+  assert.ok(result.wasmDiagnostics.stderr.every((line) => line.length <= 512));
+  assert.match(result.wasmDiagnostics.stderr[0], /^84:/);
+  assert.match(result.wasmDiagnostics.stderr.at(-1), /^99:/);
+  assert.equal(result.wasmDiagnostics.stderrTruncated, true);
+  assert.ok(JSON.stringify(result).length < 15000);
+});
+
+test('primary pthread crash records survive later stderr eviction without reclassifying the abort', async () => {
+  const { options, data, messages } = fixture();
+  options.create = async ({ onAbort, printErr }) => {
+    for (let n = 0; n < 6; ++n) { printErr(`[browser-pthread-crash] ${n}:original stack ${n}`); }
+    for (let n = 0; n < 30; ++n) { printErr(`secondary ${n}`); }
+    onAbort('');
+    throw new WebAssembly.RuntimeError('unreachable');
+  };
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'WASM_ABORT');
+  assert.equal(messages[0].wasmDiagnostics.pthreadFailure.length, 6);
+  assert.equal(messages[0].wasmDiagnostics.pthreadFailure[0], '[browser-pthread-crash] 0:original stack 0');
+  assert.ok(messages[0].wasmDiagnostics.stderr.every(line => line.startsWith('secondary')));
+});
+
+test('factory callbacks accept only primitive strings without inspecting or serializing module objects', async () => {
+  const { options, data, messages } = fixture();
+  const { proxy, revoke } = Proxy.revocable({}, {});
+  revoke();
+  options.create = async ({ onAbort, printErr }) => {
+    assert.doesNotThrow(() => printErr(proxy, { key: 'private-key', digest: 'private-digest', HEAPU8: [1, 2, 3] }));
+    assert.doesNotThrow(() => onAbort(proxy));
+    throw new WebAssembly.RuntimeError('unreachable');
+  };
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'WASM_ABORT');
+  assert.equal(messages[0].message, 'The WebAssembly runtime aborted.');
+  assert.equal(messages[0].wasmDiagnostics.abortReason, undefined);
+  assert.deepEqual(messages[0].wasmDiagnostics.stderr, []);
+  assert.doesNotMatch(JSON.stringify(messages), /private-key|private-digest|HEAPU8/);
+});
+
+test('stderr alone never reclassifies caught failures as a Wasm abort', async () => {
+  for (const code of [undefined, 'READ_FAILED']) {
+    const { options, data, messages } = fixture();
+    options.create = async ({ printErr }) => {
+      printErr('runtime context');
+      throw Object.assign(new WebAssembly.RuntimeError('unreachable'), { code });
+    };
+    await createBootSession(options)({ data });
+    assert.equal(messages[0].code, code ?? 'BOOT');
+    assert.equal(messages[0].message, 'unreachable');
+    assert.deepEqual(messages[0].wasmDiagnostics, {
+      caughtMessage: 'unreachable', stderr: ['runtime context'], stderrTruncated: false,
+    });
+  }
+});
+
+test('an abort during guest execution survives reset failure and still closes the port', async () => {
+  const { options, data, module, messages, calls } = executedFixture();
+  options.create = async ({ onAbort, printErr }) => {
+    module._image_execute = () => {
+      printErr('runtime stopped in the guest');
+      onAbort('observed guest runtime abort');
+      throw new WebAssembly.RuntimeError('unreachable');
+    };
+    return module;
+  };
+  module._image_reset = () => { calls.push('reset'); throw new WebAssembly.RuntimeError('cleanup trap'); };
+  await assert.doesNotReject(createBootSession(options)({ data }));
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].code, 'WASM_ABORT');
+  assert.equal(messages[0].message, 'observed guest runtime abort');
+  assert.equal(messages[0].entryReturned, undefined);
+  assert.equal(messages[0].activeWorkers, undefined);
+  assert.deepEqual(calls.slice(-2), ['reset', 'close']);
+});
+
+test('reset failures cannot obscure a non-abort primary result or prevent port closure', async () => {
+  const { options, data, module, messages, calls } = fixture();
+  options.prepare = async () => { throw Object.assign(new Error('preparation failed'), { code: 'PREPARE' }); };
+  module._image_reset = () => { calls.push('reset'); throw new Error('reset failed'); };
+  await assert.doesNotReject(createBootSession(options)({ data }));
+  assert.equal(messages[0].code, 'PREPARE');
+  assert.equal(messages[0].message, 'preparation failed');
+  assert.deepEqual(calls.slice(-2), ['reset', 'close']);
+});
+
+test('ownership retirement discards abort and stderr context, including the old primary message', async () => {
+  for (const phase of ['initialization', 'execution']) {
+    const { options, data, module, ownership, messages, calls } = executedFixture();
+    let callbacks;
+    options.create = async (config) => {
+      callbacks = config;
+      const abort = () => {
+        config.printErr('old owner stderr');
+        config.onAbort('old owner abort');
+        Atomics.store(ownership, 0, 2);
+        config.printErr('retired owner stderr');
+        config.onAbort('retired owner abort');
+        throw new WebAssembly.RuntimeError('old owner unreachable');
+      };
+      if (phase === 'initialization') { abort(); }
+      module._image_execute = abort;
+      return module;
+    };
+    await createBootSession(options)({ data });
+    assert.deepEqual(messages, [{ ok: false, generation: 1, code: 'CANCELLED', message: 'Boot generation was retired.' }]);
+    assert.doesNotThrow(() => callbacks.onAbort('late abort'));
+    assert.equal(calls.at(-1), 'close');
+  }
+});
+
+test('normal guest classification ignores stderr and late callbacks cannot mutate published results', async () => {
+  const { options, data, module, messages } = executedFixture();
+  let callbacks;
+  options.create = async (config) => { callbacks = config; config.printErr('nonfatal warning'); return module; };
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'ENTRY_RETURNED');
+  assert.equal(messages[0].ok, false);
+  assert.equal(messages[0].entryReturned, true);
+  assert.equal(messages[0].wasmDiagnostics, undefined);
+  const published = JSON.stringify(messages);
+  callbacks.printErr('late stderr');
+  callbacks.onAbort('late abort');
+  assert.equal(JSON.stringify(messages), published);
+});
+
+test('captured failure stderr is an owned snapshot that late callbacks cannot change', async () => {
+  const { options, data, messages } = fixture();
+  let callbacks;
+  options.create = async (config) => {
+    callbacks = config;
+    config.printErr('original stderr');
+    throw new Error('failed');
+  };
+  await createBootSession(options)({ data });
+  const published = JSON.stringify(messages);
+  callbacks.printErr('late stderr');
+  callbacks.onAbort('late abort');
+  assert.deepEqual(messages[0].wasmDiagnostics.stderr, ['original stderr']);
+  assert.equal(JSON.stringify(messages), published);
+});
+
 test('input shared storage is published before genuine entry execution and the GPU mailbox reaches module initialization', async () => {
   const { options, data, module, messages, calls } = executedFixture();
   const mailbox = new SharedArrayBuffer(64);
@@ -101,6 +302,23 @@ test('a copied launch request is reported only as an unclassified runtime bounda
   assert.equal(messages[0].code, 'LAUNCH_BOUNDARY_UNCLASSIFIED');
   assert.deepEqual(messages[0].launchRequest, { path: 'default.xbe', hasData: true, data: Uint8Array.from({ length: 3072 }, (_, n) => n & 255) });
   assert.equal(messages[0].ok, false);
+});
+
+test('only the latest verified Solo request identifies the mission launch boundary', async () => {
+  for (const verified of [true, false]) {
+    const { options, data, module, messages } = executedFixture();
+    const path = new TextEncoder().encode('default.xbe');
+    module._image_execute = () => 0;
+    module._image_launch_word = (field, index) => field === 0 ? path.length : field === 1 ? path[index] : field === 2 ? 0 : 0;
+    module._image_mission_count = () => 2;
+    module._image_mission_total_word = (field) => field === 0 ? 2 : 0;
+    module._image_mission_word = (index, field) => [index + 1, 0, 2, 0, index === 0 || verified ? 3 : 2, 1, 2, 1, 1, 80, 12, 9][field];
+    await createBootSession(options)({ data });
+    assert.equal(messages[0].code, verified ? 'SINGLE_PLAYER_LAUNCH_REQUEST' : 'LAUNCH_BOUNDARY_UNCLASSIFIED');
+    assert.equal(messages[0].ok, false);
+    assert.equal(messages[0].launchRequest.path, 'default.xbe');
+    assert.equal(messages[0].mission.events.at(-1).requestObserved, verified);
+  }
 });
 
 test('WebGPU snapshots report only completed genuine presents rather than diagnostic zero frames', async () => {
@@ -445,4 +663,36 @@ test('overlapping start cannot replace the initializing session', async () => {
   assert.equal(messages[1].code, 'EXPORT_UNAVAILABLE');
   assert.equal(calls.filter((call) => call === 'bind').length, 1);
   assert.equal(calls.filter((call) => call === 'reset').length, 1);
+});
+
+test('thread session reports bounded provider children after execution', async () => {
+  const { options, data, module, messages } = executedFixture();
+  const words = [3, 2, 1, 0, 4, 0x10000, 0, 0x36000, 0];
+  module._image_thread_session_word = field => words[field];
+  await createBootSession(options)({ data });
+  assert.deepEqual(messages[0].threadSession, { scope: 'provider-children-excluding-initial-thread', childrenCreated: 3, childrenCompleted: 2,
+    handlesClosed: 1, childrenSuspended: 0, objectReferences: 4, requestedStackBytes: '65536', committedBytes: '221184' });
+});
+
+test('thread session absence is explicit and malformed snapshots fail closed', async () => {
+  const absent = executedFixture();
+  await createBootSession(absent.options)({ data: absent.data });
+  assert.equal(absent.messages[0].threadSession, null);
+  for (const words of [[128, 0, 0, 0, 0, 0, 0, 0, 0], [1, 2, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, NaN, 0, 0, 0], [1, 0, 0, 0, 130049, 0, 0, 0, 0]]) {
+    const { options, data, module, messages } = executedFixture();
+    module._image_thread_session_word = field => words[field];
+    await createBootSession(options)({ data });
+    assert.equal(messages[0].code, 'THREAD_SESSION_PROTOCOL');
+    assert.equal(messages[0].threadSession, undefined);
+  }
+});
+
+test('retirement during thread session snapshot suppresses guest results', async () => {
+  const { options, data, module, ownership, messages } = executedFixture();
+  let reads = 0;
+  module._image_thread_session_word = () => { ++reads; Atomics.store(ownership, 0, 2); return 0; };
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'CANCELLED');
+  assert.equal(messages[0].threadSession, undefined);
+  assert.equal(reads, 1);
 });

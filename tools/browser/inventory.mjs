@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { generationInputs, generationOutputs, verifyGeneration } from './provenance.mjs';
 import { exportCatalog } from './export-catalog.mjs';
+import { optimizerIdentity } from './tail-call-postlink.mjs';
 
 const hash = (content) => createHash('sha256').update(content).digest('hex');
 const unique = (names, category) => {
@@ -71,7 +72,13 @@ export const validateSymbols = (header, partitions, mapping) => {
 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const [root, output, toolchain, configuration, generationRecord] = process.argv.slice(2);
+  const [root, output, toolchain, configuration, generationRecord, optimizerTool] = process.argv.slice(2);
+  const actualTailCalls = configuration.split(';').includes('actual-tail-calls=ON');
+  if (actualTailCalls && !configuration.split(';').includes('boot=ON')) {
+    throw new Error('Actual tail calls require boot mode.');
+  }
+  const wasmOptimization = actualTailCalls ? optimizerIdentity(optimizerTool) : { mode: 'off', flags: [] };
+  const wasmRequirements = actualTailCalls ? ['tail-call'] : [];
   const read = (path) => readFileSync(resolve(root, path));
   const config = read('config/scda_v2.toml').toString();
   const count = Number(config.match(/^partitions = (\d+)$/m)?.[1]);
@@ -96,22 +103,29 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const declarations = readdirSync(resolve(root, 'src/kernel')).filter((name) => name.endsWith('.cpp')).sort().map((name) => `src/kernel/${name}`);
     kernelExports = exportCatalog(declarations.map((path) => ({ path, text: read(path).toString() })));
     paths.push('tools/browser/export-catalog.mjs', ...declarations);
-    paths.push(...['boot-worker', 'boot-session', 'boot-controller', 'boot-runtime', 'boot-shell', 'boot-worker-broker', 'boot-worker-host', 'iso-reader', 'iso-mailbox', 'iso-wasm', 'iso-io-service', 'iso-io-worker'].map((name) => `src/browser/${name}.mjs`));
+    paths.push(...['boot-worker', 'boot-session', 'menu-state-report', 'boot-controller', 'boot-runtime', 'boot-shell', 'wasm-capabilities', 'boot-worker-broker', 'boot-worker-host', 'iso-reader', 'iso-mailbox', 'iso-wasm', 'iso-io-service', 'iso-io-worker'].map((name) => `src/browser/${name}.mjs`));
     paths.push('src/browser/boot.html');
     paths.push('src/browser/platform-profile.cpp', 'src/browser/platform-profile.h');
     paths.push('src/browser/shutdown-provider.cpp', 'src/browser/shutdown-provider.h');
     paths.push('src/browser/dpc-provider.cpp', 'src/browser/dpc-provider.h');
     paths.push('src/browser/timer-provider.cpp', 'src/browser/timer-provider.h');
     paths.push('src/browser/sdk-provider.cpp', 'src/browser/sdk-provider.h',
-      'src/browser/diagnostic-graphics.cpp', 'src/browser/diagnostic-graphics.h', 'src/browser/push-state.cpp', 'src/browser/push-state.h', 'src/gpu/backend.h', 'src/gpu/state.h',
-      'src/browser/silent-audio.cpp', 'src/browser/silent-audio.h', 'src/audio/output.h');
+      'src/browser/diagnostic-graphics.cpp', 'src/browser/diagnostic-graphics.h', 'src/browser/diagnostic-shaders.cpp', 'src/browser/diagnostic-shaders.h', 'src/browser/push-state.cpp', 'src/browser/push-state.h', 'src/gpu/backend.h', 'src/gpu/state.h',
+      'src/browser/silent-audio.cpp', 'src/browser/silent-audio.h', 'src/audio/output.h',
+      'src/browser/audio-entries.h', 'src/browser/audio-provider.h', 'src/browser/audio-provider.cpp',
+      'src/browser/audio-core.h', 'src/browser/audio-core.cpp', 'src/browser/audio-effects.h', 'src/browser/audio-effects.cpp',
+      'tests/browser/audio-core.cpp', 'tests/browser/audio-core.test.mjs', 'tests/browser/audio-effects.cpp', 'tests/browser/audio-effects.test.mjs',
+      'tests/browser/audio-provider.cpp', 'tests/browser/audio-provider.test.mjs', 'tests/browser/audio-boot.test.mjs');
     if (configuration.includes('menu=ON') || configuration.includes('menu-capture=ON')) {
-      paths.push('src/browser/menu-input.h', 'src/browser/menu-input.cpp', 'src/browser/menu-launch.h', 'src/browser/menu-launch.cpp',
+      paths.push('src/browser/av-provider.h', 'src/browser/av-provider.cpp', 'src/browser/delay-provider.h', 'src/browser/delay-provider.cpp', 'src/browser/menu-input.h', 'src/browser/menu-input.cpp', 'src/browser/menu-launch.h', 'src/browser/menu-launch.cpp',
         'src/browser/menu-route.h', 'src/browser/menu-route.cpp');
     }
     if (configuration.includes('menu=ON')) {
+      if (configuration.split(';').includes('menu-trace-aborts=ON')) {
+        paths.push('src/browser/abort-diagnostic.cpp', 'src/browser/abort-import.js');
+      }
       paths.push('src/browser/render-snapshot.h', 'src/browser/render-snapshot.cpp', 'src/browser/menu-backend.h', 'src/browser/menu-backend.cpp',
-        'src/browser/menu-shaders.h', 'src/browser/menu-shaders.cpp', 'src/browser/menu-texture.h', 'src/browser/menu-texture.cpp',
+        'src/browser/menu-shaders.h', 'src/browser/menu-shaders.cpp', 'src/browser/menu-pixel-shaders.h', 'src/browser/menu-pixel-shaders.cpp', 'src/browser/menu-texture.h', 'src/browser/menu-texture.cpp',
         'src/browser/menu-input.mjs', 'src/browser/webgpu-transport.h', 'src/browser/webgpu-transport.cpp', 'src/browser/webgpu-transport.mjs',
         'src/browser/webgpu-service.cpp', 'src/browser/webgpu-service.mjs', 'src/browser/menu-runtime.mjs', 'src/browser/menu-shell.mjs',
         'src/browser/menu.html', 'src/gpu/shaders.h', 'src/gpu/shaders.cpp', 'src/gpu/vertex.h');
@@ -123,22 +137,26 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     paths.push('src/browser/file-provider.cpp', 'src/browser/file-provider.h', 'src/browser/temporary-filesystem.cpp', 'src/browser/temporary-filesystem.h');
     paths.push('src/browser/raw-cache.cpp', 'src/browser/raw-cache.h', 'src/browser/cache-fatx.cpp', 'src/browser/cache-fatx.h');
     paths.push('src/browser/kernel-provider.cpp', 'src/browser/kernel-provider.h', 'src/browser/thread-provider.cpp', 'src/browser/thread-provider.h', 'src/kernel/crypto.cpp', 'src/kernel/crypto.h');
+    for (const source of ['synchronization-provider', 'dispatcher', 'dispatcher-handles', 'dispatcher-object-abi', 'guest-wait']) {
+      paths.push(`src/browser/${source}.cpp`, `src/browser/${source}.h`);
+    }
     paths.push('src/browser/boot-wasm.cpp', 'src/browser/disc-wasm.cpp', 'src/browser/image.cpp', 'src/browser/image.h', 'src/kernel/disc_index.cpp', 'src/kernel/disc_index.h', 'src/browser/iso-validation.mjs', 'src/browser/iso-image.mjs');
   }
-  paths.push('tools/browser/provenance.mjs');
+  paths.push('tools/browser/provenance.mjs', 'tools/browser/tail-call-postlink.mjs');
   const discIdentity = generationRecord ? verifyGeneration(JSON.parse(readFileSync(generationRecord, 'utf8')), read) : {
     image: 'default.xbe', xbeSha256: null, xbeSize: null, requiredStoryFiles: null,
     provenance: 'Generated input hashes captured. Trusted generation XBE identity is absent; real boot is blocked. Never derive trust from the selected ISO.',
   };
   if (generationRecord) { paths.push(...generationInputs, ...generationOutputs); }
   const inputs = Object.fromEntries([...new Set(paths)].map((path) => [path, hash(read(path))]));
-  const manifest = { schema: 1, compatibility: (configuration.includes('full-cpu=ON') || configuration.includes('boot=ON')) ? 'wasm-compact-leased-v1' : 'wasm-weak-alias-v1', toolchain, configuration, partitionCount: count, functionCount, namedSymbolCount, ranges, ...discIdentity, ...(kernelExports ? { kernelExports } : {}), inputs };
+  const manifest = { schema: 1, wasmOptimization, wasmRequirements, compatibility: (configuration.includes('full-cpu=ON') || configuration.includes('boot=ON')) ? 'wasm-compact-leased-v1' : 'wasm-weak-alias-v1', toolchain, configuration, partitionCount: count, functionCount, namedSymbolCount, ranges, ...discIdentity, ...(kernelExports ? { kernelExports } : {}), inputs };
   const identity = hash(JSON.stringify(manifest));
   const emit = (name, content) => {
     const path = resolve(output, name);
     if (!existsSync(path) || readFileSync(path, 'utf8') !== content) { writeFileSync(path, content); }
   };
   emit('input-manifest.json', JSON.stringify({ identity, ...manifest }, null, 2) + '\n');
+  emit('wasm-postlink.json', JSON.stringify({ ...wasmOptimization, ...(actualTailCalls ? { tool: resolve(optimizerTool) } : {}) }, null, 2) + '\n');
   if (configuration.includes('boot=ON')) {
     if (!generationRecord) { throw new Error('Boot requires trusted generation evidence'); }
     emit('boot-manifest.mjs', `export default ${JSON.stringify({ identity, ...manifest })};\n`);

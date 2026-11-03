@@ -1,5 +1,6 @@
 #include "browser/cache-fatx.h"
 #include <algorithm>
+#include <new>
 
 namespace browser {
 
@@ -9,6 +10,7 @@ bool CacheFatx::ValidTransfer(uint64_t offset, size_t length) {
 }
 
 bool CacheFatx::ValidFormat() const {
+  if (bytes_.size() != Capacity) { return false; }
   const auto read32 = [&](size_t offset) {
     uint32_t value = 0;
     for (uint32_t n = 0; n < 4; ++n) { value |= uint32_t(bytes_[offset + n]) << (n * 8); }
@@ -26,6 +28,12 @@ uint32_t CacheFatx::OpenRaw() {
   std::lock_guard lock(lock_);
   if (filesystem_) { return 0xc00000bb; }
   if (rawOpen_) { return 0xc0000043; }
+  if (bytes_.empty()) {
+    try {
+      std::vector<uint8_t> bytes(Capacity);
+      bytes_.swap(bytes);
+    } catch (const std::bad_alloc&) { return 0xc000009a; }
+  }
   rawOpen_ = true;
   dismounted_ = false;
   return 0;
@@ -66,12 +74,18 @@ uint32_t CacheFatx::Mount() {
   if (rawOpen_ || !dismounted_) { return 0xc00000a3; }
   if (!ValidFormat()) { return 0xc000014f; }
   filesystem_ = std::make_shared<TemporaryFilesystem>(UsableCapacity);
+  std::vector<uint8_t>().swap(bytes_);
   return 0;
 }
 
 bool CacheFatx::Mounted() const {
   std::lock_guard lock(lock_);
   return bool(filesystem_);
+}
+
+size_t CacheFatx::RawBackingBytes() const {
+  std::lock_guard lock(lock_);
+  return bytes_.capacity();
 }
 
 std::shared_ptr<TemporaryFilesystem> CacheFatx::Filesystem() const {

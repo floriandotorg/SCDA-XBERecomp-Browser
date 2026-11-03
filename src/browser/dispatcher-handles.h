@@ -17,7 +17,7 @@ class DispatcherHandles {
   };
   Dispatcher& dispatcher_;
   mutable std::mutex lock_;
-  std::array<Slot, 128> slots_{};
+  std::array<Slot, kDispatcherCapacity> slots_{};
   uint64_t nextHandle_ = 0x1000;
   Slot& Available();
   Slot& Find(uint32_t handle);
@@ -27,6 +27,8 @@ class DispatcherHandles {
 public:
   explicit DispatcherHandles(Dispatcher& dispatcher) : dispatcher_(dispatcher) {}
   uint32_t CreateEvent(bool notification, bool signaled);
+  uint32_t PublishThread(uint32_t handle);
+  void RollbackThread(uint32_t handle, uint32_t token);
   uint32_t CreateSemaphore(int32_t initial, int32_t limit);
   uint32_t CreateTimer(bool notification);
   uint32_t CreateMutant(uint32_t owner = 0);
@@ -40,6 +42,8 @@ public:
   Dispatcher::TimerState CancelTimerState(uint32_t handle);
   uint32_t Duplicate(uint32_t handle, bool closeSource = false);
   void Close(uint32_t handle);
+  bool Contains(uint32_t handle);
+  void RollbackCreate(uint32_t handle);
   int32_t SetEvent(uint32_t handle);
   int32_t ResetEvent(uint32_t handle);
   int32_t ReleaseSemaphore(uint32_t handle, int32_t count);

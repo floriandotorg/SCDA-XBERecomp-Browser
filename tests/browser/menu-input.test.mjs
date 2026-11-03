@@ -84,6 +84,32 @@ test('press release aliases opposing directions and repeat publish bounded lates
   input.dispose();
 });
 
+test('profile keyboard controls publish real analog buttons without synthesizing text', async () => {
+  const { input, words, key, focusTarget, MENU_INPUT } = await fixture();
+  const controls = [
+    ['KeyX', 'x', 2048], ['KeyY', 'y', 4096],
+    ['KeyQ', 'black', 8192], ['KeyE', 'white', 16384],
+    ['BracketLeft', 'leftTrigger', 32768], ['BracketRight', 'rightTrigger', 65536],
+  ];
+  for (const [code, name, mask] of controls) {
+    assert.equal(MENU_INPUT[name], mask);
+    assert.equal(key('keydown', code).defaultPrevented, true);
+    assert.equal(words[0], mask);
+    key('keyup', code);
+    assert.equal(words[0], 0);
+  }
+  key('keydown', 'KeyX');
+  focusTarget.dispatchEvent(new Event('blur'));
+  assert.equal(words[0], 0);
+  focusTarget.dispatchEvent(new Event('focus'));
+  key('keydown', 'KeyX', { repeat: true });
+  assert.equal(words[0], 0);
+  key('keyup', 'KeyX');
+  key('keydown', 'KeyX');
+  assert.equal(words[0], MENU_INPUT.x);
+  input.dispose();
+});
+
 test('blur hide reactivation and disposal clear without replaying held repeat keys', async () => {
   const { input, words, key, focusTarget, visibilityTarget, MENU_INPUT } = await fixture();
   key('keydown', 'Escape');
@@ -120,6 +146,102 @@ test('blur hide reactivation and disposal clear without replaying held repeat ke
   key('keydown', 'ArrowUp');
   assert.equal(words[0], 0);
   input.dispose();
+});
+
+test('host focus transfer clears held input and suppresses repeats until release', async () => {
+  const { input, words, key, target, MENU_INPUT } = await fixture();
+  const canvas = { closest: () => null };
+  const host = { closest: () => host };
+  const on = (element) => ({ composedPath: () => [element, target] });
+  key('keydown', 'ArrowDown', on(canvas));
+  assert.equal(words[0], MENU_INPUT.down);
+  const focusout = new Event('focusout');
+  Object.assign(focusout, { relatedTarget: host, composedPath: () => [canvas, target] });
+  target.dispatchEvent(focusout);
+  assert.equal(words[0], 0);
+  const focusin = new Event('focusin');
+  Object.assign(focusin, { composedPath: () => [host, target] });
+  target.dispatchEvent(focusin);
+  assert.equal(key('keydown', 'ArrowDown', { ...on(host), repeat: true }).defaultPrevented, false);
+  assert.equal(words[0], 0);
+  assert.equal(key('keydown', 'KeyW', on(host)).defaultPrevented, false);
+  key('keydown', 'ArrowDown', { ...on(canvas), repeat: true });
+  assert.equal(words[0], 0);
+  key('keyup', 'ArrowDown', on(host));
+  key('keydown', 'ArrowDown', on(canvas));
+  assert.equal(words[0], MENU_INPUT.down);
+  input.dispose();
+});
+
+test('fresh presses recover when key releases occurred outside the active document', async () => {
+  const { input, words, key, focusTarget, visibilityTarget, MENU_INPUT } = await fixture();
+  const suspend = [
+    [() => focusTarget.dispatchEvent(new Event('blur')), () => focusTarget.dispatchEvent(new Event('focus'))],
+    [() => { visibilityTarget.hidden = true; visibilityTarget.dispatchEvent(new Event('visibilitychange')); },
+      () => { visibilityTarget.hidden = false; visibilityTarget.dispatchEvent(new Event('visibilitychange')); }],
+    [() => input.setActive(false), () => input.setActive(true)],
+  ];
+  for (const [pause, resume] of suspend) {
+    key('keydown', 'ArrowDown');
+    assert.equal(words[0], MENU_INPUT.down);
+    pause();
+    assert.equal(words[0], 0);
+    resume();
+    for (let n = 0; n < 100; ++n) { key('keydown', 'ArrowDown', { repeat: true }); }
+    assert.equal(words[0], 0);
+    key('keydown', 'ArrowDown');
+    assert.equal(words[0], MENU_INPUT.down, 'fresh physical press must not require a stale keyup');
+    key('keyup', 'ArrowDown');
+    assert.equal(words[0], 0);
+  }
+  input.setActive(false);
+  key('keydown', 'Space');
+  input.setActive(true);
+  key('keydown', 'Space', { repeat: true });
+  assert.equal(words[0], 0);
+  key('keydown', 'Space');
+  assert.equal(words[0], MENU_INPUT.confirm);
+  input.dispose();
+});
+
+test('diagnostic summary focus clears game input and preserves native disclosure keys', async () => {
+  const { input, words, key, target, MENU_INPUT } = await fixture();
+  const canvas = { closest: () => null };
+  const summary = { closest: (selector) => selector.split(',').includes('summary') ? summary : null };
+  key('keydown', 'ArrowDown', { composedPath: () => [canvas, target] });
+  assert.equal(words[0], MENU_INPUT.down);
+  const focusout = new Event('focusout');
+  Object.assign(focusout, { relatedTarget: summary });
+  target.dispatchEvent(focusout);
+  assert.equal(words[0], 0);
+  for (const code of ['Enter', 'Space', 'ArrowLeft', 'ArrowRight']) {
+    assert.equal(key('keydown', code, { composedPath: () => [summary, target] }).defaultPrevented, false);
+    assert.equal(words[0], 0);
+    key('keyup', code, { composedPath: () => [summary, target] });
+  }
+  key('keyup', 'ArrowDown');
+  key('keydown', 'ArrowDown', { composedPath: () => [canvas, target] });
+  assert.equal(words[0], MENU_INPUT.down);
+  input.dispose();
+});
+
+test('reconnecting to a retired producer starts neutral and ignores stale repeats', async () => {
+  const { createMenuInput } = await import('../../src/browser/menu-input.mjs');
+  const { input, words, key, target, focusTarget, visibilityTarget, MENU_INPUT } = await fixture();
+  key('keydown', 'ArrowDown');
+  assert.equal(words[0], MENU_INPUT.down);
+  input.dispose();
+  assert.equal(words[0], 0);
+  const replacement = createMenuInput({ target, focusTarget, visibilityTarget, buffer: words.buffer, byteOffset: words.byteOffset });
+  key('keydown', 'ArrowDown', { repeat: true });
+  assert.equal(words[0], 0);
+  key('keydown', 'Space');
+  assert.equal(words[0], MENU_INPUT.confirm);
+  key('keyup', 'Space');
+  assert.equal(words[0], 0);
+  replacement.dispose();
+  key('keydown', 'Space');
+  assert.equal(words[0], 0);
 });
 
 test('shared input span validates bounds and exclusive producer ownership', async () => {

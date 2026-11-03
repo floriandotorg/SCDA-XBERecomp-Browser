@@ -33,6 +33,7 @@ class TimerQueue {
   bool ArmLocked(const X86Context& context, uint32_t timer, int64_t dueTime, uint32_t dpc, bool publish);
 public:
   TimerQueue(Runtime& runtime, PreparedImage& image) : runtime_(runtime), image_(image), memory_(image.memory.get()) {}
+  void TimeToTimeFields(X86Context& context, uint8_t* base);
   void Initialize(X86Context& context, uint8_t* base);
   void SetTimer(X86Context& context, uint8_t* base);
   bool Arm(const X86Context& context, uint32_t timer, int64_t dueTime, uint32_t dpc);

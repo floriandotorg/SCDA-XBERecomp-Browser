@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
 
 namespace browser {
 namespace {
@@ -19,6 +20,7 @@ const auto require = [](bool valid, const char* reason) {
   if (!valid) { throw std::runtime_error(reason); }
 };
 uint32_t address(uint32_t value) {
+  if (value >= 0xf0000000 && value < 0xf4000000) { return (value & 0x03ffffff) | 0x80000000; }
   return value && value < 0x04000000 ? value | 0x80000000 : value;
 }
 template<class T> void append(std::vector<uint8_t>& bytes, const T& value) {
@@ -177,13 +179,17 @@ struct MenuBackend::Impl {
     uint32_t id = 0;
     uint64_t version = 1;
     uint32_t command = 0;
+    uint32_t feedback = 0;
+    uint64_t feedbackVersion = 0;
     gpu::TextureDesc desc;
+    uint32_t headerAddress = 0;
     std::vector<uint8_t> header;
     std::set<uint32_t> views;
     std::vector<uint8_t> uploaded;
     std::vector<uint8_t> late;
     size_t residentBytes = 0;
     bool depth = false;
+    bool depthInitialized = false;
     bool dirty = false;
     uint64_t lateVersion = 0;
   };
@@ -193,7 +199,7 @@ struct MenuBackend::Impl {
   Execute execute;
   MenuBackendLimits limits;
   mutable std::recursive_mutex mutex;
-  std::map<uint32_t, Resource> resources;
+  std::map<uint64_t, Resource> resources;
   std::map<std::vector<uint8_t>, uint32_t> pipelines;
   std::map<uint32_t, std::pair<uint32_t, uint64_t>> uploadVersions;
   uint32_t white = 0;
@@ -203,6 +209,7 @@ struct MenuBackend::Impl {
   uint32_t nextFence = 0, completedFence = 0;
   uint64_t frames = 0, finishedFrames = 0;
   size_t resident = 0;
+  std::string storageViewFailure;
   std::map<uint32_t, uint32_t> fences;
   bool initialized = false;
 
@@ -226,7 +233,7 @@ struct MenuBackend::Impl {
     submitted = result.command;
     require(submittedCount != UINT64_MAX, "menu backend command counter budget exceeded");
     ++submittedCount;
-    if (opcode == webgpu::Opcode::Flush || opcode == webgpu::Opcode::Readback) {
+    if (opcode == webgpu::Opcode::Flush || opcode == webgpu::Opcode::Readback || opcode == webgpu::Opcode::Present) {
       completed = submitted; completedCount = submittedCount; finishedFrames = frames;
       for (auto found = fences.begin(); found != fences.end();) {
         if (found->second > completed) { break; }
@@ -292,6 +299,15 @@ struct MenuBackend::Impl {
     require(layout.supported, layout.diagnostic.c_str());
     return layout.total_bytes;
   }
+  size_t resourceCount() const {
+    return resources.size() + size_t(white != 0) + std::count_if(resources.begin(), resources.end(), [](const auto& entry) { return entry.second.feedback != 0; });
+  }
+  void observeView(Resource& item, uint32_t header) {
+    for (auto& [data, other] : resources) {
+      if (&other != &item) { other.views.erase(header); }
+    }
+    item.views.insert(header);
+  }
   Resource& ensure(uint32_t headerAddress, bool surface, bool depth = false) {
     require(headerAddress, "menu backend missing target resource");
     auto header = read(headerAddress, 20);
@@ -301,20 +317,40 @@ struct MenuBackend::Impl {
     }
     const uint64_t bytes = resourceBytes(desc, depth);
     require(bytes <= limits.maxResourceBytes, "menu backend resource byte budget exceeded");
-    auto found = resources.find(desc.data);
+    const uint64_t key = uint64_t(desc.data) * 2 + uint32_t(depth);
+    auto found = resources.find(key);
     for (const auto& [location, item] : resources) {
-      if (location != desc.data) {
+      if (item.desc.data != desc.data) {
         require(uint64_t(desc.data) + bytes <= item.desc.data || uint64_t(item.desc.data) + item.uploaded.size() <= desc.data, "menu backend unsupported overlapping GPU resource view");
       }
     }
     if (found != resources.end()) {
       auto& item = found->second;
-      require(item.depth == depth && item.desc.format == desc.format && item.desc.width == desc.width && item.desc.height == desc.height && item.desc.pitch == desc.pitch && item.desc.linear == desc.linear && item.uploaded.size() == bytes, "menu backend unsupported incompatible GPU storage view");
+      if (item.depth != depth || item.desc.format != desc.format || item.desc.width != desc.width || item.desc.height != desc.height || item.desc.pitch != desc.pitch || item.desc.linear != desc.linear || item.uploaded.size() != bytes) {
+        std::ostringstream diagnostic;
+        diagnostic << "menu backend unsupported incompatible GPU storage view";
+        const auto describeView = [&](const char* label, uint32_t location, const auto& words, const auto& view, bool isDepth, uint64_t count) {
+          diagnostic << " " << label << "{header=0x" << std::hex << location << " common=0x" << word(words, 0)
+            << " data=0x" << view.data << " format=0x" << word(words, 12) << " size=0x" << word(words, 16)
+            << std::dec << " width=" << view.width << " height=" << view.height << " pitch=" << view.pitch
+            << " linear=" << view.linear << " depth=" << isDepth << " bytes=" << count;
+        };
+        describeView("requested", headerAddress, header, desc, depth, bytes);
+        diagnostic << "}";
+        describeView("existing", item.headerAddress, item.header, item.desc, item.depth, item.uploaded.size());
+        diagnostic << " views=" << item.views.size() << " version=" << item.version << " dirty=" << item.dirty << "}";
+        storageViewFailure = diagnostic.str();
+        throw std::runtime_error(storageViewFailure);
+      }
       require(item.views.contains(headerAddress) || item.views.size() < limits.maxResources, "menu backend resource view count budget exceeded");
-      item.views.insert(headerAddress); item.header = header;
-      if (item.dirty || depth) { return item; }
+      observeView(item, headerAddress); item.headerAddress = headerAddress; item.header = header;
       auto source = read(desc.data, bytes);
       if (source == item.uploaded) { return item; }
+      if (depth && resources.contains(uint64_t(desc.data) * 2)) {
+        item.uploaded = std::move(source);
+        return item;
+      }
+      require(!depth, "menu backend unsupported CPU depth surface upload");
     }
     auto source = read(desc.data, bytes);
     std::vector<uint8_t> rgba;
@@ -325,7 +361,7 @@ struct MenuBackend::Impl {
     }
     const size_t residentBytes = size_t(bytes) + size_t(desc.width) * desc.height * 4;
     const size_t oldBytes = found == resources.end() ? 0 : found->second.residentBytes + found->second.late.size();
-    require(resources.size() + size_t(white != 0) < limits.maxResources || found != resources.end(), "menu backend resource count budget exceeded");
+    require(resourceCount() < limits.maxResources || found != resources.end(), "menu backend resource count budget exceeded");
     require(residentBytes <= limits.maxResidentBytes && resident - std::min(resident, oldBytes) <= limits.maxResidentBytes - residentBytes, "menu backend resident byte budget exceeded");
     const uint32_t id = newId();
     webgpu::TexturePacket packet{desc.width, desc.height, uint32_t(depth)};
@@ -336,25 +372,47 @@ struct MenuBackend::Impl {
     if (found != resources.end()) {
       version = found->second.version + 1;
       send(webgpu::Opcode::Destroy, found->second.id);
+      if (found->second.feedback) { send(webgpu::Opcode::Destroy, found->second.feedback); }
       resident -= std::min(resident, oldBytes);
     }
     Resource item;
     item.id = id; item.version = version; item.command = result.command;
-    item.desc = desc; item.header = std::move(header); item.uploaded = std::move(source); item.depth = depth; item.residentBytes = residentBytes;
+    item.desc = desc; item.headerAddress = headerAddress; item.header = std::move(header); item.uploaded = std::move(source); item.depth = depth; item.residentBytes = residentBytes;
     if (found != resources.end()) { item.views = std::move(found->second.views); }
     item.views.insert(headerAddress);
-    resources[desc.data] = std::move(item);
+    resources[key] = std::move(item);
     resident += residentBytes;
-    return resources.at(desc.data);
+    auto& stored = resources.at(key);
+    observeView(stored, headerAddress);
+    return stored;
   }
   Resource& surface(const gpu::Surface& value, bool depth = false) {
     auto& item = ensure(value.header, true, depth);
     require(item.desc.data == address(value.data) && word(item.header, 12) == value.format && word(item.header, 16) == value.size, "menu backend stale or incompatible surface descriptor");
     return item;
   }
+  uint32_t feedbackTexture(Resource& item) {
+    require(!item.depth, "menu backend unsupported depth feedback sampling");
+    if (!item.feedback) {
+      const size_t bytes = size_t(item.desc.width) * item.desc.height * 4;
+      require(resourceCount() < limits.maxResources, "menu backend feedback resource count budget exceeded");
+      require(bytes <= limits.maxResourceBytes && bytes <= limits.maxResidentBytes && resident <= limits.maxResidentBytes - bytes, "menu backend feedback resident byte budget exceeded");
+      std::vector<uint8_t> payload;
+      append(payload, webgpu::TexturePacket{item.desc.width, item.desc.height, 0});
+      payload.resize(payload.size() + bytes, 0);
+      const uint32_t id = newId();
+      send(webgpu::Opcode::CreateTexture, id, payload);
+      item.feedback = id; item.residentBytes += bytes; resident += bytes;
+    }
+    if (item.feedbackVersion != item.version) {
+      sendPacket(webgpu::Opcode::Copy, item.feedback, webgpu::CopyPacket{item.id, item.desc.width, item.desc.height});
+      item.feedbackVersion = item.version;
+    }
+    return item.feedback;
+  }
   uint32_t whiteTexture() {
     if (!white) {
-      require(resources.size() < limits.maxResources, "menu backend resource count budget exceeded");
+      require(resourceCount() < limits.maxResources, "menu backend resource count budget exceeded");
       require(limits.maxResidentBytes >= 8 && resident <= limits.maxResidentBytes - 8, "menu backend white texture resident budget exceeded");
       const webgpu::TexturePacket packet{1, 1, 0};
       std::vector<uint8_t> bytes;
@@ -381,7 +439,6 @@ struct MenuBackend::Impl {
   }
   std::vector<uint8_t> readback(Resource& item) {
     require(!item.depth && item.desc.linear && (item.desc.format == 0x12 || item.desc.format == 0x1e), "menu backend unsupported readback resource format");
-    require(readHeader(item), "menu backend stale resource header before readback");
     const auto result = send(webgpu::Opcode::Readback, item.id);
     require(result.bytes.size() == uint64_t(item.desc.width) * item.desc.height * 4, "menu backend GPU service invalid readback byte count");
     auto bytes = item.uploaded;
@@ -395,6 +452,23 @@ struct MenuBackend::Impl {
       }
     }
     return bytes;
+  }
+  void publish(Resource& item, std::span<const uint8_t> bytes, uint32_t offset, uint32_t size) {
+    memory->CheckRange({}, item.desc.data + offset, size);
+    for (uint32_t n = 0; n < item.desc.height; ++n) {
+      const size_t first = std::max(size_t(offset), size_t(n) * item.desc.pitch);
+      const size_t last = std::min(size_t(offset) + size, size_t(n) * item.desc.pitch + size_t(item.desc.width) * 4);
+      if (first < last) {
+        memory->Write({}, item.desc.data + uint32_t(first), bytes.data() + first, last - first);
+        std::copy_n(bytes.data() + first, last - first, item.uploaded.data() + first);
+        for (auto& [key, other] : resources) {
+          if (&other != &item && other.desc.data == item.desc.data && other.uploaded.size() == item.uploaded.size()) {
+            std::copy_n(bytes.data() + first, last - first, other.uploaded.data() + first);
+          }
+        }
+      }
+    }
+    if (offset == 0 && size == item.uploaded.size()) { item.uploaded = read(item.desc.data, item.uploaded.size()); }
   }
   void checkState(const gpu::State& state) {
     require(!state.rs[gpu::kRsStencilEnable], "menu backend unsupported stencil draw state");
@@ -420,14 +494,17 @@ MenuBackend::~MenuBackend() {
   try {
     std::lock_guard lock(impl_->mutex);
     for (const auto& [key, id] : impl_->pipelines) { impl_->send(webgpu::Opcode::Destroy, id); }
-    for (const auto& [header, item] : impl_->resources) { impl_->send(webgpu::Opcode::Destroy, item.id); }
+    for (const auto& [header, item] : impl_->resources) {
+      impl_->send(webgpu::Opcode::Destroy, item.id);
+      if (item.feedback) { impl_->send(webgpu::Opcode::Destroy, item.feedback); }
+    }
     if (impl_->white) { impl_->send(webgpu::Opcode::Destroy, impl_->white); }
   } catch (...) {}
 }
 MenuBackend::SnapshotData MenuBackend::Snapshot() const {
   std::lock_guard lock(impl_->mutex);
-  return {uint32_t(impl_->pipelines.size()), uint32_t(impl_->resources.size()) + uint32_t(impl_->white != 0), impl_->resident,
-    impl_->submittedCount, impl_->completedCount, impl_->frames};
+  return {uint32_t(impl_->pipelines.size()), uint32_t(impl_->resourceCount()), impl_->resident,
+    impl_->submittedCount, impl_->completedCount, impl_->frames, impl_->storageViewFailure};
 }
 bool MenuBackend::Init(uint32_t width, uint32_t height) {
   std::lock_guard lock(impl_->mutex);
@@ -482,7 +559,12 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   std::vector<RenderResourceRequest> requests;
   std::map<uint32_t, size_t> requestIndex;
   const auto addRequest = [&](RenderResourceKind kind, uint32_t header, uint32_t data, uint32_t bytes, uint64_t version, uint32_t gpuId = 0) {
-    if (header && requestIndex.contains(header)) { return; }
+    if (header && requestIndex.contains(header)) {
+      auto& request = requests.at(requestIndex.at(header));
+      require(request.kind == kind && request.payloadAddress == data, "menu backend incompatible shared resource binding");
+      request.payloadBytes = std::max(request.payloadBytes, bytes);
+      return;
+    }
     if (header) { requestIndex[header] = requests.size(); }
     uint32_t id = 0;
     if (kind == RenderResourceKind::Texture || kind == RenderResourceKind::Surface) {
@@ -513,17 +595,18 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   for (uint32_t n = 0; n < 4; ++n) {
     if (input.textures[n]) {
       auto& item = impl_->ensure(input.textures[n], false);
-      require(item.desc.data != address(input.rt.data), "menu backend unsupported render target feedback sampling");
       texinfo[n].kind = gpu::kTex2D; texinfo[n].rect = item.desc.linear;
       texsize[n] = {float(item.desc.width), float(item.desc.height), 1, 0};
-      packet.texture[n] = item.id;
+      packet.texture[n] = item.desc.data == address(input.rt.data) ? impl_->feedbackTexture(item) : item.id;
       addRequest(RenderResourceKind::Texture, input.textures[n], item.desc.data, uint32_t(item.uploaded.size()), item.version, item.id);
       const auto& sampling = input.tss[n];
-      require(!sampling[gpu::kTssMipLodBias] && !sampling[gpu::kTssMaxMipLevel] && sampling[gpu::kTssMaxAnisotropy] <= 1, "menu backend unsupported sampler mip or anisotropy state");
       packet.sampler[n][0] = samplerAddress(sampling[gpu::kTssAddressU]);
       packet.sampler[n][1] = samplerAddress(sampling[gpu::kTssAddressV]);
       const uint32_t mag = sampling[gpu::kTssMagFilter], min = sampling[gpu::kTssMinFilter], mip = sampling[gpu::kTssMipFilter];
       require(mag >= 1 && mag <= 2 && min >= 1 && min <= 2 && mip <= 2, "menu backend unsupported sampler filter");
+      const float bias = std::bit_cast<float>(sampling[gpu::kTssMipLodBias]);
+      require(std::isfinite(bias), "menu backend unsupported nonfinite sampler LOD bias");
+      require((bias == 0 && sampling[gpu::kTssMaxMipLevel] == 0) || (item.desc.levels == 1 && min == mag), "menu backend unsupported sampler LOD with unequal minification and magnification filters");
       packet.sampler[n][2] = mag; packet.sampler[n][3] = min; packet.sampler[n][4] = mip == 2 ? 2 : 1;
     } else {
       packet.texture[n] = impl_->whiteTexture();
@@ -532,24 +615,28 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   }
   auto& target = impl_->surface(input.rt);
   addRequest(RenderResourceKind::Surface, input.rt.header, target.desc.data, uint32_t(target.uploaded.size()), target.version, target.id);
-  if (input.zs.header) {
+  if (input.zs.header && input.rs[gpu::kRsZEnable]) {
     auto& depth = impl_->surface(input.zs, true);
     require(depth.desc.width == target.desc.width && depth.desc.height == target.desc.height, "menu backend incompatible depth target dimensions");
+    require(!input.rs[gpu::kRsZEnable] || depth.depthInitialized, "menu backend unsupported uncleared depth contents");
     packet.depth_target = depth.id;
     addRequest(RenderResourceKind::Surface, input.zs.header, depth.desc.data, uint32_t(depth.uploaded.size()), depth.version, depth.id);
   }
+  require(!input.rs[gpu::kRsZEnable] || input.zs.header, "menu backend missing depth target for depth-tested draw");
   if (input.index_buffer) {
     auto header = impl_->read(input.index_buffer, 12);
     const uint32_t data = address(word(header, 4));
     require(!input.index_data || address(input.index_data) == data, "menu backend incompatible index buffer data binding");
     addRequest(RenderResourceKind::IndexBuffer, input.index_buffer, data, indices ? count * 2 : 1, 1);
   } else if (input.index_data) {
-    addRequest(RenderResourceKind::IndexData, 0, input.index_data, indices ? count * 2 : 1, 1);
+    addRequest(RenderResourceKind::IndexData, 0, address(input.index_data), indices ? count * 2 : 1, 1);
   }
   RenderSnapshotLimits snapshotLimits;
   snapshotLimits.maxResources = budget.maxResources; snapshotLimits.maxPayloadBytes = budget.maxResourceBytes;
   snapshotLimits.maxTotalBytes = budget.maxResidentBytes;
-  auto snapshot = CaptureRenderSnapshot({}, *impl_->memory, input, requests, snapshotLimits);
+  auto consumedState = input;
+  if (!packet.depth_target) { consumedState.zs = {}; }
+  auto snapshot = CaptureRenderSnapshot({}, *impl_->memory, consumedState, requests, snapshotLimits);
   auto& state = snapshot.state;
   if (snapshot.vertexShader) { state.vs = std::make_shared<gpu::VertexShader>(*snapshot.vertexShader); }
   if (snapshot.pixelShader) { state.ps = std::make_shared<gpu::PixelShader>(*snapshot.pixelShader); }
@@ -589,7 +676,7 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   for (const auto& element : layout.inputs) { append(key, element.stream); append(key, element.offset); append(key, element.type); }
   for (const auto& stream : state.streams) { append(key, stream.stride); }
   append(key, layout.stream_stride); append(key, state.vs_handle);
-  append(key, state.rt.format); append(key, state.rt.size); append(key, state.zs.format);
+  append(key, state.rt.format); append(key, state.rt.size); append(key, packet.depth_target ? state.zs.format : 0u);
   key.insert(key.end(), shaders.vertex.begin(), shaders.vertex.end()); key.insert(key.end(), shaders.fragment.begin(), shaders.fragment.end());
   auto foundPipeline = impl_->pipelines.find(key);
   if (foundPipeline == impl_->pipelines.end()) {
@@ -597,7 +684,8 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     std::vector<uint8_t> bytes;
     append(bytes, pipeline); bytes.insert(bytes.end(), shaders.vertex.begin(), shaders.vertex.end()); bytes.insert(bytes.end(), shaders.fragment.begin(), shaders.fragment.end());
     const uint32_t id = impl_->newId();
-    impl_->send(webgpu::Opcode::CreatePipeline, id, bytes);
+    try { impl_->send(webgpu::Opcode::CreatePipeline, id, bytes); }
+    catch (const std::exception& error) { throw std::runtime_error(menu::DescribeShaderFailure(shaders, error.what())); }
     foundPipeline = impl_->pipelines.emplace(std::move(key), id).first;
   }
   std::vector<float> vertices(order.size() * 64, 0);
@@ -620,23 +708,25 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   packet.uniform_bytes = sizeof(constants);
   require(uint64_t(state.viewport.x) + state.viewport.w <= target.desc.width && uint64_t(state.viewport.y) + state.viewport.h <= target.desc.height && state.viewport.w && state.viewport.h, "menu backend unsupported viewport outside target");
   require(std::isfinite(state.viewport.min_z) && std::isfinite(state.viewport.max_z) && state.viewport.min_z >= 0 && state.viewport.max_z <= 1 && state.viewport.min_z <= state.viewport.max_z, "menu backend unsupported viewport depth range");
-  packet.viewport[0] = float(state.viewport.x); packet.viewport[1] = float(state.viewport.y);
-  packet.viewport[2] = float(state.viewport.w); packet.viewport[3] = float(state.viewport.h);
-  packet.viewport[4] = state.viewport.min_z; packet.viewport[5] = state.viewport.max_z;
-  packet.scissor[2] = target.desc.width; packet.scissor[3] = target.desc.height;
+  packet.viewport[2] = float(target.desc.width); packet.viewport[3] = float(target.desc.height);
+  packet.viewport[5] = 1;
+  uint32_t left = state.viewport.x, top = state.viewport.y;
+  uint32_t right = left + state.viewport.w, bottom = top + state.viewport.h;
   if (state.scissor_count) {
     require(state.scissors[0] <= state.scissors[2] && state.scissors[1] <= state.scissors[3] && state.scissors[2] <= target.desc.width && state.scissors[3] <= target.desc.height, "menu backend unsupported scissor outside target");
-    packet.scissor[0] = state.scissors[0]; packet.scissor[1] = state.scissors[1];
-    packet.scissor[2] = state.scissors[2] - state.scissors[0]; packet.scissor[3] = state.scissors[3] - state.scissors[1];
+    left = std::max(left, state.scissors[0]); top = std::max(top, state.scissors[1]);
+    right = std::min(right, state.scissors[2]); bottom = std::min(bottom, state.scissors[3]);
   }
+  packet.scissor[0] = left; packet.scissor[1] = top;
+  packet.scissor[2] = std::max(right, left) - left; packet.scissor[3] = std::max(bottom, top) - top;
   std::vector<uint8_t> bytes;
   append(bytes, packet);
   appendBytes(bytes, {reinterpret_cast<const uint8_t*>(vertices.data()), vertices.size() * sizeof(float)});
   append(bytes, constants);
   const auto result = impl_->send(webgpu::Opcode::Draw, target.id, bytes);
   target.dirty = true; target.command = result.command; ++target.version;
-  if (state.zs.header) {
-    auto& depth = impl_->resources.at(address(state.zs.data));
+  if (packet.depth_target) {
+    auto& depth = impl_->resources.at(uint64_t(address(state.zs.data)) * 2 + 1);
     depth.dirty = true; depth.command = result.command; ++depth.version;
   }
 }
@@ -658,7 +748,10 @@ void MenuBackend::Clear(const gpu::State& state, uint32_t count, const uint8_t* 
   if (flags & gpu::kClearStencil) { packet.flags |= 4; }
   const auto result = impl_->sendPacket(webgpu::Opcode::Clear, target, packet);
   for (auto& [header, item] : impl_->resources) {
-    if (item.id == target || item.id == packet.depth_target) { item.dirty = true; item.command = result.command; ++item.version; }
+    if (item.id == target || item.id == packet.depth_target) {
+      item.depthInitialized |= item.id == packet.depth_target && (flags & gpu::kClearZ) != 0;
+      item.dirty = true; item.command = result.command; ++item.version;
+    }
   }
 }
 void MenuBackend::Copy(const gpu::Surface& source, const gpu::Surface& destination, uint32_t count, uint32_t sourceRects, uint32_t destinationPoints) {
@@ -675,7 +768,7 @@ void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
   require(impl_->initialized, "menu backend present before initialization");
   auto& item = impl_->surface(front);
   const auto result = impl_->sendPacket(webgpu::Opcode::Present, item.id, webgpu::PresentPacket{uint32_t(pillarbox)});
-  item.command = result.command; ++impl_->frames;
+  item.command = result.command; ++impl_->frames; impl_->finishedFrames = impl_->frames;
 }
 void MenuBackend::Sync(uint32_t location, uint32_t size) {
   std::lock_guard lock(impl_->mutex);
@@ -685,14 +778,14 @@ void MenuBackend::Sync(uint32_t location, uint32_t size) {
   require(uint64_t(address(location)) + size <= uint64_t(item.desc.data) + item.uploaded.size(), "menu backend readback range exceeds resource");
   auto bytes = impl_->readback(item);
   const size_t offset = address(location) - item.desc.data;
-  impl_->memory->Write({}, address(location), bytes.data() + offset, size);
-  std::copy_n(bytes.data() + offset, size, item.uploaded.data() + offset);
+  impl_->publish(item, bytes, uint32_t(offset), size);
   if (offset == 0 && size == item.uploaded.size()) { item.dirty = false; }
 }
 void MenuBackend::RecordLate(uint32_t location) {
   std::lock_guard lock(impl_->mutex);
   auto& item = impl_->byAddress(location);
   const size_t extra = item.uploaded.size();
+  require(impl_->readHeader(item), "menu backend stale resource header before late readback");
   require(extra <= impl_->limits.maxResidentBytes && impl_->resident - item.late.size() <= impl_->limits.maxResidentBytes - extra, "menu backend late readback resident budget exceeded");
   auto bytes = impl_->readback(item);
   impl_->resident = impl_->resident - item.late.size() + bytes.size();
@@ -704,11 +797,10 @@ bool MenuBackend::DeliverLate(uint32_t location) {
   auto& item = impl_->byAddress(location);
   if (item.late.empty()) { return false; }
   require(impl_->readHeader(item), "menu backend stale late readback resource header");
-  impl_->memory->Write({}, item.desc.data, item.late.data(), item.late.size());
+  impl_->publish(item, item.late, 0, uint32_t(item.late.size()));
   impl_->resident -= item.late.size();
-  item.uploaded = std::move(item.late);
   item.dirty = item.version != item.lateVersion;
-  item.late.clear();
+  item.late = std::vector<uint8_t>{};
   return true;
 }
 void MenuBackend::SyncLate(uint32_t location) {
@@ -730,9 +822,14 @@ void MenuBackend::ApplyShadows(const gpu::State&) { throw std::runtime_error("me
 uint32_t MenuBackend::Fence() {
   std::lock_guard lock(impl_->mutex);
   require(impl_->nextFence != UINT32_MAX, "menu backend fence budget exhausted");
-  const uint32_t fence = ++impl_->nextFence;
   require(impl_->fences.size() < 4096, "menu backend pending fence budget exceeded");
-  impl_->fences[fence] = impl_->submitted;
+  const uint32_t fence = impl_->nextFence + 1;
+  if (impl_->submitted <= impl_->completed) {
+    impl_->completedFence = fence;
+  } else {
+    impl_->fences.emplace(fence, impl_->submitted);
+  }
+  impl_->nextFence = fence;
   return fence;
 }
 bool MenuBackend::FencePending(uint32_t fence) {
@@ -749,9 +846,28 @@ bool MenuBackend::Busy(uint32_t resource) {
   for (const auto& [location, item] : impl_->resources) {
     if (item.views.contains(resource)) { return item.command > impl_->completed; }
   }
+  if (impl_->uploadVersions.contains(resource)) { return false; }
   return impl_->byAddress(resource).command > impl_->completed;
 }
 void MenuBackend::WaitResource(uint32_t resource) { if (Busy(resource)) { Flush(); } }
+bool MenuBackend::ReleaseResource(uint32_t header, uint32_t data) {
+  std::lock_guard lock(impl_->mutex);
+  impl_->requireOwner();
+  impl_->uploadVersions.erase(header);
+  auto found = std::find_if(impl_->resources.begin(), impl_->resources.end(), [&](const auto& entry) {
+    return entry.second.desc.data == address(data) && entry.second.views.contains(header);
+  });
+  if (found == impl_->resources.end()) { return false; }
+  auto& item = found->second;
+  if (item.views.size() > 1) { item.views.erase(header); return false; }
+  if (item.feedback) { impl_->send(webgpu::Opcode::Destroy, item.feedback); item.feedback = 0; }
+  impl_->send(webgpu::Opcode::Destroy, item.id);
+  impl_->resident -= item.residentBytes + item.late.size();
+  impl_->resources.erase(found);
+  return std::none_of(impl_->resources.begin(), impl_->resources.end(), [&](const auto& entry) {
+    return entry.second.desc.data == address(data);
+  });
+}
 void MenuBackend::WaitGpuFrame(uint64_t frame) {
   std::lock_guard lock(impl_->mutex);
   require(frame < impl_->frames, "menu backend cannot wait for unsubmitted frame");

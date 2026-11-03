@@ -12,6 +12,19 @@ const views = mailbox => {
   return { header: new Int32Array(buffer, offset, 16), bytes: new Uint8Array(buffer, offset + HEADER_BYTES, MAX_BYTES) };
 };
 const delay = () => new Promise(resolve => setTimeout(resolve, 1));
+export const waitForMailboxRequest = async mailbox => {
+  const { header } = views(mailbox);
+  for (;;) {
+    const state = Atomics.load(header, 0);
+    if (state === 1) { return true; }
+    if (state === 4) { return false; }
+    if (typeof Atomics.waitAsync === 'function') {
+      await Atomics.waitAsync(header, 0, state).value;
+    } else {
+      await delay();
+    }
+  }
+};
 export const closeMailbox = (mailbox, status = Status.Closed) => {
   const { header } = views(mailbox);
   Atomics.store(header, 7, status);
@@ -58,7 +71,13 @@ export class MailboxClient {
         closeMailbox(this.mailbox);
         break;
       }
-      await delay();
+      const waiting = Atomics.load(header, 0);
+      if (waiting >= 3) { break; }
+      if (typeof Atomics.waitAsync === 'function') {
+        await Atomics.waitAsync(header, 0, waiting, Math.max(1, deadline - Date.now())).value;
+      } else {
+        await delay();
+      }
     }
     if (header[5] < 0 || header[5] > MAX_BYTES || header[6] < 0 || header[6] > Status.Lost || (header[1] >>> 0) !== command || (header[3] >>> 0) !== resource) {
       closeMailbox(this.mailbox, Status.Error);
@@ -66,6 +85,7 @@ export class MailboxClient {
     const terminal = Atomics.load(header, 0) === 4;
     const result = { command, resource, status: terminal ? header[7] : header[6], bytes: terminal ? new Uint8Array() : bytes.slice(0, header[5]) };
     Atomics.compareExchange(header, 0, 3, 0);
+    Atomics.notify(header, 0);
     return result;
   }
   close() {

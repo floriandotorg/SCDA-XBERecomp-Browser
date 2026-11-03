@@ -14,6 +14,39 @@ option(BROWSER_FULL_CPU "Build CPU contracts with all compact story functions an
 option(BROWSER_BOOT "Build integrated story boot preflight" OFF)
 option(BROWSER_MENU_CAPTURE "Capture real menu initialization without rendering" OFF)
 option(BROWSER_MENU "Build the WebGPU menu integration" OFF)
+option(BROWSER_ACTUAL_TAIL_CALLS "Apply Binaryen 133 actual-tail-call pass to the final story boot Wasm only" OFF)
+set(BROWSER_WASM_OPT "" CACHE FILEPATH "Pinned Binaryen 133 wasm-opt executable for actual tail calls")
+if(BROWSER_ACTUAL_TAIL_CALLS)
+    set(BROWSER_ACTUAL_TAIL_CALLS ON)
+    if(NOT BROWSER_BOOT)
+        message(FATAL_ERROR "BROWSER_ACTUAL_TAIL_CALLS requires BROWSER_BOOT")
+    endif()
+    if(NOT BROWSER_WASM_OPT OR NOT EXISTS "${BROWSER_WASM_OPT}")
+        message(FATAL_ERROR "BROWSER_ACTUAL_TAIL_CALLS requires BROWSER_WASM_OPT pointing to Binaryen 133")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${BROWSER_WASM_OPT}")
+else()
+    set(BROWSER_ACTUAL_TAIL_CALLS OFF)
+endif()
+option(BROWSER_MENU_TRACE_ABORTS "Trusted menu diagnostic: preserve Wasm names and capture original abort callers" OFF)
+if(BROWSER_MENU_TRACE_ABORTS)
+    set(BROWSER_MENU_TRACE_ABORTS ON)
+else()
+    set(BROWSER_MENU_TRACE_ABORTS OFF)
+endif()
+if(BROWSER_MENU_TRACE_ABORTS AND NOT BROWSER_MENU)
+    message(FATAL_ERROR "BROWSER_MENU_TRACE_ABORTS requires BROWSER_MENU")
+endif()
+set(BROWSER_MENU_TRACE_FRAMES "0" CACHE STRING "Trusted menu diagnostic checkpoint after completed backend Presents; 0 disables")
+if(NOT BROWSER_MENU_TRACE_FRAMES MATCHES "^(0|[1-9][0-9]*)$")
+    message(FATAL_ERROR "BROWSER_MENU_TRACE_FRAMES must be an integer from 0 through 10000")
+endif()
+if(BROWSER_MENU_TRACE_FRAMES GREATER 10000)
+    message(FATAL_ERROR "BROWSER_MENU_TRACE_FRAMES must be an integer from 0 through 10000")
+endif()
+if(BROWSER_MENU_TRACE_FRAMES AND NOT BROWSER_MENU)
+    message(FATAL_ERROR "BROWSER_MENU_TRACE_FRAMES requires BROWSER_MENU")
+endif()
 if((BROWSER_MENU_CAPTURE OR BROWSER_MENU) AND NOT BROWSER_BOOT)
     message(FATAL_ERROR "Browser menu modes require BROWSER_BOOT")
 endif()
@@ -35,62 +68,35 @@ set(story_sources ${root}/generated/game/x86_func_mapping.cpp)
 foreach(n RANGE 0 127)
     list(APPEND story_sources ${root}/generated/game/x86_recomp.${n}.cpp)
 endforeach()
-set(identity_inputs ${story_sources} ${root}/CMakeLists.txt ${root}/src/browser/diagnostic_service.h
-    ${root}/generated/game/x86_recomp_shared.h ${root}/generated/game/image_symbols.h
-    ${root}/config/scda_v2.toml ${root}/config/xdk_symbols.toml
-    ${root}/src/cpu/x86_ops.h ${root}/src/cpu/x86_context.h
-    ${root}/src/browser/diagnostic.cpp ${root}/src/browser/placeholders.cpp
-    ${root}/src/browser/index.html ${root}/src/browser/diagnostic.mjs
-    ${CMAKE_CURRENT_SOURCE_DIR}/inventory.mjs ${CMAKE_CURRENT_LIST_FILE})
-list(APPEND identity_inputs ${CMAKE_CURRENT_SOURCE_DIR}/provenance.mjs)
-if(BROWSER_GENERATION_RECORD)
-    list(APPEND identity_inputs ${BROWSER_GENERATION_RECORD} ${root}/assets/default.xbe)
-    file(GLOB generator_inputs ${root}/tools/recomp/*.cpp ${root}/tools/recomp/*.h)
-    list(APPEND identity_inputs ${generator_inputs} ${root}/src/xbe/xbe.h
-        ${root}/generated/game/exports.def ${root}/generated/game/imports.def ${root}/generated/game/x86_recomp_stats.txt)
-endif()
-if(BROWSER_FULL_CPU OR BROWSER_BOOT)
-    list(APPEND identity_inputs ${root}/src/browser/cpu_runtime.h ${root}/src/browser/cpu_runtime.cpp
-        ${root}/tests/browser/cpu.cpp ${root}/tests/browser/full-cpu.html
-        ${CMAKE_CURRENT_SOURCE_DIR}/adapt-memory.mjs ${CMAKE_CURRENT_SOURCE_DIR}/adapt-arithmetic.mjs
-        ${CMAKE_CURRENT_SOURCE_DIR}/prepare-cpu.mjs)
-endif()
-set(boot_modules boot-worker.mjs boot-session.mjs boot-controller.mjs boot-runtime.mjs boot-shell.mjs
+set(boot_modules boot-worker.mjs boot-session.mjs menu-state-report.mjs boot-controller.mjs boot-runtime.mjs boot-shell.mjs wasm-capabilities.mjs
     boot-worker-broker.mjs boot-worker-host.mjs boot.html iso-reader.mjs iso-mailbox.mjs iso-wasm.mjs iso-io-service.mjs
     iso-io-worker.mjs iso-validation.mjs iso-image.mjs)
+if(BROWSER_GENERATION_RECORD)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${BROWSER_GENERATION_RECORD} ${root}/assets/default.xbe)
+    file(GLOB generator_inputs CONFIGURE_DEPENDS ${root}/tools/recomp/*.cpp ${root}/tools/recomp/*.h)
+endif()
 if(BROWSER_BOOT)
     file(GLOB kernel_declarations CONFIGURE_DEPENDS ${root}/src/kernel/*.cpp)
-    list(APPEND identity_inputs ${kernel_declarations} ${CMAKE_CURRENT_SOURCE_DIR}/export-catalog.mjs)
-    foreach(module IN LISTS boot_modules)
-        list(APPEND identity_inputs ${root}/src/browser/${module})
-    endforeach()
-    list(APPEND identity_inputs ${root}/src/browser/boot-wasm.cpp ${root}/src/browser/disc-wasm.cpp
-        ${root}/src/browser/image.cpp ${root}/src/browser/image.h
-        ${root}/src/browser/kernel-provider.cpp ${root}/src/browser/kernel-provider.h
-        ${root}/src/browser/virtual-memory.cpp ${root}/src/browser/virtual-memory.h
-        ${root}/src/browser/contiguous-memory.cpp ${root}/src/browser/contiguous-memory.h
-        ${root}/src/browser/string-provider.cpp ${root}/src/browser/string-provider.h
-        ${root}/src/browser/section-provider.cpp ${root}/src/browser/section-provider.h
-        ${root}/src/browser/file-provider.cpp ${root}/src/browser/file-provider.h
-        ${root}/src/browser/temporary-filesystem.cpp ${root}/src/browser/temporary-filesystem.h
-        ${root}/src/browser/raw-cache.cpp ${root}/src/browser/raw-cache.h
-        ${root}/src/browser/cache-fatx.cpp ${root}/src/browser/cache-fatx.h
-        ${root}/src/browser/thread-provider.cpp ${root}/src/browser/thread-provider.h
-        ${root}/src/browser/platform-profile.cpp ${root}/src/browser/platform-profile.h
-        ${root}/src/browser/shutdown-provider.cpp ${root}/src/browser/shutdown-provider.h
-        ${root}/src/browser/dpc-provider.cpp ${root}/src/browser/dpc-provider.h
-        ${root}/src/browser/timer-provider.cpp ${root}/src/browser/timer-provider.h
-        ${root}/src/browser/sdk-provider.cpp ${root}/src/browser/sdk-provider.h
-        ${root}/src/browser/diagnostic-graphics.cpp ${root}/src/browser/diagnostic-graphics.h
-        ${root}/src/gpu/backend.h ${root}/src/gpu/state.h
-        ${root}/src/browser/silent-audio.cpp ${root}/src/browser/silent-audio.h ${root}/src/audio/output.h
-        ${root}/src/kernel/crypto.cpp ${root}/src/kernel/crypto.h ${root}/src/kernel/disc_index.cpp
-        ${root}/src/kernel/disc_index.h ${root}/src/browser/iso-validation.mjs ${root}/src/browser/iso-image.mjs)
 endif()
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${identity_inputs})
 execute_process(COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/inventory.mjs
-    ${root} ${CMAKE_CURRENT_BINARY_DIR} "${compiler_identity}" "${CMAKE_BUILD_TYPE};story=${BROWSER_STORY};full-cpu=${BROWSER_FULL_CPU};boot=${BROWSER_BOOT};menu-capture=${BROWSER_MENU_CAPTURE};menu=${BROWSER_MENU}" "${BROWSER_GENERATION_RECORD}"
+    ${root} ${CMAKE_CURRENT_BINARY_DIR} "${compiler_identity}" "${CMAKE_BUILD_TYPE};story=${BROWSER_STORY};full-cpu=${BROWSER_FULL_CPU};boot=${BROWSER_BOOT};menu-capture=${BROWSER_MENU_CAPTURE};menu=${BROWSER_MENU};menu-trace-frames=${BROWSER_MENU_TRACE_FRAMES};menu-trace-aborts=${BROWSER_MENU_TRACE_ABORTS};actual-tail-calls=${BROWSER_ACTUAL_TAIL_CALLS}" "${BROWSER_GENERATION_RECORD}" "${BROWSER_WASM_OPT}"
     COMMAND_ERROR_IS_FATAL ANY)
+file(READ ${CMAKE_CURRENT_BINARY_DIR}/input-manifest.json input_manifest)
+string(JSON input_count LENGTH "${input_manifest}" inputs)
+if(input_count LESS 1)
+    message(FATAL_ERROR "Browser input manifest has no inputs")
+endif()
+math(EXPR last_input "${input_count} - 1")
+set(identity_inputs)
+foreach(n RANGE 0 ${last_input})
+    string(JSON input_path MEMBER "${input_manifest}" inputs ${n})
+    if(IS_ABSOLUTE "${input_path}")
+        list(APPEND identity_inputs "${input_path}")
+    else()
+        list(APPEND identity_inputs "${root}/${input_path}")
+    endif()
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${identity_inputs})
 
 add_library(browser_flags INTERFACE)
 target_compile_options(browser_flags INTERFACE -fwasm-exceptions -pthread -fno-strict-aliasing)
@@ -98,6 +104,43 @@ target_link_options(browser_flags INTERFACE -fwasm-exceptions -pthread -sMODULAR
     -sENVIRONMENT=web,node -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=67108864 -sMAXIMUM_MEMORY=268435456
     -sERROR_ON_UNDEFINED_SYMBOLS=1 -sFILESYSTEM=0)
 target_include_directories(browser_flags INTERFACE ${root}/src ${CMAKE_CURRENT_BINARY_DIR})
+
+function(browser_publish_boot)
+    set(raw ${CMAKE_CURRENT_BINARY_DIR}/boot-link)
+    set(final ${CMAKE_BINARY_DIR}/boot-web)
+    set(helper ${root}/tools/browser/tail-call-postlink.mjs)
+    set(postlink ${CMAKE_CURRENT_BINARY_DIR}/wasm-postlink.json)
+    set(manifest ${CMAKE_CURRENT_BINARY_DIR}/boot-manifest.mjs)
+    set(stamp ${CMAKE_CURRENT_BINARY_DIR}/boot-publication.complete)
+    set(state ${CMAKE_CURRENT_BINARY_DIR}/boot-publication.policy)
+    file(SHA256 ${postlink} postlink_identity)
+    file(SHA256 ${manifest} manifest_identity)
+    set(policy "${postlink_identity};${manifest_identity}")
+    set(previous_policy "")
+    if(EXISTS ${state})
+        file(READ ${state} previous_policy)
+    endif()
+    if(NOT previous_policy STREQUAL policy)
+        file(REMOVE ${stamp})
+        file(WRITE ${state} "${policy}")
+    endif()
+    set_target_properties(story_boot_link PROPERTIES OUTPUT_NAME story_boot RUNTIME_OUTPUT_DIRECTORY ${raw} SUFFIX .mjs)
+    add_custom_command(TARGET story_boot_link POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E true
+        BYPRODUCTS ${raw}/story_boot.wasm
+        VERBATIM)
+    set(dependencies story_boot_link ${raw}/story_boot.wasm ${helper} ${postlink} ${manifest})
+    if(BROWSER_ACTUAL_TAIL_CALLS)
+        list(APPEND dependencies "${BROWSER_WASM_OPT}")
+    endif()
+    add_custom_command(OUTPUT ${stamp} ${final}/story_boot.wasm ${final}/story_boot.mjs ${final}/boot-manifest.mjs
+        COMMAND ${NODE_EXECUTABLE} ${helper} ${raw}/story_boot.wasm ${final}/story_boot.wasm ${postlink}
+            ${raw}/story_boot.mjs ${final}/story_boot.mjs ${manifest} ${final}/boot-manifest.mjs
+        COMMAND ${CMAKE_COMMAND} -E touch ${stamp}
+        DEPENDS ${dependencies}
+        VERBATIM)
+    add_custom_target(story_boot ALL DEPENDS ${stamp} ${final}/story_boot.wasm ${final}/story_boot.mjs ${final}/boot-manifest.mjs)
+endfunction()
 
 add_executable(story_diagnostic ${root}/src/browser/diagnostic.cpp ${root}/src/browser/placeholders.cpp)
 target_link_libraries(story_diagnostic PRIVATE browser_flags)
@@ -127,22 +170,27 @@ if(BROWSER_FULL_CPU OR BROWSER_BOOT)
 endif()
 
 if(BROWSER_BOOT)
-    add_executable(story_boot ${root}/src/browser/boot-wasm.cpp ${root}/src/browser/disc-wasm.cpp
-        ${root}/src/browser/cpu_runtime.cpp ${root}/src/browser/kernel-provider.cpp ${root}/src/browser/virtual-memory.cpp ${root}/src/browser/contiguous-memory.cpp ${root}/src/browser/string-provider.cpp ${root}/src/browser/section-provider.cpp ${root}/src/browser/file-provider.cpp ${root}/src/browser/temporary-filesystem.cpp ${root}/src/browser/raw-cache.cpp ${root}/src/browser/cache-fatx.cpp ${root}/src/browser/thread-provider.cpp ${root}/src/kernel/crypto.cpp
-        ${root}/src/browser/image.cpp ${root}/src/browser/platform-profile.cpp ${root}/src/browser/shutdown-provider.cpp ${root}/src/browser/dpc-provider.cpp ${root}/src/browser/timer-provider.cpp ${root}/src/browser/sdk-provider.cpp ${root}/src/browser/diagnostic-graphics.cpp ${root}/src/browser/push-state.cpp ${root}/src/browser/silent-audio.cpp ${root}/src/kernel/disc_index.cpp ${compact_sources})
-    target_link_libraries(story_boot PRIVATE browser_flags)
-    target_include_directories(story_boot PRIVATE ${root}/generated/game)
-    target_compile_definitions(story_boot PRIVATE X86_COMPACT_MEMORY)
+    add_executable(story_boot_link ${root}/src/browser/boot-wasm.cpp ${root}/src/browser/disc-wasm.cpp
+        ${root}/src/browser/cpu_runtime.cpp ${root}/src/browser/kernel-provider.cpp ${root}/src/browser/virtual-memory.cpp ${root}/src/browser/contiguous-memory.cpp ${root}/src/browser/string-provider.cpp ${root}/src/browser/section-provider.cpp ${root}/src/browser/file-provider.cpp ${root}/src/browser/temporary-filesystem.cpp ${root}/src/browser/raw-cache.cpp ${root}/src/browser/cache-fatx.cpp ${root}/src/browser/thread-provider.cpp ${root}/src/browser/synchronization-provider.cpp ${root}/src/browser/dispatcher.cpp ${root}/src/browser/dispatcher-handles.cpp ${root}/src/browser/dispatcher-object-abi.cpp ${root}/src/browser/guest-wait.cpp ${root}/src/kernel/crypto.cpp
+        ${root}/src/browser/image.cpp ${root}/src/browser/platform-profile.cpp ${root}/src/browser/shutdown-provider.cpp ${root}/src/browser/dpc-provider.cpp ${root}/src/browser/timer-provider.cpp ${root}/src/browser/sdk-provider.cpp ${root}/src/browser/diagnostic-graphics.cpp ${root}/src/browser/diagnostic-shaders.cpp ${root}/src/browser/push-state.cpp ${root}/src/browser/silent-audio.cpp ${root}/src/browser/audio-core.cpp ${root}/src/browser/audio-effects.cpp ${root}/src/browser/audio-provider.cpp ${root}/src/kernel/disc_index.cpp ${compact_sources})
+    target_link_libraries(story_boot_link PRIVATE browser_flags)
+    target_include_directories(story_boot_link PRIVATE ${root}/generated/game)
+    target_compile_definitions(story_boot_link PRIVATE X86_COMPACT_MEMORY)
     if(BROWSER_MENU_CAPTURE)
         set_property(SOURCE ${root}/src/browser/boot-wasm.cpp PROPERTY COMPILE_DEFINITIONS BROWSER_MENU_CAPTURE=1)
     endif()
     if(BROWSER_MENU OR BROWSER_MENU_CAPTURE)
-        target_sources(story_boot PRIVATE ${root}/src/browser/menu-input.cpp ${root}/src/browser/menu-launch.cpp ${root}/src/browser/menu-route.cpp)
+        target_sources(story_boot_link PRIVATE ${root}/src/browser/av-provider.cpp ${root}/src/browser/delay-provider.cpp ${root}/src/browser/menu-input.cpp ${root}/src/browser/menu-launch.cpp ${root}/src/browser/menu-route.cpp)
     endif()
     if(BROWSER_MENU)
-        set_property(SOURCE ${root}/src/browser/boot-wasm.cpp PROPERTY COMPILE_DEFINITIONS BROWSER_MENU=1)
-        target_sources(story_boot PRIVATE ${root}/src/browser/menu-backend.cpp ${root}/src/browser/menu-shaders.cpp
-            ${root}/src/browser/menu-texture.cpp ${root}/src/browser/render-snapshot.cpp ${root}/src/browser/webgpu-transport.cpp
+        if(BROWSER_MENU_TRACE_ABORTS)
+            target_sources(story_boot_link PRIVATE ${root}/src/browser/abort-diagnostic.cpp)
+            set_property(SOURCE ${root}/src/browser/cpu_runtime.cpp APPEND PROPERTY COMPILE_DEFINITIONS BROWSER_MENU_TRACE_ABORTS=1)
+            target_link_options(story_boot_link PRIVATE --profiling-funcs -Wl,--wrap=abort --pre-js ${root}/src/browser/abort-import.js)
+        endif()
+        set_property(SOURCE ${root}/src/browser/boot-wasm.cpp PROPERTY COMPILE_DEFINITIONS BROWSER_MENU=1 BROWSER_MENU_TRACE_FRAMES=${BROWSER_MENU_TRACE_FRAMES})
+        target_sources(story_boot_link PRIVATE ${root}/src/browser/menu-backend.cpp ${root}/src/browser/menu-shaders.cpp
+            ${root}/src/browser/menu-pixel-shaders.cpp ${root}/src/browser/menu-texture.cpp ${root}/src/browser/render-snapshot.cpp ${root}/src/browser/webgpu-transport.cpp
             ${root}/src/gpu/shaders.cpp)
         add_executable(menu_gpu ${root}/src/browser/webgpu-service.cpp)
         target_include_directories(menu_gpu PRIVATE ${root}/src)
@@ -154,14 +202,18 @@ if(BROWSER_BOOT)
             "-sEXPORTED_RUNTIME_METHODS=['HEAPU8']")
         set_target_properties(menu_gpu PROPERTIES OUTPUT_NAME "menu_gpu" SUFFIX ".mjs"
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/boot-web)
-        add_dependencies(story_boot menu_gpu)
+        add_dependencies(story_boot_link menu_gpu)
     endif()
-    target_compile_options(story_boot PRIVATE -O3)
-    target_link_options(story_boot PRIVATE --no-entry -sPTHREAD_POOL_SIZE=3 -sPTHREAD_POOL_SIZE_STRICT=2
+    target_compile_options(story_boot_link PRIVATE -O3)
+    if(BROWSER_MENU)
+        set(boot_worker_pool 129)
+    else()
+        set(boot_worker_pool 3)
+    endif()
+    target_link_options(story_boot_link PRIVATE --no-entry -sPTHREAD_POOL_SIZE=${boot_worker_pool} -sPTHREAD_POOL_SIZE_STRICT=2
         -sSTACK_SIZE=1048576 -sDEFAULT_PTHREAD_STACK_SIZE=262144 -sSTACK_OVERFLOW_CHECK=2
         -sEXPORTED_RUNTIME_METHODS=HEAPU8)
-    set_target_properties(story_boot PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/boot-web SUFFIX .mjs)
-    configure_file(${CMAKE_CURRENT_BINARY_DIR}/boot-manifest.mjs ${CMAKE_BINARY_DIR}/boot-web/boot-manifest.mjs COPYONLY)
+    browser_publish_boot()
     if(BROWSER_MENU)
         configure_file(${root}/src/browser/menu.html ${CMAKE_BINARY_DIR}/boot-web/index.html COPYONLY)
         foreach(module menu-shell menu-runtime menu-input webgpu-service webgpu-transport)

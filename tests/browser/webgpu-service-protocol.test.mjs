@@ -26,6 +26,7 @@ test('malformed replies close mailbox rather than copying invalid bytes', async 
   header[5] = MAX_BYTES + 1;
   header[6] = 0;
   Atomics.store(header, 0, 3);
+  Atomics.notify(header, 0);
   assert.equal((await pending).status, Status.Error);
 });
 

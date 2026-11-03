@@ -17,7 +17,7 @@ export const mountMenuShell = ({ root = document } = {}) => {
       canvas.replaceWith(replacement);
       canvas = replacement;
       started = performance.now();
-      evidence = { renderedFrames: 0, firstVisibleFrameMilliseconds: null, adapter: null, validationErrors: [], resources: null };
+      evidence = { renderedFrames: 0, firstPresentedFrameMilliseconds: null, adapter: null, validationErrors: [], resources: null };
       update();
       return canvas.transferControlToOffscreen();
     },
@@ -26,15 +26,18 @@ export const mountMenuShell = ({ root = document } = {}) => {
       ++evidence.renderedFrames;
       evidence.resources = details.resources;
       evidence.lastCompletedCommand = details.command;
-      if (evidence.firstVisibleFrameMilliseconds === null) {
-        evidence.firstVisibleFrameMilliseconds = performance.now() - started;
+      if (evidence.firstPresentedFrameMilliseconds === null) {
+        evidence.firstPresentedFrameMilliseconds = performance.now() - started;
         canvas.focus({ preventScroll: true });
       }
       if (evidence.renderedFrames === 1 || evidence.renderedFrames % 60 === 0) { update(); }
     },
     onDiagnostic: (details) => {
-      evidence.validationErrors.push(details);
-      if (evidence.validationErrors.length > 16) { evidence.validationErrors.shift(); }
+      if (details.guest) { evidence.guest = details.guest; }
+      else {
+        evidence.validationErrors.push(details);
+        if (evidence.validationErrors.length > 16) { evidence.validationErrors.shift(); }
+      }
       update();
     },
   }) });

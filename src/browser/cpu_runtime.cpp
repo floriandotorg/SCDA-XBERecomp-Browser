@@ -4,24 +4,48 @@
 #include <array>
 #include <cstdio>
 #include <string>
+#include <system_error>
 #ifdef __EMSCRIPTEN__
+#include <emscripten.h>
 #include <emscripten/stack.h>
+#endif
+
+#if defined(__EMSCRIPTEN__) && defined(BROWSER_MENU_TRACE_ABORTS) && BROWSER_MENU_TRACE_ABORTS
+extern "C" void browser_abort_record_context(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 #endif
 
 namespace browser {
 
 namespace {
+#ifdef __EMSCRIPTEN__
+struct TimerClockCadence {
+  uint64_t worker = 0;
+  double local = 0;
+};
+#endif
 constexpr uint32_t pageSize = 4096;
 constexpr size_t backingBudget = 112u << 20;
 const auto Describe = [](const X86Context& ctx, uint32_t address, size_t size, const char* reason) {
-  std::array<char, 256> message{};
+  std::array<char, 2048> message{};
   std::snprintf(message.data(), message.size(), "%s address=0x%08X size=%zu esp=0x%08X last_icall=0x%08X", reason, address, size, ctx.esp, ctx.last_icall);
   return std::string(message.data());
 };
 }
 
 Fault::Fault(const X86Context& ctx, uint32_t address, size_t size, const char* reason)
-  : std::runtime_error(Describe(ctx, address, size, reason)), context(std::make_shared<const X86Context>(ctx)), address(address), size(size) {}
+  : std::runtime_error(Describe(ctx, address, size, reason)), context(std::make_shared<const X86Context>(ctx)), address(address), size(size) {
+#if defined(__EMSCRIPTEN__) && defined(BROWSER_MENU_TRACE_ABORTS) && BROWSER_MENU_TRACE_ABORTS
+  if (reason && std::strcmp(reason, "unmapped guest memory") == 0) {
+    std::array<char, 4096> trace{};
+    emscripten_get_callstack(EM_LOG_JS_STACK, trace.data(), trace.size());
+    size_t lines = 0;
+    for (size_t n = 0; n < trace.size() && trace[n]; ++n) {
+      if (trace[n] == '\n' && ++lines == 12) { trace[n] = 0; break; }
+    }
+    std::fprintf(stderr, "%s\n[browser-memory-fault] %s\n", trace.data(), what());
+  }
+#endif
+}
 
 thread_local size_t Memory::threadBorrows_ = 0;
 
@@ -177,8 +201,16 @@ void Memory::DecommitMapped(uint32_t address, uint32_t size) {
 }
 
 Memory::Region& Memory::RegionAt(const X86Context& ctx, uint32_t address, size_t size) {
-  for (auto& region : regions_) {
-    if (address >= region.address && uint64_t(address) < uint64_t(region.address) + region.storage->bytes.size()) { return region; }
+  auto& cached = regionLookup_[(address / pageSize) % regionLookup_.size()];
+  const auto contains = [&](const Region& region) {
+    return address >= region.address && uint64_t(address) < uint64_t(region.address) + region.storage->bytes.size();
+  };
+  if (cached < regions_.size() && contains(regions_[cached])) { return regions_[cached]; }
+  for (size_t n = 0; n < regions_.size(); ++n) {
+    if (contains(regions_[n])) {
+      cached = n;
+      return regions_[n];
+    }
   }
   throw Fault(ctx, address, size, "unmapped guest memory");
 }
@@ -230,6 +262,13 @@ void Memory::CheckRange(const X86Context& ctx, uint32_t address, size_t size) {
 
 void Memory::Read(const X86Context& ctx, uint32_t address, void* output, size_t size) {
   std::lock_guard lock(memoryLock_);
+  if (size && size <= 16 && size <= pageSize - address % pageSize) {
+    auto& region = RegionAt(ctx, address, size);
+    const size_t offset = address - region.address;
+    if (!region.storage->committed[offset / pageSize]) { throw Fault(ctx, address, size, "uncommitted guest memory"); }
+    std::memcpy(output, region.storage->bytes.data() + offset, size);
+    return;
+  }
   Validate(ctx, address, size);
   auto* destination = static_cast<uint8_t*>(output);
   while (size) {
@@ -245,6 +284,13 @@ void Memory::Read(const X86Context& ctx, uint32_t address, void* output, size_t 
 
 void Memory::Write(const X86Context& ctx, uint32_t address, const void* input, size_t size) {
   std::lock_guard lock(memoryLock_);
+  if (size && size <= 16 && size <= pageSize - address % pageSize) {
+    auto& region = RegionAt(ctx, address, size);
+    const size_t offset = address - region.address;
+    if (!region.storage->committed[offset / pageSize]) { throw Fault(ctx, address, size, "uncommitted guest memory"); }
+    std::memcpy(region.storage->bytes.data() + offset, input, size);
+    return;
+  }
   Validate(ctx, address, size);
   const auto* source = static_cast<const uint8_t*>(input);
   while (size) {
@@ -310,13 +356,39 @@ thread_local uint32_t Runtime::workerKpcr_ = 0;
 thread_local uint64_t Runtime::workerId_ = 0;
 thread_local Runtime* Runtime::clock_ = nullptr;
 thread_local bool Runtime::polling_ = false;
+thread_local uint32_t Runtime::loopPollBudget_ = 0;
 
 Runtime::Runtime(std::span<const X86FuncMapping> mappings, std::span<const uint32_t> continuations,
-    std::function<uint64_t()> timerSource)
+    std::function<uint64_t()> timerSource, size_t workerCapacity)
   : mappings_(mappings.begin(), mappings.end()), continuations_(continuations.begin(), continuations.end()), kernels_(400),
-    timerSource_(timerSource ? std::move(timerSource) : [origin = std::chrono::steady_clock::now()] {
-      return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - origin).count()) / 100;
-    }) {
+    workerCapacity_(workerCapacity), timerSource_(timerSource ? std::move(timerSource) :
+#ifdef __EMSCRIPTEN__
+      [sample = std::optional<uint64_t>{}, cadence = std::array<TimerClockCadence, 2>{}, next = size_t(0)]() mutable {
+        const double local = emscripten_get_now();
+        auto* refresh = static_cast<TimerClockCadence*>(nullptr);
+        for (auto& slot : cadence) {
+          if (slot.worker == workerId_) { refresh = &slot; break; }
+        }
+        if (sample && refresh && local >= refresh->local && local - refresh->local < 1) { return *sample; }
+        const double milliseconds = MAIN_THREAD_EM_ASM_DOUBLE({ return performance.now(); });
+        if (!(milliseconds >= 0 && milliseconds < double(UINT64_MAX / 10000))) {
+          throw Fault({}, 149, 0, "host monotonic timer outside elapsed time range");
+        }
+        if (!refresh) {
+          refresh = &cadence[next];
+          next = (next + 1) % cadence.size();
+        }
+        *refresh = {workerId_, local};
+        sample = uint64_t(milliseconds * 10000);
+        return *sample;
+      }
+#else
+      [origin = std::chrono::steady_clock::now()] {
+        return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - origin).count()) / 100;
+      }
+#endif
+    ) {
+  if (!workerCapacity_ || workerCapacity_ > 128) { throw std::invalid_argument("guest worker capacity must be between 1 and 128"); }
   std::sort(mappings_.begin(), mappings_.end(), [](const auto& left, const auto& right) { return left.guest < right.guest; });
   for (size_t n = 0; n < mappings_.size(); ++n) {
     if (!mappings_[n].host || (n && mappings_[n - 1].guest == mappings_[n].guest) || mappings_[n].guest >= 0xFD000000) {
@@ -330,6 +402,42 @@ Runtime::Runtime(std::span<const X86FuncMapping> mappings, std::span<const uint3
 
 Runtime::~Runtime() { Stop(); }
 
+void Runtime::Worker::Diagnose(const char* phase, const char* reason, int code) const noexcept {
+#if BROWSER_MENU_TRACE_ABORTS
+  static std::atomic<unsigned> reports = 0;
+  if (reports.fetch_add(1) >= 12) { return; }
+  try {
+    std::array<char, 512> message{};
+    std::snprintf(message.data(), message.size(),
+      "[browser-worker-failure] phase=%s runtime=%p worker=%p id=%llu thread=%zu currentThread=%zu currentWorkerRuntime=%p currentWorkerId=%llu joinable=%d done=%d uncaught=%d caught=%d code=%d what=%.150s",
+      phase, static_cast<void*>(runtime), static_cast<const void*>(this), static_cast<unsigned long long>(id),
+      std::hash<std::thread::id>{}(thread.get_id()), std::hash<std::thread::id>{}(std::this_thread::get_id()),
+      static_cast<void*>(worker_), static_cast<unsigned long long>(workerId_), int(thread.joinable()), int(done.load()),
+      std::uncaught_exceptions(), int(bool(std::current_exception())), code, reason);
+    std::fprintf(stderr, "%s\n", message.data());
+  } catch (...) {}
+#endif
+}
+
+Runtime::Worker::~Worker() {
+  if (thread.joinable()) { Diagnose("destroy-joinable", "std::thread destructor will terminate"); }
+}
+
+void Runtime::Worker::Join(const char* phase) {
+  try {
+    thread.join();
+  } catch (const std::system_error& exception) {
+    Diagnose(phase, exception.what(), exception.code().value());
+    throw;
+  } catch (const std::exception& exception) {
+    Diagnose(phase, exception.what());
+    throw;
+  } catch (...) {
+    Diagnose(phase, "non-std exception");
+    throw;
+  }
+}
+
 void Runtime::Launch(X86Context ctx, uint8_t* base, std::function<void(X86Context&, uint8_t*)> entry) {
   Checkpoint(ctx);
   if (!entry || !base) { throw Fault(ctx, ctx.last_icall, 0, "invalid guest worker entry"); }
@@ -340,21 +448,23 @@ void Runtime::Launch(X86Context ctx, uint8_t* base, std::function<void(X86Contex
   }
   std::erase_if(workers_, [&](const auto& worker) {
     if (!worker->done.load()) { return false; }
-    worker->thread.join();
+    worker->Join("launch-retire");
     if (!failure_) { failure_ = worker->failure; }
     return true;
   });
-  if (activeWorkers_.load() >= 2) { throw Fault(ctx, ctx.last_icall, 0, "guest worker capacity exhausted"); }
+  if (activeWorkers_.load() >= workerCapacity_) { throw Fault(ctx, ctx.last_icall, 0, "guest worker capacity exhausted"); }
   workers_.reserve(workers_.size() + 1);
-  auto worker = std::make_unique<Worker>();
+  auto worker = std::make_unique<Worker>(this, ++workerSequence_);
   auto* state = worker.get();
   ++activeWorkers_;
   try {
-    worker->thread = std::thread([this, state, ctx, base, entry, workerId = ++workerSequence_]() mutable {
+    worker->thread = std::thread([this, state, ctx, base, entry, workerId = worker->id]() mutable {
       Runtime* previous = worker_;
       auto* previousContext = workerContext_;
       const uint32_t previousKpcr = workerKpcr_;
       const uint64_t previousId = workerId_;
+      const uint32_t previousPollBudget = loopPollBudget_;
+      loopPollBudget_ = 0;
       worker_ = this;
       workerContext_ = &ctx;
       workerKpcr_ = ctx.fs_base;
@@ -374,6 +484,7 @@ void Runtime::Launch(X86Context ctx, uint8_t* base, std::function<void(X86Contex
       workerContext_ = previousContext;
       workerKpcr_ = previousKpcr;
       workerId_ = previousId;
+      loopPollBudget_ = previousPollBudget;
       --activeWorkers_;
       state->done.store(true);
     });
@@ -395,7 +506,7 @@ std::exception_ptr Runtime::Join() {
       if (workers_.empty()) { return failure_; }
       workers.swap(workers_);
     }
-    for (auto& worker : workers) { worker->thread.join(); }
+    for (auto& worker : workers) { worker->Join("join"); }
     std::lock_guard lock(workersLock_);
     for (auto& worker : workers) {
       if (!failure_) { failure_ = worker->failure; }
@@ -475,12 +586,16 @@ void Runtime::RequireImageSession(const X86Context& ctx, uint8_t* base) const {
 }
 
 void Runtime::Invoke(X86Context& ctx, uint8_t* base, uint32_t target) {
+#if defined(__EMSCRIPTEN__) && defined(BROWSER_MENU_TRACE_ABORTS) && BROWSER_MENU_TRACE_ABORTS
+  browser_abort_record_context(uint32_t(workerId_), target, ctx.esp, ctx.ecx, ctx.ebx, ctx.esi, ctx.edi);
+#endif
   Checkpoint(ctx);
   RequireImageSession(ctx, base);
-  Poll(ctx, base);
+  if (target < 0xFD000000) { PollLoop(ctx, base); }
+  else if (target < 0xFE000000) { Poll(ctx, base); }
   ctx.last_icall = target;
   if (std::find(continuations_.begin(), continuations_.end(), target) != continuations_.end()) { throw X86Resume{target, ctx.esp}; }
-  if (auto* function = Find(target)) { function(ctx, base); return; }
+  if (auto* function = Find(target)) { ObserveInvocation(ctx, base, target); function(ctx, base); return; }
   if (target >= 0xFE000000 && target < 0xFE000640 && !(target & 3)) { Kernel(ctx, base, (target - 0xFE000000) / 4); return; }
   X86Func* function = nullptr;
   if (target >= 0xFD000000 && target < 0xFE000000 && !(target & 3)) {
@@ -489,6 +604,7 @@ void Runtime::Invoke(X86Context& ctx, uint8_t* base, uint32_t target) {
     if (index < hosts_.size()) { function = hosts_[index]; }
   }
   if (!function) { throw Fault(ctx, target, 0, "unknown indirect target"); }
+  ObserveInvocation(ctx, base, target);
   function(ctx, base);
 }
 
@@ -500,7 +616,7 @@ void Runtime::Resume(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t e
     throw Fault(ctx, target, 0, "unknown continuation target");
   }
   ctx.esp = esp;
-  Poll(ctx, base);
+  PollLoop(ctx, base);
   function(ctx, base);
 }
 
@@ -546,7 +662,8 @@ uint64_t Runtime::KernelRevision() {
 void Runtime::PublishImageMemory(Memory& memory, uint64_t revision, const std::function<void()>& publish) {
   std::scoped_lock lock(workersLock_, lock_);
   Checkpoint({});
-  if (!publish || imageMemory_.load() || activeWorkers_.load() || kernelRevision_ != revision || (sdkMemory_ && sdkMemory_ != &memory)) {
+  if (!publish || imageMemory_.load() || activeWorkers_.load() || kernelRevision_ != revision || (sdkMemory_ && sdkMemory_ != &memory) ||
+      (invocationMemory_ && invocationMemory_ != &memory)) {
     throw Fault({}, 0, 0, "image publication requires an unchanged unpublished stopped runtime");
   }
   publish();
@@ -559,14 +676,14 @@ uint32_t Runtime::KernelTarget(uint32_t ordinal) {
 }
 
 void Runtime::Kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal) {
-  Checkpoint(ctx);
-  RequireImageSession(ctx, base);
+  Poll(ctx, base);
   const std::function<void(X86Context&, uint8_t*)>* function = nullptr;
   {
     std::lock_guard lock(lock_);
     if (ordinal < kernels_.size() && kernels_[ordinal]) { function = &kernels_[ordinal]; }
   }
   if (!function) { throw Fault(ctx, ordinal, 0, "unavailable kernel ordinal"); }
+  ObserveInvocation(ctx, base, 0xfe000000 + ordinal * 4);
   RecordProgress(ctx);
   const uint64_t callId = RecordKernelTrace(ctx, ordinal, KernelTracePhase::Before, 0);
   try {
@@ -613,11 +730,30 @@ void Runtime::InstallExpiryDriver(std::function<void(X86Context&, uint8_t*)> dri
 void Runtime::InstallSdkObserver(Memory& memory, std::function<bool(X86Context&, uint32_t, uint64_t)> observer) {
   std::scoped_lock lock(workersLock_, lock_);
   Checkpoint({});
-  if (!observer || sdkObserver_ || imageMemory_.load() || workerSequence_ || Memory::HasBorrow()) {
+  if (!observer || sdkObserver_ || imageMemory_.load() || workerSequence_ || Memory::HasBorrow() ||
+      (invocationMemory_ && invocationMemory_ != &memory)) {
     throw Fault({}, 0, 0, "SDK observer requires an unpublished cold runtime");
   }
   sdkMemory_ = &memory;
   sdkObserver_ = std::move(observer);
+}
+
+void Runtime::InstallInvocationObserver(Memory& memory, std::function<void(const X86Context&, uint8_t*, uint32_t, uint64_t)> observer) {
+  std::scoped_lock lock(workersLock_, lock_);
+  Checkpoint({});
+  if (!observer || invocationObserver_ || imageMemory_.load() || workerSequence_ || Memory::HasBorrow() ||
+      (sdkMemory_ && sdkMemory_ != &memory)) {
+    throw Fault({}, 0, 0, "invocation observer requires its unpublished cold image runtime");
+  }
+  invocationMemory_ = &memory;
+  invocationObserver_ = std::move(observer);
+}
+
+void Runtime::ObserveInvocation(const X86Context& ctx, uint8_t* base, uint32_t target) noexcept {
+  if (!invocationObserver_ || !OwnsCurrentContext(ctx) || Memory::HasBorrow() ||
+      imageMemory_.load() != invocationMemory_ || !invocationMemory_ || base != invocationMemory_->Base()) { return; }
+  auto snapshot = ctx;
+  try { invocationObserver_(snapshot, base, target, workerId_); } catch (...) {}
 }
 
 bool Runtime::ObserveSdkEntry(X86Context& ctx, uint8_t* base, uint32_t id) {
@@ -626,7 +762,7 @@ bool Runtime::ObserveSdkEntry(X86Context& ctx, uint8_t* base, uint32_t id) {
       !runtime->sdkMemory_ || runtime->imageMemory_.load() != runtime->sdkMemory_ || base != runtime->sdkMemory_->Base()) {
     throw Fault(ctx, ctx.esp, 0, "SDK observation requires its bound current image worker without a backing lease");
   }
-  runtime->Checkpoint(ctx);
+  runtime->Poll(ctx, base);
   return runtime->sdkObserver_(ctx, id, workerId_);
 }
 
@@ -635,6 +771,7 @@ void Runtime::RecordProgress(const X86Context& ctx) {
 }
 
 void Runtime::Poll(X86Context& ctx, uint8_t* base) {
+  loopPollBudget_ = 0;
   Checkpoint(ctx);
   RequireImageSession(ctx, base);
   RecordProgress(ctx);
@@ -648,6 +785,19 @@ void Runtime::Poll(X86Context& ctx, uint8_t* base) {
   } polling(polling_);
   expiryDriver_(ctx, base);
   Checkpoint(ctx);
+}
+
+void Runtime::PollLoop(X86Context& ctx, uint8_t* base) {
+  Checkpoint(ctx);
+  RequireImageSession(ctx, base);
+  if (!OwnsCurrentContext(ctx)) { Poll(ctx, base); return; }
+  if (loopPollBudget_) {
+    --loopPollBudget_;
+    RecordProgress(ctx);
+    return;
+  }
+  Poll(ctx, base);
+  loopPollBudget_ = 255;
 }
 
 uint64_t Runtime::SystemTime() {
@@ -684,6 +834,11 @@ uint64_t Runtime::RelativeTimerDeadline(const X86Context& ctx, int64_t dueTime) 
 
 uint64_t Runtime::Clock() {
   if (!clock_) { throw Fault({}, 0, 0, "guest clock not configured"); }
+  if (clock_->HasPublishedImage()) {
+    if (worker_ != clock_ || !workerContext_) { throw Fault({}, 0, 0, "image cycle clock requires its owned worker"); }
+    const uint64_t elapsed = clock_->TimerTime(*workerContext_);
+    return elapsed / 10000000 * 733333333ull + elapsed % 10000000 * 733333333ull / 10000000;
+  }
   return clock_->ticks.load();
 }
 

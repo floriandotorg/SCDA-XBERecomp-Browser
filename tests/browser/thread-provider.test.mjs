@@ -5,10 +5,11 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const directory = resolve('out/thread-provider-tests');
-mkdirSync(directory, { recursive: true });
+mkdirSync(`${directory}/tmp`, { recursive: true });
+const environment = { ...process.env, TMPDIR: `${directory}/tmp` };
 writeFileSync(`${directory}/run.mjs`, "import create from './threads.mjs'; await create();\n");
 for (const platform of ['native', 'wasm']) {
-  test(`${platform} session owned thread creation publishes real child startup and isolated state`, () => {
+  test(`${platform} bounded thread ownership preserves identity, references, priority, completion and teardown`, () => {
     const wasm = platform === 'wasm';
     const output = `${directory}/${wasm ? 'threads.mjs' : 'native'}`;
     const flags = wasm
@@ -16,9 +17,9 @@ for (const platform of ['native', 'wasm']) {
       : ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'];
     const build = spawnSync(wasm ? 'em++' : 'clang++', ['-std=c++20', '-O1', '-g', '-pthread',
       '-DX86_PORTABLE_RUNTIME', '-DX86_COMPACT_MEMORY', '-Isrc', 'tests/browser/thread-provider.cpp',
-      'src/browser/thread-provider.cpp', 'src/browser/image.cpp', 'src/browser/cpu_runtime.cpp', ...flags, '-o', output], { encoding: 'utf8', timeout: 120000 });
+      'src/browser/thread-provider.cpp', 'src/browser/image.cpp', 'src/browser/cpu_runtime.cpp', ...flags, '-o', output], { encoding: 'utf8', timeout: 120000, env: environment });
     assert.equal(build.status, 0, build.stderr);
-    const run = spawnSync(wasm ? process.execPath : output, wasm ? [`${directory}/run.mjs`] : [], { encoding: 'utf8', timeout: 30000 });
+    const run = spawnSync(wasm ? process.execPath : output, wasm ? [`${directory}/run.mjs`] : [], { encoding: 'utf8', timeout: 30000, env: environment });
     assert.equal(run.status, 0, run.stderr);
     assert.match(run.stdout, /thread-provider-contracts-ok/);
   });

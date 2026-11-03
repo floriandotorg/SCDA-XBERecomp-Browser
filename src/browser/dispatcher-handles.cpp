@@ -10,7 +10,7 @@ DispatcherHandles::Reference::~Reference() {
 }
 
 DispatcherHandles::Slot& DispatcherHandles::Available() {
-  if (nextHandle_ > UINT32_MAX) { throw Fault({}, 0, 0, "dispatcher handle identifier budget exhausted"); }
+  if (nextHandle_ > 0x6ffffffc) { throw Fault({}, 0, 0, "dispatcher handle identifier budget exhausted"); }
   for (auto& slot : slots_) {
     if (!slot.object) { return slot; }
   }
@@ -21,7 +21,7 @@ DispatcherHandles::Slot& DispatcherHandles::Find(uint32_t handle) {
   for (auto& slot : slots_) {
     if (slot.object && slot.handle == handle) { return slot; }
   }
-  throw Fault({}, handle, 0, "unknown dispatcher handle");
+  throw DispatcherError(0xc0000008, handle, "unknown dispatcher handle");
 }
 
 std::shared_ptr<DispatcherHandles::Reference> DispatcherHandles::Pin(uint32_t handle) {
@@ -53,6 +53,29 @@ uint32_t DispatcherHandles::Create(Kind kind, bool notification, int32_t initial
 
 uint32_t DispatcherHandles::CreateEvent(bool notification, bool signaled) {
   return Create(Kind::Event, notification, signaled ? 1 : 0, 1);
+}
+
+uint32_t DispatcherHandles::PublishThread(uint32_t handle) {
+  std::lock_guard lock(lock_);
+  if (handle < 0x70000004 || handle >= 0x71000000 || handle % 4 ||
+      std::any_of(slots_.begin(), slots_.end(), [&](const auto& slot) { return slot.object && slot.handle == handle; })) {
+    throw Fault({}, handle, 0, "invalid dispatcher thread handle publication");
+  }
+  auto& slot = Available();
+  auto object = std::make_shared<Reference>(dispatcher_);
+  object->id = dispatcher_.CreateThread();
+  const uint32_t token = object->id;
+  slot = {handle, std::move(object)};
+  return token;
+}
+
+void DispatcherHandles::RollbackThread(uint32_t handle, uint32_t token) {
+  std::lock_guard lock(lock_);
+  auto& slot = Find(handle);
+  if (slot.object->id != token) { throw Fault({}, handle, 0, "dispatcher thread rollback token mismatch"); }
+  dispatcher_.Destroy(token);
+  slot.object->id = 0;
+  slot = {};
 }
 
 uint32_t DispatcherHandles::CreateSemaphore(int32_t initial, int32_t limit) {
@@ -115,6 +138,20 @@ uint32_t DispatcherHandles::Duplicate(uint32_t handle, bool closeSource) {
   const auto target = Publish(Available(), source.object);
   if (closeSource) { source.object.reset(); }
   return target;
+}
+
+bool DispatcherHandles::Contains(uint32_t handle) {
+  std::lock_guard lock(lock_);
+  return std::any_of(slots_.begin(), slots_.end(), [&](const auto& slot) { return slot.handle == handle && slot.object; });
+}
+
+void DispatcherHandles::RollbackCreate(uint32_t handle) {
+  std::lock_guard lock(lock_);
+  auto& slot = Find(handle);
+  const auto id = slot.object->id;
+  slot.object->id = 0;
+  slot = {};
+  dispatcher_.Destroy(id);
 }
 
 void DispatcherHandles::Close(uint32_t handle) {

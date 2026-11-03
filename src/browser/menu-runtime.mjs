@@ -69,6 +69,7 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
       return {
         webgpuMailbox: mailbox, cancel, dispose,
         handle: (data) => {
+          if ((data.graphics || data.fileOpens || data.wasmDiagnostics) && live()) { onDiagnostic({ guest: data }); }
           if (data.phase !== 'input') { return false; }
           if (!live()) { return true; }
           try {

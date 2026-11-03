@@ -67,7 +67,7 @@ extern "C" __attribute__((used)) inline int _fltused = 0;
 #define X86_SAVE_FLAGS() (ctx.cf = cf, ctx.zf = zf, ctx.sf = sf, ctx.of = of, ctx.pf = pf)
 #define X86_LOAD_FLAGS() uint32_t cf = ctx.cf, zf = ctx.zf, sf = ctx.sf, of = ctx.of, pf = ctx.pf
 #ifdef X86_COMPACT_MEMORY
-#define X86_BARRIER() do { if (ctx.host) { browser::Runtime::From(ctx).Poll(ctx, base); } __asm__ volatile("" ::: "memory"); } while (false)
+#define X86_BARRIER() do { if (ctx.host) { browser::Runtime::From(ctx).PollLoop(ctx, base); } __asm__ volatile("" ::: "memory"); } while (false)
 #else
 #define X86_BARRIER() __asm__ volatile("" ::: "memory")
 #endif

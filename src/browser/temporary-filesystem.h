@@ -22,6 +22,11 @@ public:
     uint64_t lastAccessTime;
     uint64_t lastWriteTime;
     uint64_t changeTime;
+    uint64_t allocationSize = 0;
+  };
+  struct DirectoryEntry {
+    std::string name;
+    Metadata metadata;
   };
   struct Accounting {
     uint64_t capacity;
@@ -30,9 +35,10 @@ public:
   };
   explicit TemporaryFilesystem(uint64_t capacity = 16 * 1024 * 1024, size_t maximumEntries = 256, std::function<uint64_t()> clock = {});
   std::optional<Metadata> Stat(const std::string& path) const;
+  std::optional<std::vector<DirectoryEntry>> List(const std::string& path) const;
   Accounting Usage() const;
   uint32_t CreateDirectory(const std::string& path);
-  uint32_t CreateFile(const std::string& path, uint32_t attributes);
+  uint32_t CreateFile(const std::string& path, uint32_t attributes, uint64_t allocation = 0);
   uint32_t OverwriteFile(const std::string& path, uint32_t attributes);
   uint32_t WriteFile(const std::string& path, std::span<const uint8_t> bytes);
   uint32_t Write(const std::string& path, uint64_t offset, std::span<const uint8_t> bytes);
@@ -47,6 +53,7 @@ private:
     uint64_t lastAccessTime;
     uint64_t lastWriteTime;
     uint64_t changeTime;
+    uint64_t reservation = 0;
   };
   mutable std::mutex lock_;
   mutable std::map<std::string, Node> nodes_;

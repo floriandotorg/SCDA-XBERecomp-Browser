@@ -1,5 +1,7 @@
 #include "browser/menu-input.h"
 #include "cpu/x86_ops.h"
+#include <algorithm>
+#include <array>
 #include <cstdio>
 
 const auto check = [](bool value, const char* reason) {
@@ -10,6 +12,8 @@ const auto rejects = [](const auto& action) {
   try { action(); } catch (const browser::Fault&) { rejected = true; }
   check(rejected, "unsafe input operation accepted");
 };
+X86_FUNC(__imp__sub_000534B8) { throw browser::Fault(ctx, 0x534b8, 0, "signature Begin is absent from input fixture"); }
+X86_FUNC(__imp__sub_0005351A) { throw browser::Fault(ctx, 0x5351a, 0, "signature End is absent from input fixture"); }
 std::atomic<uint32_t> originals = 0;
 #define ORIGINAL(name, bytes) \
   X86_FUNC(__imp__sub_##name) { ++originals; ctx.esp += bytes; } \
@@ -122,6 +126,17 @@ int contracts() {
     bytes = read();
     check(bytes[0] == 3 && bytes[14] == 0 && bytes[15] == 0 && bytes[16] == 0 && bytes[17] == 0,
       "opposing keys did not cancel to unchanged neutral state");
+    const std::array<uint32_t, 6> analogMasks{2048, 4096, 8192, 16384, 32768, 65536};
+    for (uint32_t n = 0; n < analogMasks.size(); ++n) {
+      state[0].store(analogMasks[n]);
+      bytes = read();
+      std::array<uint8_t, 8> expected{};
+      expected[n + 2] = 255;
+      check(std::equal(expected.begin(), expected.end(), bytes.begin() + 6), "profile keyboard analog button guest offset incorrect");
+      check(bytes[4] == 0 && bytes[5] == 0, "analog profile action became a digital button");
+    }
+    state[0].store(0);
+    read();
     const uint32_t sentinel = 0xdeadbeef;
     memory.Write(ctx, 0x20000, &sentinel, 4);
     check(call(sub_004EDB86, {0x123456, 0x20000}) == 6, "invalid handle accepted");

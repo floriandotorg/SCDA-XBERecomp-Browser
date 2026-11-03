@@ -97,6 +97,14 @@ int main() {
     X86Context ctx{};
     ctx.esp = 0xD000F000;
     ctx.last_icall = 0xABCDEF;
+    const std::string diagnosticReason(512, 'x');
+    const browser::Fault diagnosticFault(ctx, 0x12345678, 4096, diagnosticReason.c_str());
+    const std::string diagnostic = diagnosticFault.what();
+    check(diagnostic.starts_with(diagnosticReason), "bounded resource diagnostic retains its complete reason");
+    check(diagnostic.ends_with("last_icall=0x00ABCDEF"), "resource diagnostic retains guest context");
+    const std::string oversizedReason(4096, 'y');
+    const browser::Fault oversizedFault(ctx, 0, 0, oversizedReason.c_str());
+    check(std::string(oversizedFault.what()).size() <= 2047, "oversized fault diagnostic stays bounded");
     uint8_t* base = memory.Base();
     X86_MEM32(0x80000001) = 0x78563412;
     check(uint32_t(X86_MEM32(0xF0000001)) == 0x78563412, "physical alias unaligned dword");

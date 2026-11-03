@@ -54,6 +54,7 @@ public:
     virtual uint32_t Fence() { return ++fence_; }
     virtual bool FencePending(uint32_t) { return false; }
     virtual void WaitFence(uint32_t) {}
+    virtual bool ReleaseResource(uint32_t, uint32_t) { return false; }
     virtual bool Busy(uint32_t /*resource*/) { return false; }
     virtual void WaitResource(uint32_t /*resource*/) {}
     // until the GPU has drawn present number n, counted from 0; any thread

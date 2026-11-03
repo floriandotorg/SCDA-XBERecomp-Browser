@@ -358,7 +358,18 @@ int main() {
     assert(context.esp == second.context.esp);
     assert(scalar(*image, second.tlsData) == 0x44332212 && scalar(*image, first.tlsData) == changed);
     assert(image->tlsCallbacks.size() == 1 && image->image.U32(0x700) == 0xabcdef01);
-    rejects([&] { browser::PrepareImageThread(*image, runtime, 0x18, 0x10000); });
+    assert(browser::kImageThreadCapacity == 128);
+    for (uint32_t n = 2; n < browser::kImageThreadCapacity; ++n) {
+      const auto thread = browser::PrepareImageThread(*image, runtime, 0x10 + n * 4, 0x10000);
+      assert(image->threads.size() == n + 1 && thread.id == 0x10 + n * 4);
+      assert(thread.stackLimit > image->threads[n - 1].stackTop);
+      assert(thread.kpcr != first.kpcr && thread.kpcr != second.kpcr);
+      assert(scalar(*image, thread.tlsData) == 0x44332211);
+    }
+    const auto boundedBacking = image->memory->BackingBytes();
+    rejects([&] { browser::PrepareImageThread(*image, runtime, 0x20, 0x10000); });
+    assert(image->threads.size() == browser::kImageThreadCapacity && image->memory->BackingBytes() == boundedBacking);
+    assert(scalar(*image, second.tlsData) == 0x44332212 && scalar(*image, first.tlsData) == changed);
   }
   for (uint32_t n = 0; n < 2; ++n) {
     auto bytes = fixture();
@@ -399,6 +410,17 @@ int main() {
     rejects([&] { browser::PrepareImageThread(*image, runtime, 0x14, 0x10000); });
     assert(image->threads.size() == 1 && image->memory->BackingBytes() == backing);
     assert(scalar(*image, 0x12100) == changed);
+    const uint32_t index = 0u - ((1u << 20) + 4) / 4;
+    image->memory->Write({}, 0x12100, &index, 4);
+    browser::PrepareImageThread(*image, runtime, 0x14, 16u << 20);
+    const auto fullBacking = image->memory->BackingBytes();
+    rejects([&] { browser::PrepareImageThread(*image, runtime, 0x18, 16u << 20); });
+    assert(image->threads.size() == 2 && image->memory->BackingBytes() == fullBacking);
+    assert(scalar(*image, thread.tlsData) == 0x44332211 && scalar(*image, 0x12100) == index);
+    browser::PrepareImageThread(*image, runtime, 0x18, 0x10000);
+    browser::PrepareImageThread(*image, runtime, 0x1c, 0x10000);
+    const size_t budgetProbeThreads = 4;
+    assert(image->threads.size() == budgetProbeThreads && budgetProbeThreads < browser::kImageThreadCapacity);
   }
   for (uint32_t n = 0; n < 6; ++n) {
     browser::Runtime runtime({}, {});

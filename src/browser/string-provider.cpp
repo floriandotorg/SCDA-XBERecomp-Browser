@@ -5,6 +5,25 @@
 namespace browser {
 namespace {
 
+void UpperChar(Runtime& runtime, PreparedImage& image, X86Context& context, uint8_t* base) {
+  if (!image.memory || !image.importsBound || image.boundRuntime != &runtime ||
+      base != image.memory->Base() || !runtime.OwnsCurrentContext(context) || Memory::HasBorrow()) {
+    throw Fault(context, 316, 0, "character uppercasing requires its owned image worker without a backing lease");
+  }
+  auto& memory = *image.memory;
+  auto transition = memory.Mutate();
+  runtime.Checkpoint(context);
+  const uint64_t stackEnd = uint64_t(context.esp) + 8;
+  if (stackEnd > UINT32_MAX) { throw Fault(context, context.esp, 8, "character uppercasing frame overflow"); }
+  std::array<uint32_t, 2> frame;
+  memory.Read(context, context.esp, frame.data(), sizeof(frame));
+  const uint32_t value = frame[1] & 0xff;
+  const uint32_t result = value >= 'a' && value <= 'z' ? value - ('a' - 'A') : value;
+  runtime.Checkpoint(context);
+  context.eax = result;
+  context.esp = uint32_t(stackEnd);
+}
+
 void EqualString(Runtime& runtime, PreparedImage& image, X86Context& context, uint8_t* base) {
   if (!image.memory || !image.importsBound || image.boundRuntime != &runtime ||
       base != image.memory->Base() || !runtime.OwnsCurrentContext(context) || Memory::HasBorrow()) {
@@ -97,6 +116,9 @@ void InitializeAnsiString(Runtime& runtime, PreparedImage& image, X86Context& co
 }
 
 void InstallStringProvider(Runtime& runtime, PreparedImage& image) {
+  runtime.RegisterKernel(316, [&runtime, &image](X86Context& context, uint8_t* base) {
+    UpperChar(runtime, image, context, base);
+  });
   runtime.RegisterKernel(279, [&runtime, &image](X86Context& context, uint8_t* base) {
     EqualString(runtime, image, context, base);
   });
