@@ -15,7 +15,7 @@ const run = async () => {
   const device = await adapter.requestDevice();
   const errors = [];
   device.addEventListener('uncapturederror', event => errors.push(event.error.message));
-  const names = [...Array.from({ length: 16 }, (_, n) => `shadow${n}`), ...Array.from({ length: 16 }, (_, n) => `psshadow${n}`), 'depth-bias', 'depth-bias-color', 'depth-only', 'border', 'border-mip', 'cube', 'pscube', 'psreflect', 'psdotst', 'plain', 'textured', 'flat', 'stages', 'program', 'paired', 'relative', 'rcc', 'rcp', 'rsq', 'pixel', 'psef', ...Array.from({ length: 8 }, (_, n) => `pssum${n}`), 'psdot1', 'psdot2', 'psdot3', 'pskill', 'pixel-program', 'psconstants', 'psmux', 'pssimultaneous', ...Array.from({ length: 8 }, (_, n) => `psinput${n}`), ...[0, 8, 16, 24, 32, 48].map(n => `psoutput${n}`), ...Array.from({ length: 13 }, (_, n) => `mac${n + 1}`), ...Array.from({ length: 23 }, (_, n) => n + 2).filter(n => n !== 17).map(n => `op${n}`), ...Array.from({ length: 5 }, (_, n) => `combine${n + 18}`)];
+  const names = [...Array.from({ length: 16 }, (_, n) => `shadow${n}`), ...Array.from({ length: 16 }, (_, n) => `psshadow${n}`), 'depth-bias', 'depth-bias-color', 'depth-only', 'border', 'border-mip', 'cube', 'pscube', 'volume', 'psvolume1', 'psvolume2', 'psvolume3', 'psreflect', 'psdotst', 'psdep15', 'psdep16', 'plain', 'textured', 'flat', 'stages', 'program', 'paired', 'relative', 'rcc', 'rcp', 'rsq', 'pixel', 'psef', ...Array.from({ length: 8 }, (_, n) => `pssum${n}`), 'psdot1', 'psdot2', 'psdot3', 'pskill', 'pixel-program', 'psconstants', 'psmux', 'pssimultaneous', ...Array.from({ length: 8 }, (_, n) => `psinput${n}`), ...[0, 8, 16, 24, 32, 48].map(n => `psoutput${n}`), ...Array.from({ length: 13 }, (_, n) => `mac${n + 1}`), ...Array.from({ length: 23 }, (_, n) => n + 2).filter(n => n !== 17).map(n => `op${n}`), ...Array.from({ length: 5 }, (_, n) => `combine${n + 18}`)];
   const pipelines = new Map();
   let textured;
   for (const name of names) {
@@ -28,7 +28,7 @@ const run = async () => {
         throw new Error(`${name}: ${JSON.stringify(failures.map(message => ({ text: message.message, line: message.lineNum })))}`);
       }
     }
-    const regs = name.startsWith('op') || name === 'stages' || name === 'psreflect' || name === 'psdotst' ? Array.from({ length: 16 }, (_, n) => n) : [0, 3, 9];
+    const regs = name.startsWith('op') || name === 'stages' || name === 'psreflect' || name === 'psdotst' || name.startsWith('psdep') ? Array.from({ length: 16 }, (_, n) => n) : [0, 3, 9];
     device.pushErrorScope('validation');
     const pipeline = await device.createRenderPipelineAsync({
       layout: 'auto',
@@ -347,6 +347,22 @@ const run = async () => {
     const value = await render(dotLookup, lookupBinding);
     if (value.some((channel, component) => channel !== lookupColors[n][component])) { throw new Error('dot lookup coordinate mismatch ' + n + ': ' + value); }
     dotLookupPixels.push(value);
+  }
+  for (const mode of [15, 16]) {
+    const pipeline = pipelines.get(`psdep${mode}`);
+    const binding = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: uniform } },
+      { binding: 5, resource: lookupTexture.createView() }, { binding: 6, resource: sampler }
+    ] });
+    for (let n = 0; n < 4; ++n) {
+      const x = n % 2 ? 0.75 : 0.25, y = n < 2 ? 0.25 : 0.75;
+      const coordinate = mode === 15 ? [y, 0.25, 0.75, x] : [0.75, x, y, 0.25];
+      for (let n = 0; n < 3; ++n) { vertices.set(coordinate, n * 64 + 36); }
+      const value = await render(pipeline, binding);
+      if (value.some((channel, component) => channel !== lookupColors[n][component])) {
+        throw new Error(`dependent lookup ${mode} selected the wrong texel ${n}: ${value}`);
+      }
+    }
   }
   lookupTexture.destroy();
   device.queue.writeTexture({ texture: source }, new Uint8Array([64, 128, 192, 255]), {}, [1, 1]);

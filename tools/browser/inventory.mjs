@@ -115,7 +115,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     paths.push('src/browser/timer-provider.cpp', 'src/browser/timer-provider.h');
     paths.push('src/browser/sdk-provider.cpp', 'src/browser/sdk-provider.h',
       'src/browser/diagnostic-graphics.cpp', 'src/browser/diagnostic-graphics.h', 'src/browser/diagnostic-shaders.cpp', 'src/browser/diagnostic-shaders.h', 'src/browser/push-state.cpp', 'src/browser/push-state.h', 'src/gpu/backend.h', 'src/gpu/state.h',
-      'src/browser/silent-audio.cpp', 'src/browser/silent-audio.h', 'src/audio/output.h',
+      'src/browser/silent-audio.cpp', 'src/browser/silent-audio.h', 'src/audio/output.h', 'src/browser/audio-transport.mjs',
       'src/browser/audio-entries.h', 'src/browser/audio-provider.h', 'src/browser/audio-provider.cpp',
       'src/browser/audio-core.h', 'src/browser/audio-core.cpp', 'src/browser/audio-effects.h', 'src/browser/audio-effects.cpp',
       'tests/browser/audio-core.cpp', 'tests/browser/audio-core.test.mjs', 'tests/browser/audio-effects.cpp', 'tests/browser/audio-effects.test.mjs',
@@ -131,7 +131,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       }
       paths.push('src/browser/render-snapshot.h', 'src/browser/render-snapshot.cpp', 'src/browser/menu-backend.h', 'src/browser/menu-backend.cpp', 'src/browser/shader-inventory.h',
         'src/browser/menu-shaders.h', 'src/browser/menu-shaders.cpp', 'src/browser/menu-pixel-shaders.h', 'src/browser/menu-pixel-shaders.cpp', 'src/browser/menu-texture.h', 'src/browser/menu-texture.cpp',
-        'src/browser/menu-input.mjs', 'src/browser/webgpu-transport.h', 'src/browser/webgpu-transport.cpp', 'src/browser/webgpu-transport.mjs',
+        'src/browser/menu-input.mjs', 'src/browser/gamepad-input.mjs', 'src/browser/browser-audio.mjs', 'src/browser/audio-worklet.mjs', 'src/browser/webgpu-transport.h', 'src/browser/webgpu-transport.cpp', 'src/browser/webgpu-transport.mjs',
         'src/browser/webgpu-service.cpp', 'src/browser/webgpu-service.mjs', 'src/browser/menu-runtime.mjs', 'src/browser/menu-shell.mjs',
         'src/browser/menu.html', 'src/gpu/shaders.h', 'src/gpu/shaders.cpp', 'src/gpu/vertex.h');
     }

@@ -160,7 +160,7 @@ std::string Textures(const gpu::PixelKey& key) {
     if (texture.flags) {
       throw std::invalid_argument(prefix + "texture flags " + Number(texture.flags));
     }
-    if (texture.kind != gpu::kTexNone && texture.kind != gpu::kTex2D && texture.kind != gpu::kTexCube) {
+    if (texture.kind != gpu::kTexNone && texture.kind != gpu::kTex2D && texture.kind != gpu::kTexCube && texture.kind != gpu::kTex3D) {
       throw std::invalid_argument(prefix + "texture dimensionality " + Number(texture.kind));
     }
     const auto dot = [&]() {
@@ -183,11 +183,11 @@ std::string Textures(const gpu::PixelKey& key) {
     switch (mode) {
       case 0: value = "vec4<f32>(0.0, 0.0, 0.0, 1.0)"; break;
       case 1: {
-        if (texture.kind != gpu::kTex2D && texture.kind != gpu::kTexCube) {
+        if (texture.kind != gpu::kTex2D && texture.kind != gpu::kTexCube && texture.kind != gpu::kTex3D) {
           throw std::invalid_argument(prefix + "missing 2D texture");
         }
         auto uv = "(i.t" + name + ".xy / i.t" + name + ".w)";
-        if (texture.kind == gpu::kTexCube) { uv = "vec3<f32>(" + uv + ", 1.0)"; }
+        if (texture.kind == gpu::kTexCube || texture.kind == gpu::kTex3D) { uv = "vec3<f32>(" + uv + (texture.kind == gpu::kTex3D ? ", 0.0)" : ", 1.0)"); }
         else {
           if (texture.rect) { uv += " / u.texsize[" + name + "].xy"; }
           uv += " + u.texsize[" + name + "].zw";
@@ -197,8 +197,8 @@ std::string Textures(const gpu::PixelKey& key) {
         break;
       }
       case 2: case 3: {
-        if (texture.kind != gpu::kTexCube && texture.kind != gpu::kTex2D) { throw std::invalid_argument(prefix + "missing sampled texture"); }
-        auto uv = "i.t" + name + (texture.kind == gpu::kTexCube ? ".xyz" : ".xy");
+        if (texture.kind != gpu::kTexCube && texture.kind != gpu::kTex2D && texture.kind != gpu::kTex3D) { throw std::invalid_argument(prefix + "missing sampled texture"); }
+        auto uv = "i.t" + name + (texture.kind == gpu::kTexCube || texture.kind == gpu::kTex3D ? ".xyz" : ".xy");
         if (mode == 2) { uv = "(" + uv + " / i.t" + name + ".w)"; }
         if (texture.kind == gpu::kTex2D) {
           if (texture.rect) { uv += " / u.texsize[" + name + "].xy"; }
@@ -216,8 +216,21 @@ std::string Textures(const gpu::PixelKey& key) {
         if (texture.kind == gpu::kTex2D) {
           if (texture.rect) { coordinate += " / u.texsize[" + name + "].xy"; }
           coordinate += " + u.texsize[" + name + "].zw";
-        } else if (texture.kind == gpu::kTexCube) { coordinate = "vec3<f32>(" + coordinate + ", 1.0)"; }
+        } else if (texture.kind == gpu::kTexCube || texture.kind == gpu::kTex3D) { coordinate = "vec3<f32>(" + coordinate + (texture.kind == gpu::kTex3D ? ", 0.0)" : ", 1.0)"); }
         else { throw std::invalid_argument(prefix + "missing dot lookup texture"); }
+        value = "textureSampleBias(tex" + name + ", smp" + name + ", " + coordinate + ", u.lod_bias[" + name + "])";
+        break;
+      }
+      case 15: case 16: {
+        if (!n) { throw std::invalid_argument(prefix + "dependent lookup requires a preceding stage"); }
+        const uint32_t input = n == 1 ? 0 : (key.input_texture >> (n == 2 ? 16 : 20)) & 15;
+        if (input >= uint32_t(n)) { throw std::invalid_argument(prefix + "input must precede its consumer"); }
+        auto coordinate = "t" + Number(input) + (mode == 15 ? ".ar" : ".gb");
+        if (texture.kind == gpu::kTex2D) {
+          if (texture.rect) { coordinate += " / u.texsize[" + name + "].xy"; }
+          coordinate += " + u.texsize[" + name + "].zw";
+        } else if (texture.kind == gpu::kTexCube || texture.kind == gpu::kTex3D) { coordinate = "vec3<f32>(" + coordinate + (texture.kind == gpu::kTex3D ? ", 0.0)" : ", 1.0)"); }
+        else { throw std::invalid_argument(prefix + "missing dependent lookup texture"); }
         value = "textureSampleBias(tex" + name + ", smp" + name + ", " + coordinate + ", u.lod_bias[" + name + "])";
         break;
       }
@@ -235,7 +248,7 @@ std::string Textures(const gpu::PixelKey& key) {
           coordinate += ".xy";
           if (texture.rect) { coordinate += " / u.texsize[" + name + "].xy"; }
           coordinate += " + u.texsize[" + name + "].zw";
-        } else if (texture.kind != gpu::kTexCube) { throw std::invalid_argument(prefix + "missing reflection texture"); }
+        } else if (texture.kind != gpu::kTexCube && texture.kind != gpu::kTex3D) { throw std::invalid_argument(prefix + "missing reflection texture"); }
         value = "textureSampleBias(tex" + name + ", smp" + name + ", " + coordinate + ", u.lod_bias[" + name + "])";
         break;
       }
@@ -245,7 +258,7 @@ std::string Textures(const gpu::PixelKey& key) {
   }
   for (int n = 0; n < 4; ++n) {
     const auto mode = key.tex_modes >> (n * 5) & 31;
-    if (((mode >= 1 && mode <= 3) || mode == 9 || mode == 12) && (key.alphakill & (1u << n))) {
+    if (((mode >= 1 && mode <= 3) || mode == 9 || mode == 12 || mode == 15 || mode == 16) && (key.alphakill & (1u << n))) {
       body += "  if (t" + Number(n) + ".a == 0.0) { discard; }\n";
     }
   }

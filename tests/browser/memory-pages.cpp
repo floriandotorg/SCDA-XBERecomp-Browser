@@ -21,6 +21,29 @@ int main() {
     };
     memory.Map(0x10000, 8192);
     memory.Commit(0x10000, 8192);
+    const auto scoped = [&](bool early) {
+      browser::Memory::BlockScope scope{memory};
+      check(browser::Memory::HasBorrow());
+      scope.Store<uint32_t>(context, 0x10003, 31);
+      check(scope.Load<uint32_t>(context, 0x10003) == 31);
+      const std::array<uint32_t, 4> value{2, 3, 5, 7};
+      scope.Store(context, 0x10ff8, value);
+      check(scope.Load<std::array<uint32_t, 4>>(context, 0x10ff8) == value);
+      rejects([&] { scope.Load<uint32_t>(context, 0x20000); }, "unmapped");
+      rejects([&] { scope.Store<uint64_t>(context, 0xfffffffc, 0); }, "wraparound");
+      const auto version = memory.PhysicalWriteVersion(context, 0x80010000, 4096);
+      scope.Store<uint32_t>(context, 0xf0010003, 37);
+      check(scope.Load<uint32_t>(context, 0x80010003) == 37 && memory.PhysicalWriteVersion(context, 0x80010000, 4096) > version);
+      memory.Store<uint32_t>(context, 0x10000, 19);
+      if (early) { return; }
+      memory.Load<uint32_t>(context, 0x20000);
+    };
+    scoped(true);
+    check(!browser::Memory::HasBorrow());
+    rejects([&] { scoped(false); }, "unmapped");
+    check(!browser::Memory::HasBorrow());
+    memory.Decommit(0x10000, 4096);
+    memory.Commit(0x10000, 4096);
     block([&] {
       memory.Store<uint32_t>(context, 0x10003, 0xdeadbeef);
       check(memory.Load<uint32_t>(context, 0x10003) == 0xdeadbeef);
@@ -28,6 +51,12 @@ int main() {
       check(memory.Load<uint64_t>(context, 0x10ffc) == 0x1234567887654321ull);
     });
     memory.Decommit(0x11000, 4096);
+    {
+      browser::Memory::BlockScope scope{memory};
+      const auto previous = scope.Load<uint32_t>(context, 0x10ffc);
+      rejects([&] { scope.Store<uint64_t>(context, 0x10ffc, 0); }, "uncommitted");
+      check(scope.Load<uint32_t>(context, 0x10ffc) == previous);
+    }
     block([&] {
       rejects([&] { memory.Load<uint32_t>(context, 0x11000); }, "uncommitted");
       rejects([&] { memory.Store<uint64_t>(context, 0x10ffc, 0); }, "uncommitted");

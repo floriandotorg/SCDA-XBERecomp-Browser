@@ -10,6 +10,7 @@ const auto check = [](bool value, const char* reason) {
   if (!value) { throw std::runtime_error(reason); }
 };
 std::function<bool(uint32_t)> closeFile;
+uint32_t fileHandleLimit = 64;
 const auto entry = [](X86Context& ctx, uint8_t* base) {
   constexpr uint32_t cacheHeaderSize = 4096;
   constexpr uint32_t cacheFatSize = ((browser::CacheFatx::Capacity / browser::CacheFatx::AllocationUnit + 1) * 2 + 4095) / 4096 * 4096;
@@ -65,6 +66,19 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
     check(openExisting(path) == 0 && close(get(0x10100)), "pseudo-root namespace alias or case folding failed");
     check(openExisting(path, 0x64, 7, 0) == 0 && close(get(0x10100)), "ordinary absolute OPEN_EXISTING failed");
   }
+  check(openExisting("D:\\default.xbe", 0x64, 1, 0xfffffffdu, 0x80100080, 1, 1) == 0,
+    "Bink read-only file attributes rejected its existing ISO movie");
+  const auto movie = get(0x10100);
+  check(runtime.Call(ctx, base, runtime.KernelTarget(219), {movie, 0, 0, 0, 0x10840, 0x10900, 3, 0}) == 0 &&
+    get(0x10844) == 3 && (get(0x10900) & 0xffffff) == 0x4f5349 && close(movie),
+    "Bink existing-file mode did not retain bounded local ISO reads and handle retirement");
+  check(openExisting("D:\\default.xbe", 0x48, 1, 0xfffffffdu, 0x80100080, 1, 0) == 0,
+    "sound streaming asynchronous unbuffered open rejected its selected ISO");
+  const auto stream = get(0x10100);
+  put(0x10700, 3); put(0x10704, 0);
+  check(runtime.Call(ctx, base, runtime.KernelTarget(219), {stream, 0, 0, 0, 0x10840, 0x10900, 3, 0x10700}) == 0 &&
+    get(0x10840) == 0 && get(0x10844) == 3 && (get(0x10900) & 0xffffff) == 0x333231 && close(stream),
+    "polling asynchronous read lost its explicit offset, bytes or completion status");
   check(openExisting("default.xbe") == 0xc0000033, "pseudo-root admitted relative path");
   check(openExisting("D:default.xbe") == 0xc0000033, "pseudo-root admitted drive-relative path");
   check(openExisting("D:\\..\\default.xbe") == 0xc0000033, "pseudo-root admitted traversal");
@@ -268,7 +282,7 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   check(queryLink(link) == 0xc0000008 && get(0x10720) == 0xabcdef && get(0x30000) == 0xa5a5a5a5, "closed link target remained live");
   check(open("D:\\default.xbe") == 0, "shared handle quota fixture failed");
   const auto quotaFile = get(0x10100);
-  std::array<uint32_t, 63> quotaLinks{};
+  std::vector<uint32_t> quotaLinks(fileHandleLimit - 1);
   for (uint32_t n = 0; n < quotaLinks.size(); ++n) {
     check(openLink("\\??\\D:") == 0, "bounded link quota admitted too few handles");
     quotaLinks[n] = get(0x10100);
@@ -827,11 +841,21 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   catch (const browser::Fault&) { foreignContextRefused = true; }
   ctx.fs_base = kpcr;
   check(foreignContextRefused, "forged worker context accessed temporary namespace");
-  for (uint32_t n = 0; n < 64; ++n) { check(open("D:\\default.xbe") == 0, "bounded file table filled early"); }
+  std::vector<uint32_t> quotaFiles;
+  for (uint32_t n = 0; n < fileHandleLimit; ++n) {
+    check(open("D:\\default.xbe") == 0, "bounded file table filled early");
+    quotaFiles.push_back(get(0x10100));
+  }
   check(open("D:\\default.xbe") == 0xc000009a, "file handle capacity bypassed");
   check(overwrite("\\Device\\Harddisk0\\Partition1\\CACHE\\OVERWRITE.BIN", 0) == 0xc000009a &&
     overwrite("\\Device\\Harddisk0\\Partition1\\CACHE\\UNPUBLISHED.BIN", 0) == 0xc000009a,
     "actual overwrite bypassed shared handle quota");
+  check(close(quotaFiles.back()), "file budget slot did not retire");
+  check(overwrite("\\Device\\Harddisk0\\Partition1\\CACHE\\UNPUBLISHED.BIN", 0) == 0 &&
+    close(get(0x10100)), "retired slot was not reusable for a new save destination");
+  check(close(quotaFiles.front()), "file budget slot did not retire twice");
+  check(openLink("\\??\\D:") == 0 && close(get(0x10100)), "retired file slot was not reusable by a link");
+  for (uint32_t n = 1; n + 1 < quotaFiles.size(); ++n) { check(close(quotaFiles[n]), "file budget handle leaked"); }
   const auto stack = ctx.esp;
   for (uint32_t n = 0; n < 4; ++n) {
     bool refused = false;
@@ -1798,7 +1822,7 @@ const auto testNamedDiscFailure = [](std::shared_ptr<const std::vector<uint8_t>>
 };
 
 const auto testLargeDiscReads = [](std::shared_ptr<const std::vector<uint8_t>> original) {
-  constexpr uint32_t chunk = 1u << 20, length = 2 * chunk + 19, destination = 0x80020000;
+  constexpr uint32_t chunk = 1u << 20, length = 20 * chunk + 19, destination = 0x80020000;
   auto bytes = std::make_shared<std::vector<uint8_t>>(102400 + length);
   std::copy(original->begin(), original->end(), bytes->begin());
   std::memcpy(bytes->data() + 81920 + 8, &length, 4);
@@ -1828,7 +1852,7 @@ const auto testLargeDiscReads = [](std::shared_ptr<const std::vector<uint8_t>> o
       return size;
     }, error), "large read disc fixture failed");
     std::function<browser::DiscReadSnapshot()> snapshot;
-    auto close = browser::InstallFileProvider(runtime, image, disc, {}, nullptr, &snapshot, {}, nullptr, {}, {}, 4 * chunk);
+    auto close = browser::InstallFileProvider(runtime, image, disc, {}, nullptr, &snapshot, {}, nullptr, {}, {}, 32 * chunk);
     browser::BindImageImports(image, runtime, {});
     X86Context context{}; context.host = &runtime; context.esp = 0x11800;
     runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
@@ -1871,10 +1895,110 @@ const auto testLargeDiscReads = [](std::shared_ptr<const std::vector<uint8_t>> o
     for (uint32_t n = 0; n < length; ++n) {
       check(delivered[n] == (mode ? 0xa5 : pattern(n)), "large read leaked partial or stale destination data");
     }
-    check(reads == (mode ? 2u : 3u) && maximum == chunk && !runtime.ActiveWorkers() && close(handle),
+    check(reads == (mode ? 2u : 21u) && maximum == chunk && !runtime.ActiveWorkers() && close(handle),
       "large read did not bound chunks or retire its worker and file");
     check(snapshot().assetBytes == (mode ? 0 : length), "large read published fake asset progress");
   }
+};
+
+const auto testAsyncReads = [](std::shared_ptr<const kernel::DiscIndex> disc) {
+  browser::Runtime runtime({}, {});
+  browser::PreparedImage image;
+  image.memory = std::make_unique<browser::Memory>();
+  image.memory->Ensure(0x10000, 8192);
+  image.image.kernel_thunk = 0x10000;
+  auto storage = std::make_shared<browser::TemporaryFilesystem>();
+  const std::array<uint8_t, 6> content{'I', 'S', 'O', '1', '2', '3'};
+  check(storage->WriteFile("CLIP.BIN", content) == 0, "asynchronous fixture creation failed");
+  auto close = browser::InstallFileProvider(runtime, image, disc, storage);
+  uint32_t begun = 0, completed = 0;
+  uint32_t expectedStatus = 0, expectedCount = 3;
+  image.beginFileIo = [&](uint32_t event) -> browser::FileIoCompletion {
+    check(!browser::Memory::HasBorrow(), "file event began during a memory lease");
+    if (event != 0x1234) { return {0xc0000008, {}}; }
+    ++begun;
+    return {0, [&] {
+      std::array<uint32_t, 2> io{};
+      image.memory->Read({}, 0x11308, io.data(), sizeof(io));
+      check(io == std::array<uint32_t, 2>{expectedStatus, expectedCount}, "file event signaled before publishing its truthful IO status");
+      if (expectedCount) {
+        std::array<uint8_t, 3> bytes{};
+        image.memory->Read({}, 0x11400, bytes.data(), bytes.size());
+        check(bytes == std::array<uint8_t, 3>{'1', '2', '3'}, "file event signaled before publishing its actual bytes");
+      }
+      ++completed;
+    }};
+  };
+  browser::BindImageImports(image, runtime, {});
+  X86Context context{}; context.host = &runtime; context.esp = 0x11800;
+  runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+    auto& memory = *image.memory;
+    for (const std::string path : {"D:\\default.xbe", "\\Device\\Harddisk0\\Partition1\\clip.bin"}) {
+      const std::array<uint32_t, 5> attributes{uint32_t(path.size()) | uint32_t(path.size()) << 16, 0x11200, 0xfffffffdu, 0x11000, 0x40};
+      memory.Write(ctx, 0x11000, attributes.data(), sizeof(attributes));
+      memory.Write(ctx, 0x11200, path.data(), path.size());
+      check(runtime.Call(ctx, base, runtime.KernelTarget(190), {0x11300, 0x80100080, 0x11008, 0x11308, 0, 0, 1, 1, 0x48}) == 0,
+        "asynchronous read open failed for actual ISO or writable-volume backing");
+      uint32_t handle = 0;
+      memory.Read(ctx, 0x11300, &handle, 4);
+      uint64_t offset = 3;
+      memory.Write(ctx, 0x11500, &offset, 8);
+      const auto read = [&](uint32_t event, uint32_t apc = 0, uint32_t offsetAddress = 0x11500, uint32_t completionContext = 0) {
+        return runtime.Call(ctx, base, runtime.KernelTarget(219), {handle, event, apc, completionContext, 0x11308, 0x11400, 3, offsetAddress});
+      };
+      expectedStatus = 0; expectedCount = 3;
+      check(read(0x1235, 0, 0x11500, 0x11308) == 0 && begun == completed,
+        "overlapped read rejected its opaque context or low-bit completion-port flag");
+      check(runtime.Call(ctx, base, runtime.KernelTarget(211), {handle, 0x11308, 0x11600, 8, 14}) == 0,
+        "asynchronous read position query failed");
+      uint64_t position = 1;
+      memory.Read(ctx, 0x11600, &position, 8);
+      check(position == 0, "explicit asynchronous read changed the shared synchronous file position");
+      position = 2;
+      memory.Write(ctx, 0x11600, &position, 8);
+      check(runtime.Call(ctx, base, runtime.KernelTarget(226), {handle, 0x11308, 0x11600, 8, 14}) == 0 &&
+        read(0) == 0 && runtime.Call(ctx, base, runtime.KernelTarget(211), {handle, 0x11308, 0x11600, 8, 14}) == 0,
+        "asynchronous file rejected its independent SetFilePointer position");
+      memory.Read(ctx, 0x11600, &position, 8);
+      check(position == 2, "explicit overlapped read overwrote the independent file pointer");
+      const auto before = completed;
+      check(read(0x4321) == 0xc0000008 && read(0x1234, 1) == 0xc00000bb && read(0x1234, 0, 0) == 0xc00000bb &&
+        completed == before && begun == before, "invalid asynchronous request reset or signaled a completion event");
+      offset = 6;
+      memory.Write(ctx, 0x11500, &offset, 8);
+      expectedStatus = 0xc0000011; expectedCount = 0;
+      check(read(0x1234) == expectedStatus && begun == completed, "asynchronous EOF did not publish and signal its actual status");
+      check(close(handle), "asynchronous file handle did not retire");
+    }
+    const std::string destination = "\\Device\\Harddisk0\\Partition1\\overlap.bin";
+    const std::array<uint32_t, 5> attributes{uint32_t(destination.size()) | uint32_t(destination.size()) << 16, 0x11200, 0xfffffffdu, 0x11000, 0x40};
+    memory.Write(ctx, 0x11000, attributes.data(), sizeof(attributes));
+    memory.Write(ctx, 0x11200, destination.data(), destination.size());
+    check(runtime.Call(ctx, base, runtime.KernelTarget(190), {0x11300, 0x40100080, 0x11008, 0x11308, 0, 0, 1, 5, 0x48}) == 0,
+      "sound duplication rejected its asynchronous overwrite destination");
+    uint32_t handle = 0;
+    memory.Read(ctx, 0x11300, &handle, 4);
+    uint64_t offset = 3;
+    memory.Write(ctx, 0x11500, &offset, 8);
+    const std::array<uint8_t, 3> input{'1', '2', '3'};
+    memory.Write(ctx, 0x11400, input.data(), input.size());
+    expectedStatus = 0; expectedCount = 3;
+    check(runtime.Call(ctx, base, runtime.KernelTarget(236), {handle, 0x1235, 0, 0x11308, 0x11308, 0x11400, 3, 0x11500}) == 0 &&
+      begun == completed && storage->Stat("OVERLAP.BIN")->size == 6,
+      "overlapped write did not retain its real completion and explicit offset");
+    std::array<uint8_t, 6> written{};
+    check(storage->Read("OVERLAP.BIN", 0, written) == 6 && written == std::array<uint8_t, 6>{0, 0, 0, '1', '2', '3'},
+      "overlapped cache write lost its actual bytes or zero-filled gap");
+    offset = storage->Usage().capacity;
+    memory.Write(ctx, 0x11500, &offset, 8);
+    expectedStatus = 0xc000007f; expectedCount = 0;
+    check(runtime.Call(ctx, base, runtime.KernelTarget(236), {handle, 0x1234, 0, 0x11308, 0x11308, 0x11400, 3, 0x11500}) == expectedStatus &&
+      begun == completed && storage->Stat("OVERLAP.BIN")->size == 6,
+      "failed overlapped write fabricated bytes or lost its error completion");
+    check(close(handle), "overlapped write handle did not retire");
+  });
+  if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+  check(begun == 6 && completed == 6 && !runtime.ActiveWorkers(), "asynchronous file completion leaked or duplicated operations");
 };
 
 int main() {
@@ -1904,11 +2028,13 @@ int main() {
   check(disc->Open(bytes->size(), [bytes](uint64_t at, void* out, uint32_t size) { std::memcpy(out, bytes->data() + at, size); return size; }, error), "disc fixture invalid");
   testNamedDiscFailure(bytes);
   testLargeDiscReads(bytes);
+  testAsyncReads(disc);
   testPositionQueries(disc);
   testPositionQueryReadRace(bytes);
   testConcurrentProvider(disc);
   testDirectoryQueries(disc);
   for (uint32_t n = 0; n < 3; ++n) {
+    fileHandleLimit = n == 2 ? 256 : 64;
     const std::array<X86FuncMapping, 1> mappings = {{{0x11000, entry}}};
     browser::Runtime runtime(mappings, {});
     browser::PreparedImage image;
@@ -1924,7 +2050,7 @@ int main() {
     std::vector<browser::KernelDataExport> exports;
     std::vector<browser::FileOperationDiagnostic> operationDiagnostics;
     closeFile = browser::InstallFileProvider(runtime, image, disc, temporary, &exports, nullptr, {}, nullptr, {},
-      [&](browser::FileOperationDiagnostic diagnostic) { operationDiagnostics.push_back(std::move(diagnostic)); });
+      [&](browser::FileOperationDiagnostic diagnostic) { operationDiagnostics.push_back(std::move(diagnostic)); }, 1u << 20, fileHandleLimit);
     check(exports.size() == 2 && exports[0].ordinal == 40 && exports[0].address == 0xc0001000 && exports[0].size == 4 && exports[1].ordinal == 326 && exports[1].size == 8, "file data exports incorrect");
     uint32_t count = 0;
     image.memory->Read({}, exports[0].address, &count, 4);
@@ -1957,7 +2083,7 @@ int main() {
     check(temporary->Read("UDATA\\1234ABCD\\TITLEMETA.XBX", 0, metadataBytes) == 5 && metadataBytes == std::array<uint8_t, 5>{4, 8, 12, 4, 8}, "successful guest writes were not retained exactly");
     check(temporary->Read("CACHE\\OVERWRITE.BIN", 0, metadataBytes) == 5 && metadataBytes == std::array<uint8_t, 5>{4, 8, 12, 4, 8},
       "actual write-only destination retained no real sequential bytes");
-    check(!temporary->Stat("CACHE\\UNPUBLISHED.BIN"), "handle quota failure created actual destination backing");
+    check(temporary->Stat("CACHE\\UNPUBLISHED.BIN")->size == 0, "reused save slot retained unexpected data");
     closeFile = {};
   }
   std::puts("file-provider-contracts-ok");

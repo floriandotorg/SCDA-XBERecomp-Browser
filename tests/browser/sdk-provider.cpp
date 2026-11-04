@@ -18,7 +18,10 @@ thread_local uint8_t* expectedBase = nullptr;
 
 void SdkFixtureOriginal(X86Context& ctx, uint8_t* base, uint32_t id) {
   check(!expectedContext || (expectedContext == &ctx && expectedBase == base), "observer changed original context or base identity");
-  check(!browser::Memory::HasBorrow(), "original executed under observer memory lease");
+  {
+    browser::Memory::PauseExecution pause;
+    check(!browser::Memory::HasBorrow(), "original executed under observer memory lease");
+  }
   ++originalCalls;
   auto& memory = browser::Memory::From(base);
   if (ctx.eax == 0xdeadbeef) {

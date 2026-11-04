@@ -200,8 +200,22 @@ int main(int argc, char** argv) {
   key.final_abcd = Inputs(4, 0x20);
   key.final_efg = Inputs(15, 0);
   Reject(key, "final combiner register 15");
+  for (const uint32_t mode : {15u, 16u}) {
+    key = Key();
+    key.tex_modes = 4 | (mode << 10);
+    key.tex[2].kind = gpu::kTex2D;
+    const auto body = Body(key);
+    Contains(body, mode == 15 ? "t0.ar" : "t0.gb");
+    Contains(body, "textureSampleBias(tex2, smp2");
+    key.tex[2].rect = 1;
+    Contains(Body(key), "/ u.texsize[2].xy");
+    key.alphakill = 4;
+    Contains(Body(key), "if (t2.a == 0.0) { discard; }");
+    key.input_texture = 2u << 16;
+    Reject(key, "input must precede");
+  }
   for (int n = 0; n < 32; ++n) {
-    if (n <= 4 || n == 9 || n == 12 || n == 17) {
+    if (n <= 4 || n == 9 || n == 12 || n == 15 || n == 16 || n == 17) {
       continue;
     }
     key = Key();

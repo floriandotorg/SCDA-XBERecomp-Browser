@@ -64,6 +64,11 @@ struct ThreadWaitBridge {
   std::function<void(uint32_t)> close;
 };
 
+struct FileIoCompletion {
+  uint32_t status = 0;
+  std::function<void()> complete;
+};
+
 struct ImageThread {
   uint32_t id;
   uint32_t kpcr;
@@ -92,6 +97,7 @@ public:
   Runtime* threadProviderRuntime = nullptr;
   Runtime* synchronizationProviderRuntime = nullptr;
   std::shared_ptr<ThreadWaitBridge> threadWaitBridge;
+  std::function<FileIoCompletion(uint32_t)> beginFileIo;
   std::shared_ptr<ThreadSessionCounters> threadSessionCounters;
   std::function<void(uint32_t)> threadRetirement;
   mutable std::mutex threadLock;

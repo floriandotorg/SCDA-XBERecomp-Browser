@@ -56,9 +56,9 @@ export const readMissionMetrics = words => {
   if (!version || version % 2) { return undefined; }
   const sample = Array.from({ length: words.length }, (_, n) => Atomics.load(words, n));
   if (Atomics.load(words, 0) !== version) { return undefined; }
-  if (sample[1] > 384 * 1024 * 1024 || sample[2] > 192 * 1024 * 1024 || sample[3] > 128 || sample[4] > MISSION_RENDERER_BYTES || sample[5] > 4096 || sample[6] > 256) { throw new RangeError('Mission metrics exceed memory, worker or resource bounds.'); }
+  if (sample[1] > 1024 * 1024 * 1024 || sample[2] > 192 * 1024 * 1024 || sample[3] > 128 || sample[4] > MISSION_RENDERER_BYTES || sample[5] > 4096 || sample[6] > 256) { throw new RangeError('Mission metrics exceed memory, worker or resource bounds.'); }
   if (sample[41] > 2000000) { throw new RangeError('Mission simulation backlog exceeds its bound.'); }
-  if (sample[35] > 64) { throw new RangeError('Mission audio occupancy exceeds its voice bound.'); }
+  if (sample[35] > 256) { throw new RangeError('Mission audio occupancy exceeds its voice object bound.'); }
   const floats = new Float32Array(Uint32Array.of(sample[32], sample[33]).buffer);
   if (sample[31] && (!sample[34] || sample[34] > sample[31] || !Number.isFinite(floats[0]) || floats[0] < 0 || !Number.isFinite(floats[1]) || floats[1] < 0 || floats[1] > 10)) { throw new RangeError('Invalid simulation time sample.'); }
   const simulation = sample[31] ? { samples: sample[31], seconds: floats[0], deltaSeconds: floats[1], epoch: sample[34] } : undefined;

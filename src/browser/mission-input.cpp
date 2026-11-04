@@ -18,6 +18,10 @@ X86_FUNC(sub_0004B525) {
 
 X86_FUNC(__imp__sub_001D2A4E);
 X86_FUNC(__imp__sub_001CDA8A);
+X86_FUNC(__imp__sub_00039AD4);
+X86_FUNC(sub_00039AD4) {
+  if (browser::Runtime::ObserveSdkEntry(ctx, base, 135)) { __imp__sub_00039AD4(ctx, base); }
+}
 X86_FUNC(sub_001D2A4E) {
   if (browser::Runtime::ObserveSdkEntry(ctx, base, 133)) { __imp__sub_001D2A4E(ctx, base); }
 }
@@ -32,6 +36,13 @@ thread_local uint32_t MissionInput::viewport_ = 0;
 
 MissionInput::StepSnapshot MissionInput::SnapshotSteps() const {
   return {steps_.load(), skippedDraws_.load(), updateMicroseconds_.load(), renderMicroseconds_.load(), backlogTicks_.load()};
+}
+
+void MissionInput::ConfigureDevelopmentStart() {
+  if (image_.importsBound || runtime_.HasPublishedImage() || runtime_.ActiveWorkers() || Memory::HasBorrow()) {
+    throw Fault({}, 0, 0, "development start requires a cold unpublished mission runtime");
+  }
+  skipVideos_ = true;
 }
 
 MissionInput::Scene MissionInput::ReadScene(const X86Context& context) {
@@ -169,12 +180,20 @@ void MissionInput::ObserveSimulation(const X86Context& context) {
   observer_(*sample);
 }
 bool MissionInput::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
-  if (id < 132 || id > 134) { return controller_ ? controller_->Dispatch(ctx, base, id) : true; }
+  if (id < 132 || id > 135) { return controller_ ? controller_->Dispatch(ctx, base, id) : true; }
   if (!BelongsTo(runtime_, image_) || !image_.importsBound || image_.boundRuntime != &runtime_ ||
       base != memory_->Base() || !runtime_.OwnsCurrentContext(ctx) || Memory::HasBorrow()) {
     throw Fault(ctx, ctx.esp, 0, "mission input requires its bound current worker without a lease");
   }
   runtime_.Checkpoint(ctx);
+  if (id == 135) {
+    if (!skipVideos_) { return true; }
+    if (uint64_t(ctx.esp) + 24 > UINT32_MAX) { throw Fault(ctx, ctx.esp, 24, "development video frame overflow"); }
+    memory_->CheckRange(ctx, ctx.esp, 24);
+    ctx.eax = 0;
+    ctx.esp += 24;
+    return false;
+  }
   if (id == 133) { Tick(ctx, base); return false; }
   if (id == 134) { Draw(ctx, base); return false; }
   ObserveSimulation(ctx);

@@ -9,7 +9,7 @@ TemporaryFilesystem::TemporaryFilesystem(uint64_t capacity, size_t maximumEntrie
   : clock_(clock ? std::move(clock) : [] {
       return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count() / 100) + 116444736000000000ull;
     }), capacity_(capacity), maximumEntries_(maximumEntries) {
-  if (capacity < AllocationUnit || capacity % AllocationUnit || capacity > 64 * 1024 * 1024 ||
+  if (capacity < AllocationUnit || capacity % AllocationUnit || capacity > MaximumCapacity ||
       !maximumEntries || maximumEntries > 4096) {
     throw std::invalid_argument("invalid temporary filesystem bounds");
   }

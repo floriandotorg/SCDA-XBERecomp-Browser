@@ -199,8 +199,40 @@ void realSourceWorkers() {
 #endif
 }
 
+void reusedSamples() {
+#ifdef __EMSCRIPTEN__
+  std::atomic<uint32_t> samples = 0;
+  const auto origin = std::chrono::steady_clock::now();
+  browser::Runtime runtime({}, {}, [&] {
+    ++samples;
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - origin).count()) / 100;
+  });
+  runtime.ReuseTimerSamples(1);
+  browser::Memory memory;
+  X86Context context{};
+  runtime.Launch(context, memory.Base(), [&](X86Context& ctx, uint8_t*) {
+    uint64_t previous = 0;
+    uint32_t calls = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    while (std::chrono::steady_clock::now() < deadline) {
+      const uint64_t value = runtime.TimerTime(ctx);
+      check(value >= previous, "reused timer samples moved backwards");
+      previous = value;
+      ++calls;
+    }
+    check(calls > 1000 && samples.load() < 120, "timer sample reuse still sampled the source on every call");
+    check(previous >= 400000, "reused timer samples stopped advancing");
+  });
+  if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+  bool rejected = false;
+  try { runtime.ReuseTimerSamples(17); } catch (const browser::Fault&) { rejected = true; }
+  check(rejected, "timer sample reuse accepted an unbounded window");
+#endif
+}
+
 int main() try {
   serializedSampling();
+  reusedSamples();
   workerRealmClock();
   canonicalSourceRefusal();
   realSourceWorkers();

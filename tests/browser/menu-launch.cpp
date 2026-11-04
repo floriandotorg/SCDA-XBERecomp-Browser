@@ -2,14 +2,27 @@
 #include "cpu/x86_ops.h"
 
 #include <array>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
 const auto check = [](bool value, const char* reason) { if (!value) { throw std::runtime_error(reason); } };
 X86_FUNC(__imp__sub_00055666) { throw std::runtime_error("original launch executed"); }
+X86_FUNC(__imp__sub_000530A7) { throw std::runtime_error("original utility mount executed"); }
 X86_FUNC(sub_00055666);
 
 int main() {
+  const auto development = browser::DevelopmentIcelandLaunchPage();
+  const auto launchWord = [&](uint32_t offset) { uint32_t value; std::memcpy(&value, development.data() + offset, 4); return value; };
+  check(launchWord(0) == 0 && launchWord(4) == 0x5553005e, "development launch has the wrong title or type");
+  check(std::strcmp(reinterpret_cast<const char*>(development.data() + 8), "\\DEVICE\\CDROM0;default.xbe") == 0, "development launch changed its executable");
+  check(std::strcmp(reinterpret_cast<const char*>(development.data() + 540), "\\DEVICE\\CDROM0") == 0 &&
+    std::strcmp(reinterpret_cast<const char*>(development.data() + 555), "default.xbe") == 0, "development launch overwrote its device path terminator");
+  check(launchWord(1024) == 0x73636d6f && launchWord(1032) == 0x70616431 && launchWord(1040) == 0x7363336d && launchWord(1044) == 1 && launchWord(1048) == 0x73633370, "development launch lost original payload records");
+  const auto wideText = [&](uint32_t offset) { std::u16string text; for (uint32_t n = offset; n + 1 < development.size(); n += 2) { const char16_t value = development[n] | (uint16_t(development[n + 1]) << 8); if (!value) { return text; } text.push_back(value); } throw std::runtime_error("unterminated launch text"); };
+  check(wideText(1060) == u"SAMFISHER", "development launch lost the temporary player name");
+  check(wideText(1104) == u"MAPNAME=x01_Iceland_a?MENUPAGE=2?PLAYER1=SAMFISHER?MISSIONMODE=1?MISSIONDIFF=1?TRUSTVALUE=75 PLAYERNAME=SAMFISHER TRAVELDATA=FALSE  NEWGAME=TRUE LastScreen=D:\\Default\\DataXb\\Screens\\int\\x01_Iceland_a_loading.tga", "development launch changed the observed New Game request");
+  check(std::all_of(development.begin() + 1528, development.end(), [](uint8_t value) { return value == 0; }), "development launch contains uninitialized tail data");
   const std::array<X86FuncMapping, 1> mappings = {{{0x55666, sub_00055666}}};
   {
     browser::Runtime runtime(mappings, {});
@@ -18,6 +31,7 @@ int main() {
     image.memory->Ensure(0x10000, 4096);
     image.memory->Ensure(0x20000, 8192);
     browser::MenuLaunch launch(runtime, image);
+    launch.ConfigureDevelopmentStart();
     image.image.kernel_thunk = 0x10000;
     image.memory->Write({}, 0x10000, std::array<uint32_t, 1>{0}.data(), 4);
     browser::BindImageImports(image, runtime, {});
@@ -32,6 +46,16 @@ int main() {
         image.memory->Write(ctx, ctx.esp, frame.data(), sizeof(frame));
         return launch.Dispatch(ctx, base, 64);
       };
+      ctx.esp = 0xfffffffcu;
+      bool mountRejected = false;
+      try { launch.Dispatch(ctx, base, 136); } catch (const browser::Fault&) { mountRejected = true; }
+      check(mountRejected && ctx.esp == 0xfffffffcu, "invalid development mount frame changed guest state");
+      for (uint32_t n = 0; n < 2; ++n) {
+        ctx.esp = 0x20f00;
+        const std::array<uint32_t, 2> frame{0x53000, 0};
+        image.memory->Write(ctx, ctx.esp, frame.data(), sizeof(frame));
+        check(launch.Dispatch(ctx, base, 136) && image.memory->Load<uint32_t>(ctx, ctx.esp + 4) == (n ? 0u : 1u), "development utility mount did not initialize exactly once through the original function");
+      }
       for (const char* path : {static_cast<const char*>(nullptr), "", "D:\\sc4_adv.xbe", "D:\\other.xbe", "xdefault.xbe"}) {
         check(!invoke(path, 0), "unsupported launch delegated");
         check(ctx.eax == 2 && ctx.esp == 0x20f0c, "rejected launch ABI");
@@ -82,6 +106,9 @@ int main() {
     X86Context originalContext{};
     originalContext.host = &originalRuntime;
     originalRuntime.Launch(originalContext, originalImage.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+      ctx.esp = 0x20f00;
+      originalImage.memory->Store(ctx, ctx.esp + 4, 0u);
+      check(originalLaunch.Dispatch(ctx, base, 136) && originalImage.memory->Load<uint32_t>(ctx, ctx.esp + 4) == 0, "normal utility mount was changed by development support");
       constexpr char path[] = "D:\\default.xbe";
       originalImage.memory->Write(ctx, 0x20100, path, sizeof(path));
       const std::array<uint32_t, 3> frame = {0x12345, 0x20100, 0x21000};

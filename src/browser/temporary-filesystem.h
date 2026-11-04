@@ -15,6 +15,7 @@ namespace browser {
 class TemporaryFilesystem {
 public:
   static constexpr uint32_t AllocationUnit = 16384;
+  static constexpr uint64_t MaximumCapacity = 512ull * 1024 * 1024;
   struct Metadata {
     bool directory;
     uint64_t size;

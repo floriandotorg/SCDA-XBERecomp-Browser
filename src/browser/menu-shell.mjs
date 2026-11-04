@@ -15,6 +15,7 @@ export const mountMenuShell = ({ root = document } = {}) => {
   root.addEventListener('visibilitychange', suspend);
   const update = () => { evidence.performance = measurement.snapshot(); diagnostic.textContent = JSON.stringify(evidence, null, 2); };
   const shell = mountBootShell({ root, createRuntime: () => createMenuRuntime({
+    developmentStart: root.querySelector('#development-start')?.checked === true,
     acquireCanvas: () => {
       if (!globalThis.navigator?.gpu || typeof canvas.transferControlToOffscreen !== 'function') {
         throw Object.assign(new Error('WebGPU and an offscreen canvas are required in this browser.'), { code: 'CAPABILITY' });
@@ -25,7 +26,8 @@ export const mountMenuShell = ({ root = document } = {}) => {
       started = performance.now();
       measurement.begin();
       lastUpdated = started;
-      evidence = { renderedFrames: 0, firstPresentedFrameMilliseconds: null, adapter: null, validationErrors: [], resources: null };
+      evidence = { developmentStart: root.querySelector('#development-start')?.checked === true,
+        renderedFrames: 0, firstPresentedFrameMilliseconds: null, adapter: null, validationErrors: [], resources: null };
       update();
       return canvas.transferControlToOffscreen();
     },

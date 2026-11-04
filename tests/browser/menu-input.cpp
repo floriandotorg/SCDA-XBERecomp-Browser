@@ -57,7 +57,8 @@ int contracts() {
   memory.Ensure(0x4ec000, 0x1000);
   memory.Ensure(0x80001000, 0x1000);
   image.image.kernel_thunk = 0x10000;
-  auto input = std::make_shared<browser::MenuInput>(runtime, image);
+  auto gamepadStorage = std::make_shared<browser::MenuInput::GamepadStorage>();
+  auto input = std::make_shared<browser::MenuInput>(runtime, image, std::shared_ptr<browser::MenuInput::SharedStorage>{}, gamepadStorage);
   check(input->BelongsTo(runtime, image) && !input->BelongsTo(foreign, image), "input ownership identity missing");
   check(input->SharedWords() == 2 && input->SharedAddress() != nullptr, "input shared state contract changed");
   auto route = std::make_shared<InputRoute>(input);
@@ -72,6 +73,8 @@ int contracts() {
   context.ebx = 0x11223344;
   rejects([&] { input->Dispatch(context, memory.Base(), 40); });
   const auto state = input->SharedAddress();
+  const auto gamepad = input->GamepadAddress();
+  check(input->GamepadWords() == 8 && gamepad == gamepadStorage->data(), "gamepad publication lost its owned storage");
   runtime.Launch(context, memory.Base(), [&](X86Context& ctx, uint8_t* base) {
     const auto call = [&](X86Func* function, std::initializer_list<uint32_t> args) {
       std::vector<uint32_t> frame{0xabcdef};
@@ -135,8 +138,42 @@ int contracts() {
       check(std::equal(expected.begin(), expected.end(), bytes.begin() + 6), "profile keyboard analog button guest offset incorrect");
       check(bytes[4] == 0 && bytes[5] == 0, "analog profile action became a digital button");
     }
+    for (uint32_t n = 0; n < 3; ++n) {
+      state[0].store(131072u << n);
+      bytes = read();
+      check(bytes[4] == (0x20u << n) && bytes[5] == 0,
+        "OPSAT and stick click actions must reach their original digital button bits");
+      check(std::all_of(bytes.begin() + 6, bytes.end(), [](uint8_t value) { return value == 0; }),
+        "digital mission action changed analog buttons or sticks");
+    }
     state[0].store(0);
     read();
+    gamepad[0].store(1);
+    gamepad[1].store(1);
+    gamepad[2].store(browser::MenuInput::Start | browser::MenuInput::Confirm | browser::MenuInput::RightThumb);
+    gamepad[3].store(16384);
+    gamepad[4].store(uint32_t(-8192));
+    gamepad[5].store(uint32_t(-32767));
+    gamepad[6].store(32767);
+    gamepad[0].store(2);
+    bytes = read();
+    check(bytes[4] == 0x90 && bytes[6] == 255 && bytes[14] == 0 && bytes[15] == 0x40 && bytes[16] == 0 && bytes[17] == 0xe0 &&
+      bytes[18] == 1 && bytes[19] == 0x80 && bytes[20] == 255 && bytes[21] == 0x7f, "gamepad axes or original button offsets changed");
+    gamepad[0].store(4);
+    check(read() == bytes, "unchanged gamepad publication fabricated a controller packet");
+    state[0].store(browser::MenuInput::Up | browser::MenuInput::Backward);
+    bytes = read();
+    check(bytes[4] == 0x91 && bytes[14] == 0 && bytes[15] == 0x40 && bytes[16] == 1 && bytes[17] == 0x80,
+      "keyboard and gamepad did not merge buttons or select keyboard axes independently");
+    state[0].store(0);
+    gamepad[0].store(5);
+    bytes = read();
+    check(std::all_of(bytes.begin() + 4, bytes.end(), [](uint8_t value) { return value == 0; }), "partial gamepad publication retained held input");
+    gamepad[0].store(6);
+    check(read()[6] == 255, "completed gamepad publication did not resume input");
+    gamepad[1].store(0);
+    bytes = read();
+    check(std::all_of(bytes.begin() + 4, bytes.end(), [](uint8_t value) { return value == 0; }), "gamepad disconnect retained axes or buttons");
     const uint32_t sentinel = 0xdeadbeef;
     memory.Write(ctx, 0x20000, &sentinel, 4);
     check(call(sub_004EDB86, {0x123456, 0x20000}) == 6, "invalid handle accepted");
@@ -163,6 +200,17 @@ int contracts() {
     state[0].store(0x80000000);
     unsafeState(0x22000, 0x20000);
     state[0].store(0);
+    gamepad[1].store(1);
+    gamepad[3].store(32768);
+    unsafeState(0x22000, 0x20000);
+    gamepad[3].store(0);
+    gamepad[2].store(0x80000000);
+    unsafeState(0x22000, 0x20000);
+    gamepad[2].store(0);
+    gamepad[7].store(1);
+    unsafeState(0x22000, 0x20000);
+    gamepad[7].store(0);
+    gamepad[1].store(0);
     ctx.esp = 0xfffffff8;
     rejects([&] { input->Dispatch(ctx, base, 43); });
     check(ctx.esp == 0xfffffff8, "overflowing input cleanup changed stack");

@@ -1,4 +1,5 @@
 import { MISSION_METRICS_WORDS, MISSION_RENDERER_BYTES } from './mission-metrics.mjs';
+import { AUDIO_FRAMES, AUDIO_CHANNELS } from './audio-transport.mjs';
 import { createWasmIsoReader } from './iso-wasm.mjs';
 import { prepareDiscImage } from './iso-image.mjs';
 import { readMenuStateDiagnostic, readMenuFileDiagnostics } from './menu-state-report.mjs';
@@ -230,8 +231,25 @@ const readInputDescriptor = (module) => {
   const motionOffset = span(module._image_motion_address?.() ?? 0, 20);
   const metricsOffset = span(module._image_metrics_address?.() ?? 0, MISSION_METRICS_WORDS * 4);
   if (metricsOffset && module._image_metrics_words?.() !== MISSION_METRICS_WORDS) { reject(); }
-  if (motionOffset && metricsOffset && motionOffset < metricsOffset + MISSION_METRICS_WORDS * 4 && metricsOffset < motionOffset + 20) { reject(); }
-  return { buffer, byteOffset, words, ...(motionOffset ? { motionOffset } : {}), ...(metricsOffset ? { metricsOffset } : {}) };
+  const audioOffset = span(module._image_audio_address?.() ?? 0, 32);
+  const audioSamplesOffset = span(module._image_audio_samples_address?.() ?? 0, AUDIO_FRAMES * AUDIO_CHANNELS * 4);
+  if (Boolean(audioOffset) !== Boolean(audioSamplesOffset)) { reject(); }
+  let gamepadOffset = 0;
+  if (module._image_gamepad_address !== undefined || module._image_gamepad_words !== undefined) {
+    if (typeof module._image_gamepad_address !== 'function' || typeof module._image_gamepad_words !== 'function') { reject(); }
+    gamepadOffset = span(module._image_gamepad_address(), 32);
+    if (!gamepadOffset || module._image_gamepad_words() !== 8) { reject(); }
+  }
+  const spans = [[motionOffset, 20], [metricsOffset, MISSION_METRICS_WORDS * 4], [audioOffset, 32],
+    [audioSamplesOffset, AUDIO_FRAMES * AUDIO_CHANNELS * 4], [gamepadOffset, 32]].filter(([offset]) => offset);
+  for (let n = 0; n < spans.length; ++n) {
+    const [offset, size] = spans[n];
+    for (const [other, bytes] of spans.slice(n + 1)) {
+      if (offset < other + bytes && other < offset + size) { reject(); }
+    }
+  }
+  return { buffer, byteOffset, words, ...(motionOffset ? { motionOffset } : {}), ...(metricsOffset ? { metricsOffset } : {}),
+    ...(audioOffset ? { audioOffset, audioSamplesOffset } : {}), ...(gamepadOffset ? { gamepadOffset } : {}) };
 };
 
 const readLaunchRequest = (module) => {
@@ -285,7 +303,7 @@ export const readMissionDiagnostic = (module) => {
 
 export const createBootSession = ({ create, manifest, postMessage, prepare = prepareDiscImage, onProgress = () => {} }) => {
   let started = false;
-  return async ({ data: { port, mailbox, generation, ownership, size, webgpuMailbox } }) => {
+  return async ({ data: { port, mailbox, generation, ownership, size, webgpuMailbox, developmentStart = false } }) => {
     if (started) {
       port?.close();
       postMessage({ ok: false, generation, code: 'SESSION', message: 'A boot worker owns one session only.' });
@@ -310,6 +328,7 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
       },
     };
     try {
+      if (typeof developmentStart !== 'boolean') { throw Object.assign(new Error('Invalid development start option.'), { code: 'DEVELOPMENT_START' }); }
       const read = createWasmIsoReader({ port, mailbox, generation, ownership, getHeap: () => module.HEAPU8 });
       ownershipChecked = true;
       signal.throwIfAborted();
@@ -358,6 +377,9 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
         layout: { base: manifest.ranges.X86ImageBase, end: manifest.ranges.X86ImageEnd, entry: manifest.ranges.X86EntryPoint },
       });
       signal.throwIfAborted();
+      if (developmentStart && module._image_development_boot?.() !== 1) {
+        throw Object.assign(new Error('This build cannot start a development mission directly.'), { code: 'DEVELOPMENT_START' });
+      }
       onProgress({ generation, phase: 'booting' });
       signal.throwIfAborted();
       for (const entry of manifest.kernelExports) {
@@ -454,7 +476,7 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
         activeWorkers: module._image_active_workers(), backingBytes: module._image_backing(), identity: manifest.identity,
       };
       signal.throwIfAborted();
-      postMessage(result);
+      postMessage({ ...result, developmentStart });
     } catch (error) {
       const diagnostics = !signal.aborted && !wasmAborted && error.code === 'GRAPHICS_PROTOCOL' && execution ? {
         ...execution, underlyingGuestCode: execution.code, underlyingGuestMessage: execution.message,

@@ -14,7 +14,9 @@ public:
   bool Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) override;
   struct StepSnapshot { uint64_t steps, skippedDraws, updateMicroseconds, renderMicroseconds, backlogTicks; };
   StepSnapshot SnapshotSteps() const;
+  void ConfigureDevelopmentStart();
 private:
+  bool skipVideos_ = false;
   void ObserveSimulation(const X86Context& context);
   struct Scene { uint32_t level = 0, viewport = 0; float seconds = 0; bool active = false; };
   Scene ReadScene(const X86Context& context);

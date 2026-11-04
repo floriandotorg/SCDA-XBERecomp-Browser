@@ -34,6 +34,7 @@ public:
   void RollbackThread(uint32_t handle, uint32_t token) { handles_.RollbackThread(handle, token); }
   void CompleteThread(uint32_t token) { dispatcher_.CompleteThread(token); }
   void CloseThread(uint32_t handle) { handles_.Close(handle); }
+  std::function<void()> BeginFileIo(uint32_t handle) { return handles_.BeginFileIo(handle); }
 
   void Invoke(X86Context& ctx, uint8_t* base, uint32_t ordinal) {
     runtime_.Checkpoint(ctx);
@@ -143,6 +144,15 @@ std::function<bool(uint32_t)> InstallSynchronizationProvider(Runtime& runtime, P
     if (const auto owner = weak.lock()) { owner->CloseThread(handle); }
   };
   image.threadWaitBridge = std::move(bridge);
+  image.beginFileIo = [weak = std::weak_ptr(provider)](uint32_t handle) -> FileIoCompletion {
+    const auto owner = weak.lock();
+    if (!owner) { throw Fault({}, handle, 0, "file read event owner retired"); }
+    try {
+      return {0, [owner, complete = owner->BeginFileIo(handle)] { complete(); }};
+    } catch (const DispatcherError& error) {
+      return {error.status, {}};
+    }
+  };
   image.synchronizationProviderRuntime = &runtime;
   return [weak = std::weak_ptr(provider)](uint32_t handle) {
     const auto owner = weak.lock();

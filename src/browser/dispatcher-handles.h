@@ -46,6 +46,7 @@ public:
   void RollbackCreate(uint32_t handle);
   int32_t SetEvent(uint32_t handle);
   int32_t ResetEvent(uint32_t handle);
+  std::function<void()> BeginFileIo(uint32_t handle);
   int32_t ReleaseSemaphore(uint32_t handle, int32_t count);
   Dispatcher::EventInformation QueryEvent(uint32_t handle);
   Dispatcher::SemaphoreInformation QuerySemaphore(uint32_t handle);

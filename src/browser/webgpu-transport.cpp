@@ -3,12 +3,41 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 
-EM_JS(uint32_t, webgpu_exchange_local, (uint32_t opcode, uint32_t resource, const uint8_t* input, uint32_t size, uint8_t* output, uint32_t* metadata), {
+EM_JS(uint32_t, webgpu_exchange_local, (uint32_t opcode, uint32_t resource, const uint8_t* input, uint32_t size, uint8_t* output, uint32_t* metadata, uint32_t posted), {
   opcode >>>= 0; resource >>>= 0; input >>>= 0; size >>>= 0; output >>>= 0; metadata >>>= 0;
   const mailbox = Module.webgpuMailbox;
   if (!mailbox) { return 4; }
   const header = new Int32Array(mailbox, 0, 16);
   const bytes = new Uint8Array(mailbox, 64);
+  const close = status => { header[5] = 0; header[6] = status; header[7] = status; Atomics.store(header, 0, 4); Atomics.notify(header, 0); };
+  const settle = (command, resource) => {
+    const deadline = Date.now() + 30000;
+    while (Atomics.load(header, 0) < 3) {
+      if (Date.now() >= deadline) { close(2); break; }
+      const state = Atomics.load(header, 0);
+      Atomics.wait(header, 0, state, 1000);
+    }
+    const length = header[5];
+    if (length < 0 || length > 4194304 || header[6] < 0 || header[6] > 3 || (header[1] >>> 0) !== command || (header[3] >>> 0) !== resource) { close(1); return undefined; }
+    const terminal = Atomics.load(header, 0) === 4;
+    return { status: terminal ? header[7] : header[6], length: terminal ? 0 : length, terminal };
+  };
+  const deliver = reply => {
+    if (!reply.terminal) { HEAPU8.set(bytes.subarray(0, reply.length), output); }
+    HEAPU32[metadata >> 2] = header[1];
+    HEAPU32[(metadata >> 2) + 1] = reply.length;
+    Atomics.compareExchange(header, 0, 3, 0);
+    Atomics.notify(header, 0);
+    return reply.status;
+  };
+  if (Atomics.load(header, 8)) {
+    const reply = settle(header[1] >>> 0, header[9] >>> 0);
+    Atomics.store(header, 8, 0);
+    if (!reply) { return 1; }
+    if (reply.status !== 0) { return deliver(reply); }
+    Atomics.compareExchange(header, 0, 3, 0);
+    Atomics.notify(header, 0);
+  }
   if (Atomics.load(header, 0) === 4) { return header[7]; }
   if (Atomics.compareExchange(header, 0, 0, 5) !== 0) { return 1; }
   bytes.set(HEAPU8.subarray(input, input + size));
@@ -19,37 +48,30 @@ EM_JS(uint32_t, webgpu_exchange_local, (uint32_t opcode, uint32_t resource, cons
   header[3] = resource;
   header[4] = size;
   header[5] = 0;
+  if (posted) { header[9] = resource; Atomics.store(header, 8, 1); }
   Atomics.compareExchange(header, 0, 5, 1);
   Atomics.notify(header, 0);
-  const deadline = Date.now() + 30000;
-  while (Atomics.load(header, 0) < 3) {
-    if (Date.now() >= deadline) { header[5] = 0; header[6] = 2; header[7] = 2; Atomics.store(header, 0, 4); Atomics.notify(header, 0); break; }
-    const state = Atomics.load(header, 0);
-    Atomics.wait(header, 0, state, 1000);
+  if (posted) {
+    HEAPU32[metadata >> 2] = command;
+    HEAPU32[(metadata >> 2) + 1] = 0;
+    return 0;
   }
-  const length = header[5];
-  if (length < 0 || length > 4194304 || header[6] < 0 || header[6] > 3 || (header[1] >>> 0) !== command || (header[3] >>> 0) !== resource) { header[5] = 0; header[6] = 1; header[7] = 1; Atomics.store(header, 0, 4); Atomics.notify(header, 0); return 1; }
-  const terminal = Atomics.load(header, 0) === 4;
-  if (!terminal) { HEAPU8.set(bytes.subarray(0, length), output); }
-  HEAPU32[metadata >> 2] = header[1];
-  HEAPU32[(metadata >> 2) + 1] = terminal ? 0 : length;
-  const status = terminal ? header[7] : header[6];
-  Atomics.compareExchange(header, 0, 3, 0);
-  Atomics.notify(header, 0);
-  return status;
+  const reply = settle(command, resource);
+  return reply ? deliver(reply) : 1;
 });
-uint32_t webgpu_exchange(uint32_t opcode, uint32_t resource, const uint8_t* input, uint32_t size, uint8_t* output, uint32_t* metadata) {
-  const auto local = webgpu_exchange_local(opcode, resource, input, size, output, metadata);
+uint32_t webgpu_exchange(uint32_t opcode, uint32_t resource, const uint8_t* input, uint32_t size, uint8_t* output, uint32_t* metadata, bool posted) {
+  const auto local = webgpu_exchange_local(opcode, resource, input, size, output, metadata, posted);
   if (local != 4) { return local; }
   return MAIN_THREAD_EM_ASM_INT({
-    const result = webgpu_exchange_local($0, $1, $2, $3, $4, $5);
+    const result = webgpu_exchange_local($0, $1, $2, $3, $4, $5, 0);
     return result === 4 ? 2 : result;
   }, opcode, resource, input, size, output, metadata);
 }
 #endif
 
 namespace browser::webgpu {
-Result Transport::Execute(Opcode opcode, uint32_t resource, std::span<const uint8_t> bytes) {
+namespace {
+Result Exchange(Opcode opcode, uint32_t resource, std::span<const uint8_t> bytes, bool posted) {
   static std::mutex mutex;
   std::lock_guard lock(mutex);
   Result result{Status::Error, 0, resource, {}};
@@ -57,13 +79,18 @@ Result Transport::Execute(Opcode opcode, uint32_t resource, std::span<const uint
 #ifdef __EMSCRIPTEN__
   static std::vector<uint8_t> reply(MaxBytes);
   uint32_t metadata[2]{};
-  result.status = static_cast<Status>(webgpu_exchange(static_cast<uint32_t>(opcode), resource, bytes.data(), bytes.size(), reply.data(), metadata));
+  result.status = static_cast<Status>(webgpu_exchange(static_cast<uint32_t>(opcode), resource, bytes.data(), bytes.size(), reply.data(), metadata, posted));
   result.command = metadata[0];
   if (metadata[1] > reply.size()) { return {Status::Error, 0, resource, {}}; }
   result.bytes.assign(reply.begin(), reply.begin() + metadata[1]);
 #else
+  (void)posted;
   result.status = Status::Closed;
 #endif
   return result;
 }
+}
+
+Result Transport::Execute(Opcode opcode, uint32_t resource, std::span<const uint8_t> bytes) { return Exchange(opcode, resource, bytes, false); }
+Result Transport::Post(Opcode opcode, uint32_t resource, std::span<const uint8_t> bytes) { return Exchange(opcode, resource, bytes, true); }
 }

@@ -4,6 +4,7 @@ export const MENU_INPUT = Object.freeze({
   forward: 16, backward: 32, strafeLeft: 64, strafeRight: 128,
   start: 256, confirm: 512, back: 1024,
   x: 2048, y: 4096, black: 8192, white: 16384, leftTrigger: 32768, rightTrigger: 65536,
+  select: 131072, leftThumb: 262144, rightThumb: 524288,
 });
 
 const bindings = new Map([
@@ -17,6 +18,10 @@ const bindings = new Map([
   ['KeyX', MENU_INPUT.x], ['KeyY', MENU_INPUT.y],
   ['KeyQ', MENU_INPUT.black], ['KeyE', MENU_INPUT.white],
   ['BracketLeft', MENU_INPUT.leftTrigger], ['BracketRight', MENU_INPUT.rightTrigger],
+  ['Tab', MENU_INPUT.select], ['KeyF', MENU_INPUT.leftThumb], ['Digit1', MENU_INPUT.rightThumb],
+  ['Digit2', MENU_INPUT.left], ['Digit3', MENU_INPUT.right],
+  ['Digit4', MENU_INPUT.up], ['Digit5', MENU_INPUT.down],
+  ['KeyC', MENU_INPUT.back], ['ShiftLeft', MENU_INPUT.y], ['ShiftRight', MENU_INPUT.y],
 ]);
 const producers = new WeakMap();
 

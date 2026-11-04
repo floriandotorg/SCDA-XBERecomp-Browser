@@ -112,7 +112,8 @@ bool Dispatcher::ArmTimer(Object& object, uint64_t deadline, uint64_t periodTick
   object.signal = 0;
   object.deadline = deadline;
   object.period = periodTicks;
-  if (ExpireTimer(object)) { runtime_.Wake(); }
+  ExpireTimer(object);
+  runtime_.Wake();
   return previous;
 }
 
@@ -351,6 +352,7 @@ Dispatcher::WaitOutcome Dispatcher::WaitImpl(const X86Context& ctx, std::span<co
   } pending{*this};
   for (;;) {
     uint64_t sequence;
+    auto clockWait = std::chrono::milliseconds(16);
     {
       std::lock_guard lock(lock_);
       runtime_.Checkpoint(ctx);
@@ -389,6 +391,13 @@ Dispatcher::WaitOutcome Dispatcher::WaitImpl(const X86Context& ctx, std::span<co
         return {WaitResult::Signaled, mode == WaitMode::Any ? std::optional<size_t>(selected) : std::nullopt};
       }
       if (guestDeadline && timerTime_ >= *guestDeadline) { return {WaitResult::TimedOut, std::nullopt}; }
+      auto wake = guestDeadline;
+      for (size_t n = 0; n < count; ++n) {
+        if (objects[n]->deadline && (!wake || *objects[n]->deadline < *wake)) { wake = objects[n]->deadline; }
+      }
+      if (wake && *wake > timerTime_) {
+        clockWait = std::chrono::milliseconds(std::clamp<uint64_t>((*wake - timerTime_ + 9999) / 10000, 1, uint64_t(clockWait.count())));
+      }
       sequence = runtime_.Sequence();
     }
     const auto now = std::chrono::steady_clock::now();
@@ -397,7 +406,7 @@ Dispatcher::WaitOutcome Dispatcher::WaitImpl(const X86Context& ctx, std::span<co
       deadline = now + timeout;
     }
     const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
-    runtime_.Wait(ctx, sequence, pollClock ? std::min(remaining, std::chrono::milliseconds(1)) : remaining);
+    runtime_.Wait(ctx, sequence, pollClock ? std::min(remaining, clockWait) : remaining);
   }
 }
 

@@ -3,15 +3,43 @@
 
 namespace browser {
 
-SilentAudioSink::SilentAudioSink(Runtime& runtime, PreparedImage& image)
-  : runtime_(runtime), image_(image), memory_(image.memory.get()) {
+void AudioOutput::Reset() {
+  header[3].store(0, std::memory_order_release);
+  header[0].store(0, std::memory_order_release);
+  header[1].store(0, std::memory_order_release);
+  header[2].fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool AudioOutput::Submit(std::span<const float> source) {
+  if (!header[3].load(std::memory_order_acquire)) { return false; }
+  const uint32_t write = header[0].load(std::memory_order_relaxed);
+  const uint32_t read = header[1].load(std::memory_order_acquire);
+  const size_t frames = source.size() / audio::kChannels;
+  const uint32_t queued = write - read;
+  if (source.size() % audio::kChannels || queued > kFrames || frames > kFrames - queued) {
+    header[4].fetch_add(uint32_t(frames), std::memory_order_relaxed);
+    return false;
+  }
+  const size_t offset = size_t(write % kFrames) * audio::kChannels;
+  const size_t first = std::min(source.size(), samples.size() - offset);
+  std::copy_n(source.begin(), first, samples.begin() + offset);
+  std::copy(source.begin() + first, source.end(), samples.begin());
+  header[0].store(write + uint32_t(frames), std::memory_order_release);
+  return true;
+}
+
+SilentAudioSink::SilentAudioSink(Runtime& runtime, PreparedImage& image, std::shared_ptr<AudioOutput> output)
+  : runtime_(runtime), image_(image), memory_(image.memory.get()), output_(std::move(output)) {
   runtime_.Checkpoint({});
   if (!memory_ || image.importsBound || image.boundRuntime || runtime.HasPublishedImage() || runtime.ActiveWorkers() ||
       (image.diagnosticRuntime && image.diagnosticRuntime != &runtime) || Memory::HasBorrow()) {
     throw Fault({}, 0, 0, "silent audio requires its unpublished stopped owned image without a backing lease");
   }
   samples_.resize(size_t(kCapacityFrames) * audio::kChannels);
+  if (output_) { output_->Reset(); }
 }
+
+bool SilentAudioSink::NeedsSamples() const { return output_ && output_->header[3].load(std::memory_order_acquire); }
 
 void SilentAudioSink::RequireWorker(const X86Context& context) const {
   if (context.host != &runtime_ || !runtime_.OwnsCurrentContext(context) || !image_.importsBound ||
@@ -60,6 +88,7 @@ void SilentAudioSink::SubmitAtTime(const X86Context& context, uint64_t now, std:
     }
     state_ = state;
     clock_ = clock;
+    if (output_) { output_->Submit(samples); }
   }
   if (consumed) { runtime_.Wake(); }
 }

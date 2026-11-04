@@ -102,6 +102,26 @@ const auto contracts = [] {
     handles.Close(alias);
     check(dispatcher.ActiveObjects() == 0, "last reference retires the object");
   }
+  {
+    const auto event = handles.CreateEvent(false, true);
+    const auto alias = handles.Duplicate(event);
+    auto complete = handles.BeginFileIo(event);
+    check(wait(std::span(&alias, 1)) == 0x102, "file read did not clear its old completion signal");
+    handles.Close(event);
+    complete();
+    check(wait(std::span(&alias, 1)) == 0, "file completion lost the event after its original handle closed");
+    fault([&] { handles.BeginFileIo(event); }, "closed file event admitted a new operation");
+    handles.Close(alias);
+    const auto orphan = handles.CreateEvent(false, false);
+    auto finish = handles.BeginFileIo(orphan);
+    handles.Close(orphan);
+    check(dispatcher.ActiveObjects() == 1, "pending file read lost its only event reference");
+    finish();
+    check(dispatcher.ActiveObjects() == 0, "completed file read retained its orphan event");
+    const auto semaphore = handles.CreateSemaphore(0, 1);
+    fault([&] { handles.BeginFileIo(semaphore); }, "file operation accepted a non-event completion handle");
+    handles.Close(semaphore);
+  }
   for (size_t n = 0; n < 100; ++n) {
     const auto event = handles.CreateEvent(false, false);
     const auto alias = handles.Duplicate(event);

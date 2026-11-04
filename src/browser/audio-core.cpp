@@ -1,8 +1,51 @@
 #include "browser/audio-core.h"
 
 #include <algorithm>
+#include <array>
 
 namespace browser::audio {
+
+std::optional<float> DecodePcm(const Format& format, std::span<const uint8_t> frame, uint32_t channel) {
+  if (format.tag != kFormatPcm || !format.channels || format.channels > kMaxChannels || channel >= format.channels ||
+      (format.bits != 8 && format.bits != 16) || format.align != format.channels * (format.bits / 8) || frame.size() < format.align) {
+    return std::nullopt;
+  }
+  if (format.bits == 8) { return (int32_t(frame[channel]) - 128) / 128.0f; }
+  const uint32_t offset = channel * 2;
+  const uint32_t bits = uint32_t(frame[offset]) | uint32_t(frame[offset + 1]) << 8;
+  return (int32_t(bits) - ((bits & 0x8000) ? 65536 : 0)) / 32768.0f;
+}
+
+bool DecodeAdpcm(std::span<const uint8_t> block, uint32_t channels, std::span<int16_t> decoded) {
+  if (!channels || channels > kMaxChannels || block.size() < channels * 36 || decoded.size() < channels * 65) { return false; }
+  constexpr std::array<int32_t, 89> steps{
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
+    73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449,
+    494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272,
+    2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493,
+    10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+  };
+  constexpr std::array<int32_t, 8> adjustments{-1, -1, -1, -1, 2, 4, 6, 8};
+  std::array<int32_t, kMaxChannels> predictors{}, indices{};
+  for (uint32_t n = 0; n < channels; ++n) {
+    const uint32_t bits = uint32_t(block[n * 4]) | uint32_t(block[n * 4 + 1]) << 8;
+    predictors[n] = int32_t(bits) - ((bits & 0x8000) ? 65536 : 0);
+    indices[n] = std::min<int32_t>(block[n * 4 + 2], 88);
+    decoded[n] = int16_t(predictors[n]);
+  }
+  for (uint32_t n = 0; n < 64 * channels; ++n) {
+    const uint32_t channel = n % channels, frame = n / channels;
+    const uint32_t offset = channels * 4 + (frame / 8 * channels + channel) * 4 + frame % 8 / 2;
+    const uint32_t nibble = (block[offset] >> ((frame & 1) * 4)) & 15;
+    const int32_t step = steps[indices[channel]];
+    const int32_t delta = (step >> 3) + ((nibble & 1) ? step >> 2 : 0) +
+      ((nibble & 2) ? step >> 1 : 0) + ((nibble & 4) ? step : 0);
+    predictors[channel] = std::clamp(predictors[channel] + ((nibble & 8) ? -delta : delta), -32768, 32767);
+    indices[channel] = std::clamp(indices[channel] + adjustments[nibble & 7], 0, 88);
+    decoded[n + channels] = int16_t(predictors[channel]);
+  }
+  return true;
+}
 
 namespace {
 
@@ -354,6 +397,38 @@ StreamInfo Voice::GetStreamInfo() const {
   StreamInfo info;
   info.packetSize = format_.tag == kFormatXboxAdpcm ? kAdpcmBlockBytesPerChannel * format_.channels : format_.align;
   return info;
+}
+
+std::optional<SampleCursor> Voice::Sample(uint64_t now) const {
+  if (!Advancing() || now < anchor_) { return std::nullopt; }
+  const uint64_t delta = now - anchor_;
+  const uint32_t rate = EffectiveRate();
+  const uint64_t scaled = baseNumerator_ % kRate + delta % kRate * rate;
+  SampleCursor cursor;
+  cursor.fraction = uint32_t(scaled % kRate);
+  if (stream_) {
+    if (ReachesNumerator(baseNumerator_, delta, rate, StreamQueuedFrames() * kRate)) { return std::nullopt; }
+    uint64_t frame = baseNumerator_ / kRate + delta / kRate * rate + scaled / kRate;
+    for (uint32_t n = packetHead_; n < packets_.size(); ++n) {
+      if (frame < packets_[n].frames) {
+        cursor.token = packets_[n].token;
+        cursor.frame = uint32_t(frame);
+        return cursor;
+      }
+      frame -= packets_[n].frames;
+    }
+    return std::nullopt;
+  }
+  const uint32_t end = EndFrames();
+  if (!end) { return std::nullopt; }
+  if (ReachesNumerator(baseNumerator_, delta, rate, uint64_t(end) * kRate)) {
+    const uint32_t start = LoopStartFrames();
+    if (!looping_ || end <= start) { return std::nullopt; }
+    cursor.frame = uint32_t(LoopWrapFrames(baseNumerator_, delta, rate, start, end));
+  } else {
+    cursor.frame = uint32_t(baseNumerator_ / kRate + delta / kRate * rate + scaled / kRate);
+  }
+  return cursor;
 }
 
 uint32_t Voice::PlayFrames(uint64_t now) const {

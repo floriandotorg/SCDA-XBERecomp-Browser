@@ -45,7 +45,8 @@ std::function<bool(uint32_t)> InstallFileProvider(Runtime& runtime, PreparedImag
   std::function<DiscReadSnapshot()>* discReads = nullptr,
   std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic = {},
   std::function<bool(uint32_t)>* ownsHandle = nullptr, std::shared_ptr<RawCache> cache = {},
-  std::function<void(FileOperationDiagnostic)> operationDiagnostic = {}, uint32_t maximumReadBytes = 1u << 20);
+  std::function<void(FileOperationDiagnostic)> operationDiagnostic = {}, uint32_t maximumReadBytes = 1u << 20,
+  uint32_t maximumHandles = 64);
 std::shared_ptr<const kernel::DiscIndex> MountedIsoDisc();
 
 }

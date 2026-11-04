@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createBootRuntime } from '../../src/browser/boot-runtime.mjs';
 import { ISO_MAILBOX, isoMailboxHeader } from '../../src/browser/iso-mailbox.mjs';
 
-const fixture = (acknowledge = true) => {
+const fixture = (acknowledge = true, options = {}) => {
   const ioWorkers = [];
   const guestMessages = [];
   let guestReport;
@@ -20,6 +20,7 @@ const fixture = (acknowledge = true) => {
     terminate = () => { this.terminated = true; };
   }
   const runtime = createBootRuntime({
+    ...options,
     WorkerClass: IoWorker,
     createBroker: () => ({
       create: (url, options, report, error) => {
@@ -36,6 +37,16 @@ const fixture = (acknowledge = true) => {
   context.report = (data) => context.reports.push(data);
   return { runtime, context, ioWorkers, guestMessages, get guestReport() { return guestReport; }, get guestError() { return guestError; }, get treeTerminated() { return treeTerminated; } };
 };
+
+test('development start reaches the owned worker only when explicitly selected', async () => {
+  for (const developmentStart of [false, true]) {
+    const harness = fixture(true, { developmentStart });
+    await harness.runtime.start(harness.context);
+    assert.equal(harness.guestMessages[0].developmentStart, developmentStart);
+    await harness.runtime.terminateAll();
+  }
+  assert.throws(() => createBootRuntime({ WorkerClass: EventTarget, developmentStart: 'true' }), /development start/);
+});
 
 test('runtime wires selected source, ownership and completion bridge without player manifest authority', async () => {
   const harness = fixture();

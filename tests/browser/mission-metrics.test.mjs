@@ -83,14 +83,14 @@ test('audio occupancy and rejected creations remain observable and bounded', asy
   const { readMissionMetrics, createMissionMetrics } = await load();
   const words = new Uint32Array(new SharedArrayBuffer(168));
   words[0] = 2;
-  words[35] = 64;
+  words[35] = 256;
   words[36] = 7;
   const sample = readMissionMetrics(words);
-  assert.equal(sample.audioVoices, 64);
+  assert.equal(sample.audioVoices, 256);
   assert.equal(sample.audioVoiceRejections, 7);
   const metrics = createMissionMetrics();
   metrics.present(0, { metrics: sample });
-  assert.equal(metrics.snapshot().peaks.audioVoices, 64);
+  assert.equal(metrics.snapshot().peaks.audioVoices, 256);
   ++words[35];
   assert.throws(() => readMissionMetrics(words), /audio|bound/i);
 });
@@ -115,4 +115,14 @@ test('simulation update, render work and bounded backlog have independent teleme
   assert.equal(metrics.snapshot().peaks.simulationBacklogMicroseconds, 20000);
   words[41] = 2000001;
   assert.throws(() => readMissionMetrics(words), /backlog|bound/i);
+});
+
+test('story cache heap has a checked one GiB telemetry ceiling', async () => {
+  const { readMissionMetrics } = await load();
+  const words = new Uint32Array(new SharedArrayBuffer(168));
+  words[0] = 2;
+  words[1] = 1024 * 1024 * 1024;
+  assert.equal(readMissionMetrics(words).wasmHeapBytes, words[1]);
+  ++words[1];
+  assert.throws(() => readMissionMetrics(words), /memory|bound/i);
 });

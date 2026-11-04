@@ -35,14 +35,16 @@ struct Texture {
   bool cube = false;
   WGPUTextureView sampled = nullptr;
   WGPUTextureView attachment = nullptr;
+  uint32_t volumeDepth = 1;
 };
 struct CachedSampler { WGPUSampler handle; uint64_t used; };
-std::map<std::array<uint32_t, 7>, CachedSampler> sampler_cache;
+std::map<std::array<uint32_t, 8>, CachedSampler> sampler_cache;
 uint64_t sampler_sequence = 0;
 uint32_t cached_views = 0;
-WGPUSampler cached_sampler(const uint32_t (&state)[7]) {
-  std::array<uint32_t, 7> key;
+WGPUSampler cached_sampler(const uint32_t (&state)[7], uint32_t addressW) {
+  std::array<uint32_t, 8> key;
   std::copy(std::begin(state), std::end(state), key.begin());
+  key[7] = addressW;
   auto found = sampler_cache.find(key);
   if (found == sampler_cache.end()) {
     if (sampler_cache.size() == 128) {
@@ -53,6 +55,7 @@ WGPUSampler cached_sampler(const uint32_t (&state)[7]) {
       sampler_cache.erase(oldest);
     }
     auto descriptor = WGPU_SAMPLER_DESCRIPTOR_INIT;
+    descriptor.addressModeW = static_cast<WGPUAddressMode>(addressW);
     descriptor.addressModeU = static_cast<WGPUAddressMode>(state[0]); descriptor.addressModeV = static_cast<WGPUAddressMode>(state[1]);
     descriptor.magFilter = static_cast<WGPUFilterMode>(state[2]); descriptor.minFilter = static_cast<WGPUFilterMode>(state[3]);
     descriptor.mipmapFilter = static_cast<WGPUMipmapFilterMode>(state[4]); descriptor.lodMinClamp = float(state[5]); descriptor.lodMaxClamp = float(state[6]);
@@ -66,7 +69,7 @@ WGPUTextureView sampled_view(Texture& texture) {
   if (!texture.sampled) {
     auto descriptor = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
     if (texture.depth) { descriptor.aspect = WGPUTextureAspect_DepthOnly; }
-    descriptor.dimension = texture.cube ? WGPUTextureViewDimension_Cube : WGPUTextureViewDimension_2D;
+    descriptor.dimension = texture.cube ? WGPUTextureViewDimension_Cube : texture.volumeDepth > 1 ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2D;
     texture.sampled = wgpuTextureCreateView(texture.handle, &descriptor);
     ++cached_views;
   }
@@ -80,9 +83,9 @@ void release_views(Texture& texture) {
   if (texture.sampled) { wgpuTextureViewRelease(texture.sampled); texture.sampled = nullptr; --cached_views; }
   if (texture.attachment) { wgpuTextureViewRelease(texture.attachment); texture.attachment = nullptr; --cached_views; }
 }
-uint64_t textureBytes(uint32_t width, uint32_t height, uint32_t levels) {
+uint64_t textureBytes(uint32_t width, uint32_t height, uint32_t levels, uint32_t depth = 1) {
   uint64_t bytes = 0;
-  for (uint32_t n = 0; n < levels; ++n) { bytes += uint64_t(std::max(width >> n, 1u)) * std::max(height >> n, 1u) * 4; }
+  for (uint32_t n = 0; n < levels; ++n) { bytes += uint64_t(std::max(width >> n, 1u)) * std::max(height >> n, 1u) * std::max(depth >> n, 1u) * 4; }
   return bytes;
 }
 std::map<uint32_t, Texture> textures;
@@ -106,6 +109,9 @@ Texture presentation_target{};
 WGPURenderPipeline depth_upload_pipeline;
 WGPUBindGroupLayout depth_upload_bindings;
 WGPUPipelineLayout depth_upload_layout;
+WGPURenderPipeline depth_readback_pipeline;
+WGPUBindGroupLayout depth_readback_bindings;
+WGPUPipelineLayout depth_readback_layout;
 std::array<WGPURenderPipeline, 9> partial_clear_pipelines{};
 WGPUBindGroupLayout partial_clear_bindings;
 WGPUPipelineLayout partial_clear_layout;
@@ -116,7 +122,7 @@ std::array<uint8_t, 768> gamma_ramp = [] {
 }();
 void discard(uint32_t id) {
   auto image = textures.find(id);
-  if (image != textures.end()) { texture_bytes -= textureBytes(image->second.width, image->second.height, image->second.levels) * (image->second.cube ? 6 : 1); release_views(image->second); wgpuTextureDestroy(image->second.handle); wgpuTextureRelease(image->second.handle); textures.erase(image); }
+  if (image != textures.end()) { texture_bytes -= textureBytes(image->second.width, image->second.height, image->second.levels, image->second.volumeDepth) * (image->second.cube ? 6 : 1); release_views(image->second); wgpuTextureDestroy(image->second.handle); wgpuTextureRelease(image->second.handle); textures.erase(image); }
   auto pipeline = pipelines.find(id);
   if (pipeline != pipelines.end()) { wgpuRenderPipelineRelease(pipeline->second.handle); pipelines.erase(pipeline); }
 }
@@ -211,12 +217,19 @@ struct DrawUploads {
   std::array<std::vector<uint8_t>, 3> bytes;
   std::array<WGPUBuffer, 3> buffers{};
   std::vector<std::array<uint64_t, 3>> offsets;
-  void prepare(std::span<const uint8_t> packets, uint32_t count) {
+  void prepare(std::span<const uint8_t> packets, uint32_t count, bool mixed = false) {
     for (uint32_t n = 0; n < count; ++n) {
+      const auto operation = mixed ? static_cast<Opcode>(packet<uint32_t>(packets)) : Opcode::Draw;
+      if (operation != Opcode::Draw && operation != Opcode::Clear && operation != Opcode::Copy) { throw std::runtime_error("unsupported staged render command"); }
       packet<uint32_t>(packets);
       const uint32_t length = packet<uint32_t>(packets);
       if (length > packets.size()) { throw std::runtime_error("truncated batched draw"); }
       auto payload = packets.first(length);
+      if (operation != Opcode::Draw) {
+        offsets.push_back({});
+        packets = packets.subspan(length);
+        continue;
+      }
       const auto draw = packet<DrawPacket>(payload);
       exact(payload, uint64_t(draw.vertex_bytes) + draw.index_bytes + draw.uniform_bytes);
       std::array<uint64_t, 3> row{};
@@ -307,6 +320,59 @@ void force_opaque_alpha(WGPUCommandEncoder encoder, Texture& target, const CopyP
   wgpuTextureViewRelease(attachment.view); wgpuBindGroupRelease(group); wgpuBufferRelease(uniforms);
 }
 
+WGPUTexture pack_depth(WGPUCommandEncoder encoder, const Texture& target) {
+  if (!depth_readback_pipeline) {
+    auto entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+    entry.binding = 0; entry.visibility = WGPUShaderStage_Fragment;
+    entry.texture.sampleType = WGPUTextureSampleType_Depth; entry.texture.viewDimension = WGPUTextureViewDimension_2D;
+    auto group = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT; group.entryCount = 1; group.entries = &entry;
+    depth_readback_bindings = wgpuDeviceCreateBindGroupLayout(device, &group);
+    auto layout_descriptor = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    layout_descriptor.bindGroupLayoutCount = 1; layout_descriptor.bindGroupLayouts = &depth_readback_bindings;
+    depth_readback_layout = wgpuDeviceCreatePipelineLayout(device, &layout_descriptor);
+    auto source = WGPU_SHADER_SOURCE_WGSL_INIT;
+    source.code = text(R"(
+@group(0) @binding(0) var image: texture_depth_2d;
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+  let positions = array<vec2<f32>, 3>(vec2<f32>(-1,-1), vec2<f32>(3,-1), vec2<f32>(-1,3));
+  return vec4<f32>(positions[index], 0, 1);
+}
+@fragment fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+  let depth = u32(round(clamp(textureLoad(image, vec2<i32>(position.xy), 0), 0.0, 1.0) * 16777215.0));
+  return vec4<f32>(0.0, f32(depth & 255u), f32((depth >> 8u) & 255u), f32(depth >> 16u)) / 255.0;
+}
+)");
+    auto shader_descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT; shader_descriptor.nextInChain = &source.chain;
+    auto shader = wgpuDeviceCreateShaderModule(device, &shader_descriptor);
+    auto color = WGPU_COLOR_TARGET_STATE_INIT; color.format = WGPUTextureFormat_RGBA8Unorm;
+    auto fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = shader; fragment.entryPoint = text("fs_main"); fragment.targetCount = 1; fragment.targets = &color;
+    auto descriptor = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    descriptor.layout = depth_readback_layout; descriptor.vertex.module = shader; descriptor.vertex.entryPoint = text("vs_main");
+    descriptor.fragment = &fragment; descriptor.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    depth_readback_pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor);
+    wgpuShaderModuleRelease(shader);
+  }
+  auto texture_descriptor = WGPU_TEXTURE_DESCRIPTOR_INIT;
+  texture_descriptor.size = {target.width, target.height, 1}; texture_descriptor.format = WGPUTextureFormat_RGBA8Unorm;
+  texture_descriptor.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
+  auto packed = wgpuDeviceCreateTexture(device, &texture_descriptor);
+  auto view_descriptor = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT; view_descriptor.aspect = WGPUTextureAspect_DepthOnly;
+  auto input = wgpuTextureCreateView(target.handle, &view_descriptor);
+  auto entry = WGPU_BIND_GROUP_ENTRY_INIT; entry.binding = 0; entry.textureView = input;
+  auto group_descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+  group_descriptor.layout = depth_readback_bindings; group_descriptor.entryCount = 1; group_descriptor.entries = &entry;
+  auto group = wgpuDeviceCreateBindGroup(device, &group_descriptor);
+  auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+  attachment.view = wgpuTextureCreateView(packed, nullptr); attachment.loadOp = WGPULoadOp_Clear; attachment.storeOp = WGPUStoreOp_Store;
+  auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &attachment;
+  auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+  wgpuRenderPassEncoderSetPipeline(pass, depth_readback_pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
+  wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
+  wgpuTextureViewRelease(attachment.view); wgpuBindGroupRelease(group); wgpuTextureViewRelease(input);
+  return packed;
+}
+
 void prepare_depth_upload() {
   if (depth_upload_pipeline) { return; }
   std::array<WGPUBindGroupLayoutEntry, 2> entries{};
@@ -338,7 +404,10 @@ struct Vertex { @builtin(position) position: vec4<f32>, @location(0) @interpolat
 @fragment fn fs_main(input: Vertex) -> @builtin(frag_depth) f32 {
   let value = pixels[u32(input.position.y) * parameters.width + u32(input.position.x)];
   if ((value & 255u) != input.stencil) { discard; }
-  return f32(value >> 8u) / f32(parameters.maximum);
+  let depth = value >> 8u;
+  if (parameters.maximum == 65535u) { return unpack2x16unorm(depth).x; }
+  let scaled = f32(depth) * 0.000000059604644775390625;
+  return bitcast<f32>(bitcast<u32>(scaled) + select(0u, 1u, depth != 0u));
 }
 )");
   auto shader_descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT; shader_descriptor.nextInChain = &source.chain;
@@ -416,10 +485,13 @@ struct Output { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f3
 }
 void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* uploads = nullptr, uint32_t upload = 0) {
       auto spec = packet<DrawPacket>(bytes); exact(bytes, uint64_t(spec.vertex_bytes) + spec.index_bytes + spec.uniform_bytes);
+      for (const float value : spec.blend_constant) {
+        if (!std::isfinite(value) || value < 0 || value > 1) { throw std::runtime_error("invalid blend constant"); }
+      }
       auto found = pipelines.find(spec.pipeline); if (found == pipelines.end()) { throw std::runtime_error("unknown pipeline resource"); }
       const uint32_t stride = found->second.vertexStride;
       auto* target = resource ? &texture(resource) : nullptr;
-      if ((!target && !spec.depth_target) || (target && (target->depth || target->cube)) || !spec.vertex_bytes || spec.vertex_bytes % stride || spec.vertex_count > spec.vertex_bytes / stride || spec.index32 > 1 || spec.index_bytes != uint64_t(spec.index_count) * (spec.index32 ? 4 : 2) || !spec.uniform_bytes || spec.uniform_bytes > 65536 || spec.uniform_bytes % 16) { throw std::runtime_error("invalid draw payload"); }
+      if ((!target && !spec.depth_target) || (target && (target->depth || target->cube || target->volumeDepth > 1)) || !spec.vertex_bytes || spec.vertex_bytes % stride || spec.vertex_count > spec.vertex_bytes / stride || spec.index32 > 1 || spec.index_bytes != uint64_t(spec.index_count) * (spec.index32 ? 4 : 2) || !spec.uniform_bytes || spec.uniform_bytes > 65536 || spec.uniform_bytes % 16) { throw std::runtime_error("invalid draw payload"); }
       for (uint32_t n = 0; n < spec.index_count; ++n) {
         uint32_t index = 0;
         std::memcpy(&index, bytes.data() + spec.vertex_bytes + n * (spec.index32 ? 4 : 2), spec.index32 ? 4 : 2);
@@ -427,7 +499,7 @@ void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* 
       }
       for (uint32_t n = 0; n < 4; ++n) {
         if (spec.texture[n] == spec.depth_target || spec.texture[n] == resource) { throw std::runtime_error("invalid sampled texture resource"); }
-        if (spec.sampler[n][0] < 1 || spec.sampler[n][0] > 3 || spec.sampler[n][1] < 1 || spec.sampler[n][1] > 3 || spec.sampler[n][2] < 1 || spec.sampler[n][2] > 2 || spec.sampler[n][3] < 1 || spec.sampler[n][3] > 2 || spec.sampler[n][4] < 1 || spec.sampler[n][4] > 2 || spec.sampler[n][5] > spec.sampler[n][6] || spec.sampler[n][6] > 32) { throw std::runtime_error("unsupported sampler state"); }
+        if (spec.sampler[n][0] < 1 || spec.sampler[n][0] > 3 || spec.sampler[n][1] < 1 || spec.sampler[n][1] > 3 || spec.sampler[n][2] < 1 || spec.sampler[n][2] > 2 || spec.sampler[n][3] < 1 || spec.sampler[n][3] > 2 || spec.sampler[n][4] < 1 || spec.sampler[n][4] > 2 || spec.sampler[n][5] > spec.sampler[n][6] || spec.sampler[n][6] > 32 || spec.address_w[n] < 1 || spec.address_w[n] > 3) { throw std::runtime_error("unsupported sampler state"); }
       }
       if (spec.depth_target && !texture(spec.depth_target).depth) { throw std::runtime_error("invalid depth target resource"); }
       const std::array<uint64_t, 3> offsets = uploads ? uploads->offsets[upload] : std::array<uint64_t, 3>{};
@@ -439,7 +511,7 @@ void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* 
       entries[0] = WGPU_BIND_GROUP_ENTRY_INIT; entries[0].binding = 0; entries[0].buffer = uniforms; entries[0].offset = offsets[2]; entries[0].size = spec.uniform_bytes;
       for (uint32_t n = 0; n < 4; ++n) {
         auto& sampled = texture(spec.texture[n]);
-        samplers[n] = cached_sampler(spec.sampler[n]);
+        samplers[n] = cached_sampler(spec.sampler[n], spec.address_w[n]);
         views[n] = sampled_view(sampled);
         entries[1 + n * 2] = WGPU_BIND_GROUP_ENTRY_INIT; entries[1 + n * 2].binding = 1 + n * 2; entries[1 + n * 2].textureView = views[n];
         entries[2 + n * 2] = WGPU_BIND_GROUP_ENTRY_INIT; entries[2 + n * 2].binding = 2 + n * 2; entries[2 + n * 2].sampler = samplers[n];
@@ -461,6 +533,8 @@ void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* 
       if (batch_encoder) { batch_pass = pass; batch_color = resource; batch_depth = spec.depth_target; }
       wgpuRenderPassEncoderSetPipeline(pass, found->second.handle); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr); wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertices, offsets[0], spec.vertex_bytes);
       wgpuRenderPassEncoderSetStencilReference(pass, spec.stencil_reference);
+      const WGPUColor blendConstant{spec.blend_constant[0], spec.blend_constant[1], spec.blend_constant[2], spec.blend_constant[3]};
+      wgpuRenderPassEncoderSetBlendConstant(pass, &blendConstant);
       wgpuRenderPassEncoderSetViewport(pass, spec.viewport[0], spec.viewport[1], spec.viewport[2], spec.viewport[3], spec.viewport[4], spec.viewport[5]); wgpuRenderPassEncoderSetScissorRect(pass, spec.scissor[0], spec.scissor[1], spec.scissor[2], spec.scissor[3]);
       if (indices) { wgpuRenderPassEncoderSetIndexBuffer(pass, indices, spec.index32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16, offsets[1], spec.index_bytes); wgpuRenderPassEncoderDrawIndexed(pass, spec.index_count, 1, 0, 0, 0); }
       else { wgpuRenderPassEncoderDraw(pass, spec.vertex_count, 1, 0, 0); }
@@ -468,6 +542,70 @@ void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* 
       for (auto item : samplers) { wgpuSamplerRelease(item); }
       wgpuBindGroupRelease(group);
       if (!uploads) { wgpuBufferRelease(vertices); wgpuBufferRelease(uniforms); if (indices) { wgpuBufferRelease(indices); } }
+}
+void clear(uint32_t resource, std::span<const uint8_t> bytes) {
+      const auto spec = packet<ClearPacket>(bytes); exact(bytes, uint64_t(spec.rect_count) * 16);
+      if (!spec.flags || spec.flags > 7 || spec.rect_count > 4096 || spec.stencil > 255 || !std::isfinite(spec.depth) || spec.depth < 0 || spec.depth > 1 ||
+          std::any_of(std::begin(spec.color), std::end(spec.color), [](float value) { return !std::isfinite(value) || value < 0 || value > 1; })) { throw std::runtime_error("invalid clear state"); }
+      auto* target = spec.flags & 1 ? &texture(resource) : nullptr;
+      auto* depth_target = spec.flags & 6 ? &texture(spec.depth_target) : nullptr;
+      if ((target && (target->depth || target->cube || target->volumeDepth > 1)) || (depth_target && !depth_target->depth) ||
+          (target && depth_target && (target->width != depth_target->width || target->height != depth_target->height))) { throw std::runtime_error("invalid clear attachment"); }
+      auto color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; auto depth = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+      auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+      if (target) {
+        color.view = wgpuTextureCreateView(target->handle, nullptr); color.loadOp = spec.rect_count ? WGPULoadOp_Load : WGPULoadOp_Clear;
+        color.storeOp = WGPUStoreOp_Store; color.clearValue = {spec.color[0], spec.color[1], spec.color[2], spec.color[3]};
+        descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &color;
+      }
+      if (depth_target) {
+        depth.view = wgpuTextureCreateView(depth_target->handle, nullptr);
+        depth.depthLoadOp = !spec.rect_count && (spec.flags & 2) ? WGPULoadOp_Clear : WGPULoadOp_Load;
+        depth.stencilLoadOp = !spec.rect_count && (spec.flags & 4) ? WGPULoadOp_Clear : WGPULoadOp_Load;
+        depth.depthStoreOp = WGPUStoreOp_Store; depth.stencilStoreOp = WGPUStoreOp_Store;
+        depth.depthClearValue = spec.depth; depth.stencilClearValue = spec.stencil; descriptor.depthStencilAttachment = &depth;
+      }
+      WGPUBuffer uniforms = nullptr; WGPUBindGroup group = nullptr;
+      WGPURenderPipeline pipeline = nullptr;
+      if (spec.rect_count) {
+        pipeline = partial_clear_pipeline(spec.flags);
+        std::array<float, 8> parameters{spec.color[0], spec.color[1], spec.color[2], spec.color[3], spec.depth};
+        uniforms = buffer({reinterpret_cast<const uint8_t*>(parameters.data()), sizeof(parameters)}, WGPUBufferUsage_Uniform);
+        auto entry = WGPU_BIND_GROUP_ENTRY_INIT; entry.binding = 0; entry.buffer = uniforms; entry.size = sizeof(parameters);
+        auto descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT; descriptor.layout = partial_clear_bindings; descriptor.entryCount = 1; descriptor.entries = &entry;
+        group = wgpuDeviceCreateBindGroup(device, &descriptor);
+      }
+      end_batch_pass();
+      auto encoder = batch_encoder ? batch_encoder : wgpuDeviceCreateCommandEncoder(device, nullptr);
+      auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+      if (spec.rect_count) {
+        wgpuRenderPassEncoderSetPipeline(pass, pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
+        wgpuRenderPassEncoderSetStencilReference(pass, spec.stencil);
+        const auto& dimensions = target ? *target : *depth_target;
+        for (uint32_t n = 0; n < spec.rect_count; ++n) {
+          std::array<int32_t, 4> rectangle{};
+          std::memcpy(rectangle.data(), bytes.data() + n * 16, 16);
+          const uint32_t left = std::clamp<int64_t>(rectangle[0], 0, dimensions.width), right = std::clamp<int64_t>(rectangle[2], 0, dimensions.width);
+          const uint32_t top = std::clamp<int64_t>(rectangle[1], 0, dimensions.height), bottom = std::clamp<int64_t>(rectangle[3], 0, dimensions.height);
+          if (left >= right || top >= bottom) { continue; }
+          wgpuRenderPassEncoderSetScissorRect(pass, left, top, right - left, bottom - top); wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+        }
+      }
+      wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
+      if (!batch_encoder) { submit(encoder); }
+      if (group) { wgpuBindGroupRelease(group); } if (uniforms) { wgpuBufferRelease(uniforms); }
+      if (color.view) { wgpuTextureViewRelease(color.view); } if (depth.view) { wgpuTextureViewRelease(depth.view); }
+}
+void copy(uint32_t resource, std::span<const uint8_t> bytes) {
+      auto copy = packet<CopyPacket>(bytes); exact(bytes, 0);
+      auto& source = texture(copy.source); auto& target = texture(resource);
+      if (source.depth || target.depth || source.cube || target.cube || source.volumeDepth > 1 || target.volumeDepth > 1 || copy.force_opaque > 1 || !copy.width || !copy.height || uint64_t(copy.source_x) + copy.width > source.width || uint64_t(copy.source_y) + copy.height > source.height || uint64_t(copy.destination_x) + copy.width > target.width || uint64_t(copy.destination_y) + copy.height > target.height || copy.source == resource) { throw std::runtime_error("invalid texture copy region, format or alias"); }
+      auto from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; from.texture = source.handle; from.origin = {copy.source_x, copy.source_y, 0}; auto to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; to.texture = target.handle; to.origin = {copy.destination_x, copy.destination_y, 0};
+      WGPUExtent3D extent{copy.width, copy.height, 1};
+      end_batch_pass();
+      auto encoder = batch_encoder ? batch_encoder : wgpuDeviceCreateCommandEncoder(device, nullptr); wgpuCommandEncoderCopyTextureToTexture(encoder, &from, &to, &extent);
+      if (copy.force_opaque) { force_opaque_alpha(encoder, target, copy); }
+      if (!batch_encoder) { submit(encoder); }
 }
 void release_resources() {
   for (const auto& [key, item] : sampler_cache) { wgpuSamplerRelease(item.handle); }
@@ -478,6 +616,9 @@ void release_resources() {
   if (depth_upload_pipeline) { wgpuRenderPipelineRelease(depth_upload_pipeline); depth_upload_pipeline = nullptr; }
   if (depth_upload_layout) { wgpuPipelineLayoutRelease(depth_upload_layout); depth_upload_layout = nullptr; }
   if (depth_upload_bindings) { wgpuBindGroupLayoutRelease(depth_upload_bindings); depth_upload_bindings = nullptr; }
+  if (depth_readback_pipeline) { wgpuRenderPipelineRelease(depth_readback_pipeline); depth_readback_pipeline = nullptr; }
+  if (depth_readback_layout) { wgpuPipelineLayoutRelease(depth_readback_layout); depth_readback_layout = nullptr; }
+  if (depth_readback_bindings) { wgpuBindGroupLayoutRelease(depth_readback_bindings); depth_readback_bindings = nullptr; }
   release_presentation_target();
   if (gamma_texture) { wgpuTextureDestroy(gamma_texture); wgpuTextureRelease(gamma_texture); gamma_texture = nullptr; }
   if (presentation_pipeline) { wgpuRenderPipelineRelease(presentation_pipeline); presentation_pipeline = nullptr; }
@@ -488,14 +629,14 @@ void release_resources() {
   for (auto& entry : pipelines) { wgpuRenderPipelineRelease(entry.second.handle); }
   pipelines.clear();
 }
-std::pair<WGPUBindGroupLayout, WGPUPipelineLayout> create_bindings(uint32_t cubeMask, uint32_t shadowMask = 0) {
+std::pair<WGPUBindGroupLayout, WGPUPipelineLayout> create_bindings(uint32_t cubeMask, uint32_t shadowMask = 0, uint32_t volumeMask = 0) {
   std::array<WGPUBindGroupLayoutEntry, 9> entries{};
   for (uint32_t n = 0; n < entries.size(); ++n) {
     entries[n] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
     entries[n].binding = n;
     entries[n].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
     if (n == 0) { entries[n].buffer.type = WGPUBufferBindingType_Uniform; }
-    else if (n % 2 == 1) { entries[n].texture.sampleType = shadowMask & (1u << ((n - 1) / 2)) ? WGPUTextureSampleType_Depth : WGPUTextureSampleType_Float; entries[n].texture.viewDimension = cubeMask & (1u << ((n - 1) / 2)) ? WGPUTextureViewDimension_Cube : WGPUTextureViewDimension_2D; }
+    else if (n % 2 == 1) { entries[n].texture.sampleType = shadowMask & (1u << ((n - 1) / 2)) ? WGPUTextureSampleType_Depth : WGPUTextureSampleType_Float; entries[n].texture.viewDimension = cubeMask & (1u << ((n - 1) / 2)) ? WGPUTextureViewDimension_Cube : volumeMask & (1u << ((n - 1) / 2)) ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2D; }
     else { entries[n].sampler.type = WGPUSamplerBindingType_Filtering; }
   }
   auto descriptor = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
@@ -552,7 +693,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_start() {
 #ifdef WEBGPU_SERVICE_TESTING
 EMSCRIPTEN_KEEPALIVE void webgpu_test_loss() { wgpuDeviceDestroy(device); }
 #endif
-EMSCRIPTEN_KEEPALIVE uint32_t webgpu_resources() { return textures.size() + pipelines.size() + sampler_cache.size() + cached_views + (gamma_texture ? 1 : 0) + (presentation_pipeline ? 1 : 0) + (presentation_target.handle ? 1 : 0) + (depth_upload_pipeline ? 1 : 0) + std::count_if(partial_clear_pipelines.begin(), partial_clear_pipelines.end(), [](auto pipeline) { return pipeline != nullptr; }); }
+EMSCRIPTEN_KEEPALIVE uint32_t webgpu_resources() { return textures.size() + pipelines.size() + sampler_cache.size() + cached_views + (gamma_texture ? 1 : 0) + (presentation_pipeline ? 1 : 0) + (presentation_target.handle ? 1 : 0) + (depth_upload_pipeline ? 1 : 0) + (depth_readback_pipeline ? 1 : 0) + std::count_if(partial_clear_pipelines.begin(), partial_clear_pipelines.end(), [](auto pipeline) { return pipeline != nullptr; }); }
 EMSCRIPTEN_KEEPALIVE void webgpu_shutdown() {
   closed = true;
   if (active) { active = false; completed(2, nullptr, 0, "GPU service shutdown"); }
@@ -591,27 +732,35 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
     case Opcode::CreateTexture: {
       if (!resource || textures.contains(resource) || pipelines.contains(resource) || textures.size() + pipelines.size() >= 4096) { throw std::runtime_error("duplicate or exhausted GPU resource ID"); }
       auto spec = packet<TexturePacket>(bytes);
-      if (!spec.width || !spec.height || spec.width > 8192 || spec.height > 8192 || spec.depth > 2 || (spec.depth == 2 && spec.width != spec.height) || !spec.levels || spec.levels > std::bit_width(std::max(spec.width, spec.height)) || (spec.depth == 1 && spec.levels != 1)) { throw std::runtime_error("invalid texture dimensions or format"); }
+      const uint32_t volumeDepth = spec.depth == 3 ? packet<uint32_t>(bytes) : 1;
+      const uint32_t maximum = std::max({spec.width, spec.height, volumeDepth});
+      if (!spec.width || !spec.height || spec.width > 8192 || spec.height > 8192 || spec.depth > 3 ||
+          (spec.depth == 2 && spec.width != spec.height) || !volumeDepth || volumeDepth > 2048 ||
+          (spec.depth == 3 && (volumeDepth == 1 || spec.width > 2048 || spec.height > 2048)) ||
+          !spec.levels || spec.levels > std::bit_width(maximum) || (spec.depth == 1 && spec.levels != 1)) {
+        throw std::runtime_error("invalid texture dimensions or format");
+      }
       const uint32_t faces = spec.depth == 2 ? 6 : 1;
-      const uint64_t storageBytes = textureBytes(spec.width, spec.height, spec.levels) * faces;
+      const uint64_t storageBytes = textureBytes(spec.width, spec.height, spec.levels, volumeDepth) * faces;
       exact(bytes, spec.depth == 1 ? 0 : storageBytes);
       if (texture_bytes + storageBytes > TextureBudget) { throw std::runtime_error("GPU texture budget exhausted"); }
       auto descriptor = WGPU_TEXTURE_DESCRIPTOR_INIT;
-      descriptor.size = {spec.width, spec.height, faces}; descriptor.mipLevelCount = spec.levels;
+      descriptor.dimension = spec.depth == 3 ? WGPUTextureDimension_3D : WGPUTextureDimension_2D;
+      descriptor.size = {spec.width, spec.height, spec.depth == 3 ? volumeDepth : faces}; descriptor.mipLevelCount = spec.levels;
       descriptor.format = spec.depth == 1 ? WGPUTextureFormat_Depth24PlusStencil8 : WGPUTextureFormat_RGBA8Unorm;
-      descriptor.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
-#ifdef WEBGPU_SERVICE_TESTING
-      if (spec.depth == 1) { descriptor.usage |= WGPUTextureUsage_CopySrc; }
-#endif
-      if (spec.depth != 1) { descriptor.usage |= WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst; }
+      descriptor.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc;
+      if (spec.depth != 3) { descriptor.usage |= WGPUTextureUsage_RenderAttachment; }
+      if (spec.depth != 1) { descriptor.usage |= WGPUTextureUsage_CopyDst; }
       auto handle = wgpuDeviceCreateTexture(device, &descriptor);
-      textures.emplace(resource, Texture{handle, spec.width, spec.height, spec.depth == 1, spec.levels, spec.depth == 2}); texture_bytes += storageBytes; created_resource = resource;
+      Texture stored{handle, spec.width, spec.height, spec.depth == 1, spec.levels, spec.depth == 2};
+      stored.volumeDepth = volumeDepth;
+      textures.emplace(resource, stored); texture_bytes += storageBytes; created_resource = resource;
       if (spec.depth != 1) {
         size_t offset = 0;
         for (uint32_t n = 0; n < spec.levels * faces; ++n) {
           const uint32_t level = n % spec.levels;
-          WGPUExtent3D extent{std::max(spec.width >> level, 1u), std::max(spec.height >> level, 1u), 1};
-          const size_t size = size_t(extent.width) * extent.height * 4;
+          WGPUExtent3D extent{std::max(spec.width >> level, 1u), std::max(spec.height >> level, 1u), std::max(volumeDepth >> level, 1u)};
+          const size_t size = size_t(extent.width) * extent.height * extent.depthOrArrayLayers * 4;
           auto destination = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; destination.texture = handle; destination.mipLevel = level; destination.origin.z = n / spec.levels;
           auto layout = WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT; layout.bytesPerRow = extent.width * 4; layout.rowsPerImage = extent.height;
           wgpuQueueWriteTexture(queue, &destination, bytes.data() + offset, size, &layout, &extent);
@@ -625,7 +774,8 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       if (pipelines.size() >= 256) { throw std::runtime_error("GPU pipeline budget exhausted"); }
       auto spec = packet<PipelinePacket>(bytes); exact(bytes, uint64_t(spec.vertex_bytes) + spec.fragment_bytes);
       if (spec.vertex_mask > 65535) { throw std::runtime_error("invalid vertex register mask"); }
-      if (spec.cube_mask > 15 || spec.shadow_mask > 15 || (spec.cube_mask & spec.shadow_mask) || spec.color_target > 1 || (!spec.color_target && spec.write_mask)) { throw std::runtime_error("invalid cube binding mask"); }
+      if (spec.cube_mask > 15 || spec.shadow_mask > 15 || spec.volume_mask > 15 ||
+          (spec.cube_mask & spec.shadow_mask) || (spec.volume_mask & (spec.cube_mask | spec.shadow_mask)) || spec.color_target > 1 || (!spec.color_target && spec.write_mask)) { throw std::runtime_error("invalid cube binding mask"); }
       if (spec.stencil > 1 || (spec.stencil && (!spec.depth || spec.stencil_compare < 1 || spec.stencil_compare > 8 || spec.stencil_fail < 1 || spec.stencil_fail > 8 || spec.stencil_depth_fail < 1 || spec.stencil_depth_fail > 8 || spec.stencil_pass < 1 || spec.stencil_pass > 8 || spec.stencil_read_mask > 255 || spec.stencil_write_mask > 255))) { throw std::runtime_error("invalid stencil pipeline state"); }
       auto shader = [](std::span<const uint8_t> code) {
         auto source = WGPU_SHADER_SOURCE_WGSL_INIT;
@@ -660,29 +810,37 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
         depth.stencilReadMask = spec.stencil_read_mask; depth.stencilWriteMask = spec.stencil_write_mask;
       }
       auto descriptor = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
-      const auto custom = (spec.cube_mask || spec.shadow_mask) ? create_bindings(spec.cube_mask, spec.shadow_mask) : std::pair<WGPUBindGroupLayout, WGPUPipelineLayout>{};
-      descriptor.layout = (spec.cube_mask || spec.shadow_mask) ? custom.second : layout; descriptor.vertex.module = vertex; descriptor.vertex.entryPoint = text("vs_main"); descriptor.vertex.bufferCount = 1; descriptor.vertex.buffers = &vertex_layout;
+      const auto custom = (spec.cube_mask || spec.shadow_mask || spec.volume_mask) ? create_bindings(spec.cube_mask, spec.shadow_mask, spec.volume_mask) : std::pair<WGPUBindGroupLayout, WGPUPipelineLayout>{};
+      descriptor.layout = (spec.cube_mask || spec.shadow_mask || spec.volume_mask) ? custom.second : layout; descriptor.vertex.module = vertex; descriptor.vertex.entryPoint = text("vs_main"); descriptor.vertex.bufferCount = 1; descriptor.vertex.buffers = &vertex_layout;
       descriptor.fragment = &pixel; descriptor.primitive.topology = static_cast<WGPUPrimitiveTopology>(spec.topology); descriptor.primitive.cullMode = static_cast<WGPUCullMode>(spec.cull); descriptor.primitive.frontFace = static_cast<WGPUFrontFace>(spec.front_face);
       if (spec.depth) { descriptor.depthStencil = &depth; }
       auto pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor); pipelines.emplace(resource, Pipeline{pipeline, attributeCount * 16}); created_resource = resource;
-      if (spec.cube_mask || spec.shadow_mask) { wgpuPipelineLayoutRelease(custom.second); wgpuBindGroupLayoutRelease(custom.first); }
+      if (spec.cube_mask || spec.shadow_mask || spec.volume_mask) { wgpuPipelineLayoutRelease(custom.second); wgpuBindGroupLayoutRelease(custom.first); }
       wgpuShaderModuleRelease(vertex); wgpuShaderModuleRelease(fragment);
       break;
     }
     case Opcode::Draw: { draw(resource, bytes); break; }
-    case Opcode::DrawBatch: {
+    case Opcode::DrawBatch:
+    case Opcode::RenderBatch: {
+      const bool mixed = static_cast<Opcode>(operation) == Opcode::RenderBatch;
       if (resource) { throw std::runtime_error("draw batch cannot name a target"); }
       const uint32_t count = packet<uint32_t>(bytes);
       if (!count || count > 256) { throw std::runtime_error("invalid draw batch count"); }
       DrawUploads uploads;
-      uploads.prepare(bytes, count);
+      uploads.prepare(bytes, count, mixed);
       auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
       batch_encoder = encoder;
       try {
         for (uint32_t n = 0; n < count; ++n) {
+          const auto opcode = mixed ? static_cast<Opcode>(packet<uint32_t>(bytes)) : Opcode::Draw;
           const uint32_t target = packet<uint32_t>(bytes), size = packet<uint32_t>(bytes);
           if (size > bytes.size()) { throw std::runtime_error("truncated batched draw"); }
-          try { draw(target, bytes.first(size), &uploads, n); }
+          try {
+            if (opcode == Opcode::Draw) { draw(target, bytes.first(size), &uploads, n); }
+            else if (opcode == Opcode::Clear) { clear(target, bytes.first(size)); }
+            else if (opcode == Opcode::Copy) { copy(target, bytes.first(size)); }
+            else { throw std::runtime_error("unsupported staged render command"); }
+          }
           catch (const std::exception& error) { throw std::runtime_error("batched draw " + std::to_string(n) + " target=" + std::to_string(target) + ": " + error.what()); }
           bytes = bytes.subspan(size);
         }
@@ -698,57 +856,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       submit(encoder);
       break;
     }
-    case Opcode::Clear: {
-      const auto spec = packet<ClearPacket>(bytes); exact(bytes, uint64_t(spec.rect_count) * 16);
-      if (!spec.flags || spec.flags > 7 || spec.rect_count > 4096 || spec.stencil > 255 || !std::isfinite(spec.depth) || spec.depth < 0 || spec.depth > 1 ||
-          std::any_of(std::begin(spec.color), std::end(spec.color), [](float value) { return !std::isfinite(value) || value < 0 || value > 1; })) { throw std::runtime_error("invalid clear state"); }
-      auto* target = spec.flags & 1 ? &texture(resource) : nullptr;
-      auto* depth_target = spec.flags & 6 ? &texture(spec.depth_target) : nullptr;
-      if ((target && (target->depth || target->cube)) || (depth_target && !depth_target->depth) ||
-          (target && depth_target && (target->width != depth_target->width || target->height != depth_target->height))) { throw std::runtime_error("invalid clear attachment"); }
-      auto color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; auto depth = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
-      auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-      if (target) {
-        color.view = wgpuTextureCreateView(target->handle, nullptr); color.loadOp = spec.rect_count ? WGPULoadOp_Load : WGPULoadOp_Clear;
-        color.storeOp = WGPUStoreOp_Store; color.clearValue = {spec.color[0], spec.color[1], spec.color[2], spec.color[3]};
-        descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &color;
-      }
-      if (depth_target) {
-        depth.view = wgpuTextureCreateView(depth_target->handle, nullptr);
-        depth.depthLoadOp = !spec.rect_count && (spec.flags & 2) ? WGPULoadOp_Clear : WGPULoadOp_Load;
-        depth.stencilLoadOp = !spec.rect_count && (spec.flags & 4) ? WGPULoadOp_Clear : WGPULoadOp_Load;
-        depth.depthStoreOp = WGPUStoreOp_Store; depth.stencilStoreOp = WGPUStoreOp_Store;
-        depth.depthClearValue = spec.depth; depth.stencilClearValue = spec.stencil; descriptor.depthStencilAttachment = &depth;
-      }
-      WGPUBuffer uniforms = nullptr; WGPUBindGroup group = nullptr;
-      WGPURenderPipeline pipeline = nullptr;
-      if (spec.rect_count) {
-        pipeline = partial_clear_pipeline(spec.flags);
-        std::array<float, 8> parameters{spec.color[0], spec.color[1], spec.color[2], spec.color[3], spec.depth};
-        uniforms = buffer({reinterpret_cast<const uint8_t*>(parameters.data()), sizeof(parameters)}, WGPUBufferUsage_Uniform);
-        auto entry = WGPU_BIND_GROUP_ENTRY_INIT; entry.binding = 0; entry.buffer = uniforms; entry.size = sizeof(parameters);
-        auto descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT; descriptor.layout = partial_clear_bindings; descriptor.entryCount = 1; descriptor.entries = &entry;
-        group = wgpuDeviceCreateBindGroup(device, &descriptor);
-      }
-      auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr); auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
-      if (spec.rect_count) {
-        wgpuRenderPassEncoderSetPipeline(pass, pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
-        wgpuRenderPassEncoderSetStencilReference(pass, spec.stencil);
-        const auto& dimensions = target ? *target : *depth_target;
-        for (uint32_t n = 0; n < spec.rect_count; ++n) {
-          std::array<int32_t, 4> rectangle{};
-          std::memcpy(rectangle.data(), bytes.data() + n * 16, 16);
-          const uint32_t left = std::clamp<int64_t>(rectangle[0], 0, dimensions.width), right = std::clamp<int64_t>(rectangle[2], 0, dimensions.width);
-          const uint32_t top = std::clamp<int64_t>(rectangle[1], 0, dimensions.height), bottom = std::clamp<int64_t>(rectangle[3], 0, dimensions.height);
-          if (left >= right || top >= bottom) { continue; }
-          wgpuRenderPassEncoderSetScissorRect(pass, left, top, right - left, bottom - top); wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
-        }
-      }
-      wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass); submit(encoder);
-      if (group) { wgpuBindGroupRelease(group); } if (uniforms) { wgpuBufferRelease(uniforms); }
-      if (color.view) { wgpuTextureViewRelease(color.view); } if (depth.view) { wgpuTextureViewRelease(depth.view); }
-      break;
-    }
+    case Opcode::Clear: { clear(resource, bytes); break; }
     case Opcode::UploadDepth: {
       const auto spec = packet<DepthUploadPacket>(bytes);
       auto& target = texture(resource);
@@ -795,23 +903,14 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       wgpuBufferRelease(values); wgpuBufferRelease(uniforms);
       break;
     }
-    case Opcode::Copy: {
-      auto copy = packet<CopyPacket>(bytes); exact(bytes, 0);
-      auto& source = texture(copy.source); auto& target = texture(resource);
-      if (source.depth || target.depth || source.cube || target.cube || copy.force_opaque > 1 || !copy.width || !copy.height || uint64_t(copy.source_x) + copy.width > source.width || uint64_t(copy.source_y) + copy.height > source.height || uint64_t(copy.destination_x) + copy.width > target.width || uint64_t(copy.destination_y) + copy.height > target.height || copy.source == resource) { throw std::runtime_error("invalid texture copy region, format or alias"); }
-      auto from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; from.texture = source.handle; from.origin = {copy.source_x, copy.source_y, 0}; auto to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; to.texture = target.handle; to.origin = {copy.destination_x, copy.destination_y, 0};
-      WGPUExtent3D extent{copy.width, copy.height, 1}; auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr); wgpuCommandEncoderCopyTextureToTexture(encoder, &from, &to, &extent);
-      if (copy.force_opaque) { force_opaque_alpha(encoder, target, copy); }
-      submit(encoder);
-      break;
-    }
+    case Opcode::Copy: { copy(resource, bytes); break; }
     case Opcode::SetGamma: {
       exact(bytes, gamma_ramp.size()); std::memcpy(gamma_ramp.data(), bytes.data(), gamma_ramp.size()); upload_gamma(); break;
     }
     case Opcode::Present: {
       auto present = packet<PresentPacket>(bytes); exact(bytes, 0);
       auto& source = texture(resource);
-      if (source.depth || present.pillarbox > 1) { throw std::runtime_error("unsupported presentation source or flags"); }
+      if (source.depth || source.cube || source.volumeDepth > 1 || present.pillarbox > 1) { throw std::runtime_error("unsupported presentation source or flags"); }
       prepare_presentation();
       auto current = WGPU_SURFACE_TEXTURE_INIT; wgpuSurfaceGetCurrentTexture(surface, &current);
       if (!current.texture) { throw std::runtime_error("canvas surface unavailable"); }
@@ -839,27 +938,57 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       bool stencil = false;
 #ifdef WEBGPU_SERVICE_TESTING
       if (target.depth && bytes.size() == 4) {
-        stencil = packet<uint32_t>(bytes) == 1;
+        if (packet<uint32_t>(bytes) != 1) { throw std::runtime_error("unsupported readback plane"); }
+        stencil = true;
       }
 #endif
       exact(bytes, 0);
       if (!target.handle) { throw std::runtime_error("no completed presentation target"); }
+      if (target.cube || target.volumeDepth > 1) { throw std::runtime_error("readback requires a 2D texture"); }
       const uint32_t pixel_bytes = stencil ? 1 : 4;
       const uint32_t pitch = (target.width * pixel_bytes + 255) & ~255u;
-      if ((target.depth && !stencil) || uint64_t(pitch) * target.height > MaxBytes) { throw std::runtime_error("readback exceeds bounded capacity or uses depth"); }
-      auto descriptor = WGPU_BUFFER_DESCRIPTOR_INIT; descriptor.size = pitch * target.height; descriptor.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+      if (uint64_t(pitch) * target.height > MaxBytes) { throw std::runtime_error("readback exceeds bounded capacity"); }
+      const uint32_t stencilPitch = target.depth && !stencil ? (target.width + 255) & ~255u : 0;
+      const uint32_t mapBytes = (pitch + stencilPitch) * target.height;
+      if (stencilPitch && texture_bytes > TextureBudget - uint64_t(target.width) * target.height * 4) {
+        throw std::runtime_error("GPU depth readback texture budget exhausted");
+      }
+      auto descriptor = WGPU_BUFFER_DESCRIPTOR_INIT; descriptor.size = mapBytes; descriptor.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
       auto staging = wgpuDeviceCreateBuffer(device, &descriptor);
-      auto source = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; source.texture = target.handle;
+      auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
+      auto packed = stencilPitch ? pack_depth(encoder, target) : nullptr;
+      auto source = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; source.texture = packed ? packed : target.handle;
       if (stencil) { source.aspect = WGPUTextureAspect_StencilOnly; }
       auto destination = WGPU_TEXEL_COPY_BUFFER_INFO_INIT; destination.buffer = staging; destination.layout.bytesPerRow = pitch; destination.layout.rowsPerImage = target.height;
-      WGPUExtent3D extent{target.width, target.height, 1}; auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr); wgpuCommandEncoderCopyTextureToBuffer(encoder, &source, &destination, &extent); submit(encoder);
-      struct Read { WGPUBuffer buffer; uint32_t width, height, pitch, pixel_bytes; }; auto read = new Read{staging, target.width, target.height, pitch, pixel_bytes};
+      WGPUExtent3D extent{target.width, target.height, 1}; wgpuCommandEncoderCopyTextureToBuffer(encoder, &source, &destination, &extent);
+      if (stencilPitch) {
+        source.texture = target.handle; source.aspect = WGPUTextureAspect_StencilOnly;
+        destination.layout.offset = uint64_t(pitch) * target.height; destination.layout.bytesPerRow = stencilPitch;
+        wgpuCommandEncoderCopyTextureToBuffer(encoder, &source, &destination, &extent);
+      }
+      submit(encoder);
+      struct Read { WGPUBuffer buffer; WGPUTexture packed; uint32_t width, height, pitch, pixel_bytes, stencil_pitch, map_bytes; };
+      auto read = new Read{staging, packed, target.width, target.height, pitch, pixel_bytes, stencilPitch, mapBytes};
       auto info = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT; info.mode = WGPUCallbackMode_AllowSpontaneous; info.userdata1 = read;
       info.callback = [](WGPUMapAsyncStatus status, WGPUStringView message, void* userdata, void*) {
         auto read = static_cast<Read*>(userdata);
-        if (status == WGPUMapAsyncStatus_Success) { auto mapped = static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(read->buffer, 0, read->pitch * read->height)); reply.resize(read->width * read->height * read->pixel_bytes); for (uint32_t n = 0; n < read->height; ++n) { std::memcpy(reply.data() + n * read->width * read->pixel_bytes, mapped + n * read->pitch, read->width * read->pixel_bytes); } wgpuBufferUnmap(read->buffer); }
+        if (status == WGPUMapAsyncStatus_Success) {
+          auto mapped = static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(read->buffer, 0, read->map_bytes));
+          reply.resize(read->width * read->height * read->pixel_bytes);
+          for (uint32_t n = 0; n < read->height; ++n) {
+            auto row = reply.data() + n * read->width * read->pixel_bytes;
+            std::memcpy(row, mapped + n * read->pitch, read->width * read->pixel_bytes);
+            if (read->stencil_pitch) {
+              const auto stencil = mapped + read->pitch * read->height + n * read->stencil_pitch;
+              for (uint32_t n = 0; n < read->width; ++n) { row[n * 4] = stencil[n]; }
+            }
+          }
+          wgpuBufferUnmap(read->buffer);
+        }
         else { failure = string(message); }
-        wgpuBufferDestroy(read->buffer); wgpuBufferRelease(read->buffer); delete read;
+        wgpuBufferDestroy(read->buffer); wgpuBufferRelease(read->buffer);
+        if (read->packed) { wgpuTextureDestroy(read->packed); wgpuTextureRelease(read->packed); }
+        delete read;
         if (active && device) { finish(); }
       };
       wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, descriptor.size, info); return;
@@ -880,7 +1009,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
     }
   } catch (const std::exception& error) { failure = error.what(); }
   const auto opcode = static_cast<Opcode>(operation);
-  if (failure.empty() && pending_validations < 64 && (opcode == Opcode::Draw || opcode == Opcode::DrawBatch ||
+  if (failure.empty() && pending_validations < 64 && (opcode == Opcode::Draw || opcode == Opcode::DrawBatch || opcode == Opcode::RenderBatch ||
       opcode == Opcode::Clear || opcode == Opcode::Copy || opcode == Opcode::Destroy)) {
     defer_validation(command, resource);
     return;

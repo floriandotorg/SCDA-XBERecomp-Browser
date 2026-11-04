@@ -28,6 +28,7 @@ struct Service {
   std::function<void()> beforePresentCompletion;
   browser::webgpu::Status presentStatus = browser::webgpu::Status::Ok;
   std::vector<Command> commands;
+  std::vector<Command> rendered;
   std::map<uint32_t, std::vector<uint8_t>> pixels;
   std::set<uint32_t> live;
   bool fail = false;
@@ -40,21 +41,7 @@ struct Service {
       const std::string reason = "fixture WGSL compilation failed";
       return {browser::webgpu::Status::Error, ++sequence, resource, {reason.begin(), reason.end()}};
     }
-    if (opcode == browser::webgpu::Opcode::CreateTexture || opcode == browser::webgpu::Opcode::CreatePipeline) {
-      check(live.insert(resource).second, "GPU resource IDs cannot alias across backends sharing a service");
-    }
-    if (opcode == browser::webgpu::Opcode::Destroy) { check(live.erase(resource) == 1, "destroy actual live GPU resource"); }
-    if (opcode == browser::webgpu::Opcode::CreateTexture) {
-      browser::webgpu::TexturePacket packet;
-      std::memcpy(&packet, bytes.data(), sizeof(packet));
-      pixels[resource] = std::vector<uint8_t>(packet.width * packet.height * 4, 0);
-    }
-    if (opcode == browser::webgpu::Opcode::Copy) {
-      browser::webgpu::CopyPacket packet;
-      std::memcpy(&packet, bytes.data(), sizeof(packet));
-      check(packet.source != resource, "snapshot copy cannot alias its source");
-      pixels.at(resource) = pixels.at(packet.source);
-    }
+    Apply(opcode, resource, bytes);
     const auto command = ++sequence;
     if (opcode == browser::webgpu::Opcode::Present) {
       check(live.contains(resource), "present requires a live source texture");
@@ -69,6 +56,65 @@ struct Service {
       return {browser::webgpu::Status::Ok, command, resource, pixels.at(resource)};
     }
     return {browser::webgpu::Status::Ok, command, resource, {}};
+  }
+  void Apply(browser::webgpu::Opcode opcode, uint32_t resource, std::span<const uint8_t> bytes) {
+    if (opcode == browser::webgpu::Opcode::Draw || opcode == browser::webgpu::Opcode::Clear || opcode == browser::webgpu::Opcode::Copy) {
+      rendered.push_back({opcode, resource, {bytes.begin(), bytes.end()}});
+    }
+    if (opcode == browser::webgpu::Opcode::CreateTexture || opcode == browser::webgpu::Opcode::CreatePipeline) {
+      check(live.insert(resource).second, "GPU resource IDs cannot alias across backends sharing a service");
+    }
+    if (opcode == browser::webgpu::Opcode::Destroy) { check(live.erase(resource) == 1, "destroy actual live GPU resource"); }
+    if (opcode == browser::webgpu::Opcode::Draw) {
+      browser::webgpu::DrawPacket packet;
+      std::memcpy(&packet, bytes.data(), sizeof(packet));
+      check(live.contains(packet.pipeline), "draw references a retired pipeline");
+      for (const auto texture : packet.texture) { check(!texture || live.contains(texture), "draw references retired feedback storage"); }
+    }
+    if (opcode == browser::webgpu::Opcode::DrawBatch) {
+      uint32_t count;
+      std::memcpy(&count, bytes.data(), 4);
+      size_t offset = 4;
+      for (uint32_t n = 0; n < count; ++n) {
+        uint32_t size;
+        std::memcpy(&size, bytes.data() + offset + 4, 4);
+        browser::webgpu::DrawPacket packet;
+        std::memcpy(&packet, bytes.data() + offset + 8, sizeof(packet));
+        check(live.contains(packet.pipeline), "staged draw references an evicted pipeline");
+        for (const auto texture : packet.texture) { check(!texture || live.contains(texture), "staged draw references retired feedback storage"); }
+        offset += 8 + size;
+      }
+    }
+    if (opcode == browser::webgpu::Opcode::CreateTexture) {
+      browser::webgpu::TexturePacket packet;
+      std::memcpy(&packet, bytes.data(), sizeof(packet));
+      pixels[resource] = std::vector<uint8_t>(packet.width * packet.height * 4, 0);
+    }
+    if (opcode == browser::webgpu::Opcode::Copy) {
+      browser::webgpu::CopyPacket packet;
+      std::memcpy(&packet, bytes.data(), sizeof(packet));
+      check(packet.source != resource, "snapshot copy cannot alias its source");
+      pixels.at(resource) = pixels.at(packet.source);
+    }
+    if (opcode == browser::webgpu::Opcode::RenderBatch) {
+      check(!resource && bytes.size() >= 4, "invalid mixed render batch identity");
+      uint32_t count;
+      std::memcpy(&count, bytes.data(), 4);
+      size_t offset = 4;
+      for (uint32_t n = 0; n < count; ++n) {
+        check(bytes.size() - offset >= 12, "truncated mixed render entry");
+        std::array<uint32_t, 3> entry;
+        std::memcpy(entry.data(), bytes.data() + offset, 12);
+        offset += 12;
+        check(entry[2] <= bytes.size() - offset, "truncated mixed render payload");
+        const auto operation = static_cast<browser::webgpu::Opcode>(entry[0]);
+        check(operation == browser::webgpu::Opcode::Draw || operation == browser::webgpu::Opcode::Clear || operation == browser::webgpu::Opcode::Copy,
+          "unsupported mixed render command");
+        Apply(operation, entry[1], bytes.subspan(offset, entry[2]));
+        offset += entry[2];
+      }
+      check(offset == bytes.size(), "trailing mixed render bytes");
+    }
   }
   size_t Count(browser::webgpu::Opcode opcode) const {
     return std::count_if(commands.begin(), commands.end(), [&](const auto& command) { return command.opcode == opcode; });
@@ -106,6 +152,66 @@ int main() {
     image.memory->Write({}, 0x10011000, vertices, sizeof(vertices));
     backend.Draw(state, 5, 0, 3, nullptr);
     check(service.Count(Opcode::Draw) == 1, "actual draw submitted");
+    {
+      Service pipelineService;
+      MenuBackendLimits pipelineLimits;
+      pipelineLimits.maxPipelines = 1;
+      MenuBackend pipelines(runtime, image, [&](auto opcode, auto resource, auto bytes) {
+        return pipelineService.Execute(opcode, resource, bytes);
+      }, pipelineLimits);
+      pipelines.Init(4, 4);
+      auto pipelineState = state;
+      for (uint32_t n = 0; n < 40; ++n) {
+        pipelineState.streams[0].stride = 20 + n * 4;
+        pipelines.Draw(pipelineState, n % 2 ? 6 : 5, 0, 3, nullptr);
+      }
+      check(pipelineService.Count(Opcode::Draw) == 40 && pipelineService.Count(Opcode::CreatePipeline) == 1,
+        "CPU vertex strides and equivalent triangle topologies exhausted the GPU pipeline cache");
+      for (uint32_t n = 0; n < 40; ++n) {
+        pipelineState.simple[gpu::kMColorWriteEnable / 4] = n % 2 ? 0x01010101 : 0x00000101;
+        pipelines.Draw(pipelineState, 5, 0, 3, nullptr);
+        check(pipelines.Snapshot().pipelineCount == 1, "pipeline eviction exceeded the fixed live cache limit");
+      }
+      check(pipelineService.Count(Opcode::Draw) == 80 && pipelineService.Count(Opcode::Destroy) == 40,
+        "distinct cave pipelines exhausted the bounded cache instead of retiring old GPU identities");
+      pipelines.Retire();
+      check(pipelineService.live.empty(), "pipeline cache retirement retained service resources");
+      pipelineLimits.batchDraws = true;
+      MenuBackend batchedPipelines(runtime, image, [&](auto opcode, auto resource, auto bytes) {
+        return pipelineService.Execute(opcode, resource, bytes);
+      }, pipelineLimits);
+      batchedPipelines.Init(4, 4);
+      batchedPipelines.Draw(pipelineState, 5, 0, 3, nullptr);
+      pipelineState.simple[gpu::kMColorWriteEnable / 4] = 0;
+      batchedPipelines.Draw(pipelineState, 5, 0, 3, nullptr);
+      check(pipelineService.Count(Opcode::DrawBatch) == 1, "pipeline eviction did not submit older staged geometry before destruction");
+      batchedPipelines.Flush();
+      check(pipelineService.Count(Opcode::DrawBatch) == 2, "replacement pipeline did not submit its staged geometry");
+      batchedPipelines.Retire();
+    }
+    {
+      Service uploadService;
+      MenuBackendLimits uploadLimits;
+      uploadLimits.maxResources = 8;
+      MenuBackend uploads(runtime, image, [&](auto opcode, auto resource, auto bytes) {
+        return uploadService.Execute(opcode, resource, bytes);
+      }, uploadLimits);
+      uploads.Init(4, 4);
+      auto uploadState = state;
+      for (uint32_t n = 0; n < 40; ++n) {
+        const uint32_t header = 0x11000 + n * 16;
+        image.memory->Write({}, header, vb, sizeof(vb));
+        uploadState.streams[0].vb = header;
+        uploads.Draw(uploadState, 5, 0, 3, nullptr);
+        check(uploads.Snapshot().uploadCacheEntries <= 8, "CPU upload history exceeded its fixed metadata budget");
+      }
+      check(uploadService.Count(Opcode::Draw) == 40, "historical CPU uploads exhausted the cave resource budget");
+      check(!uploads.Busy(0x11000), "an evicted deep-owned vertex upload became an unknown or busy GPU resource");
+      uploadState.streams[0].vb = 0x11000;
+      uploads.Draw(uploadState, 5, 0, 3, nullptr);
+      uploads.Retire();
+      check(uploads.Snapshot().uploadCacheEntries == 0, "retired renderer retained CPU upload history");
+    }
     const auto creates = service.Count(Opcode::CreateTexture);
     backend.Draw(state, 5, 0, 3, nullptr);
     check(service.Count(Opcode::CreateTexture) == creates && service.Count(Opcode::CreatePipeline) == 1, "same resources and compatible pipeline reused");
@@ -349,9 +455,12 @@ int main() {
     state.streams[0].stride = 16;
     const auto beforeLayout = service.Count(Opcode::CreatePipeline);
     backend.Draw(state, 5, 0, 3, nullptr);
+    const auto firstLayout = service.commands.back().bytes;
+    const auto layoutPipelines = service.Count(Opcode::CreatePipeline);
     shader->inputs[3].offset = 8;
     backend.Draw(state, 5, 0, 3, nullptr);
-    check(service.Count(Opcode::CreatePipeline) == beforeLayout + 2, "incompatible guest vertex layouts cannot reuse pipeline");
+    check(service.Count(Opcode::CreatePipeline) == layoutPipelines && layoutPipelines <= beforeLayout + 1 &&
+      service.commands.back().bytes != firstLayout, "CPU vertex layout conversion reused stale geometry or duplicated the canonical GPU pipeline");
     const uint32_t depthHeader[] = {0x50001, 0x10015000, 0, 0x2e00, state.rt.size};
     image.memory->Write({}, 0x10500, depthHeader, sizeof(depthHeader));
     state.zs = {0x10500, depthHeader[1], depthHeader[3], depthHeader[4]};
@@ -376,7 +485,99 @@ int main() {
     state.simple[gpu::kMZFunc / 4] = 0x203;
     state.simple[gpu::kMZWriteEnable / 4] = 1;
     backend.Draw(state, 5, 0, 3, nullptr);
-    rejects([&] { backend.Sync(state.zs.data, 4); }, "format");
+    backend.Sync(state.zs.data, 4);
+    {
+      image.memory->Ensure(0x10016000, 4096);
+      for (const uint32_t format : {0x2eu, 0x30u}) {
+        Service depthService;
+        MenuBackend depthBackend(runtime, image, [&](auto opcode, auto resource, auto bytes) {
+          return depthService.Execute(opcode, resource, bytes);
+        });
+        depthBackend.Init(3, 2);
+        auto depthState = state;
+        depthState.zs = {0x10e00, 0x10016000, format << 8, 2 | (1 << 12)};
+        depthState.viewport = {0, 0, 3, 2, 0, 1};
+        const uint32_t header[] = {0x50001, depthState.zs.data, 0, depthState.zs.format, depthState.zs.size};
+        image.memory->Write({}, depthState.zs.header, header, sizeof(header));
+        std::array<uint8_t, 128> canary;
+        canary.fill(0xa5);
+        image.memory->Write({}, depthState.zs.data, canary.data(), canary.size());
+        depthBackend.Clear(depthState, 0, nullptr, gpu::kClearZ | gpu::kClearStencil, 0, 0.5f, 7);
+        webgpu::ClearPacket clear{};
+        std::memcpy(&clear, depthService.commands.back().bytes.data(), sizeof(clear));
+        auto& pixels = depthService.pixels.at(clear.depth_target);
+        const std::array<uint32_t, 6> values{0x00000017, 0xffffffab, 0x8000005c, 0x123456c3, 0x7fffff42, 0x010203e7};
+        std::memcpy(pixels.data(), values.data(), sizeof(values));
+        const uint32_t pixelBytes = format == 0x30 ? 2 : 4;
+        const auto expected = [&](uint32_t value) {
+          return pixelBytes == 4 ? value : uint32_t((uint64_t(value >> 8) * 65535 + 8388607) / 16777215);
+        };
+        std::array<uint8_t, 128> actual;
+        depthBackend.Sync(depthState.zs.data + pixelBytes, pixelBytes);
+        image.memory->Read({}, depthState.zs.data, actual.data(), actual.size());
+        const auto second = expected(values[1]);
+        std::memcpy(canary.data() + pixelBytes, &second, pixelBytes);
+        check(actual == canary, "partial depth readback changed neighboring pixels or row padding");
+        depthBackend.Sync(depthState.zs.data, 0);
+        const auto verify = [&](uint8_t padding) {
+          image.memory->Read({}, depthState.zs.data, actual.data(), actual.size());
+          auto result = actual;
+          result.fill(padding);
+          for (uint32_t n = 0; n < values.size(); ++n) {
+            const auto value = expected(values[n]);
+            std::memcpy(result.data() + n / 3 * 64 + n % 3 * pixelBytes, &value, pixelBytes);
+          }
+          check(actual == result, "depth readback lost depth, stencil, quantization or current row padding");
+        };
+        verify(0xa5);
+        depthBackend.RecordLate(depthState.zs.data);
+        std::fill(pixels.begin(), pixels.end(), 0);
+        canary.fill(0x6d);
+        image.memory->Write({}, depthState.zs.data, canary.data(), canary.size());
+        check(depthBackend.DeliverLate(depthState.zs.data) && !depthBackend.DeliverLate(depthState.zs.data),
+          "late depth snapshot was lost or delivered twice");
+        verify(0x6d);
+        pixels.resize(pixels.size() - 1);
+        rejects([&] { depthBackend.Sync(depthState.zs.data, 0); }, "depth readback");
+        verify(0x6d);
+        depthBackend.Retire();
+        check(depthService.live.empty(), "depth readback retained service resources");
+      }
+    }
+    {
+      Service blendService;
+      MenuBackend blendBackend(runtime, image, [&](auto opcode, auto resource, auto bytes) {
+        return blendService.Execute(opcode, resource, bytes);
+      });
+      blendBackend.Init(4, 4);
+      auto blendState = state;
+      blendState.simple[gpu::kMBlendEnable / 4] = 1;
+      blendState.simple[gpu::kMColorWriteEnable / 4] = 0x01010101;
+      blendState.simple[gpu::kMBlendOp / 4] = 0x8006;
+      blendState.simple[gpu::kMDestBlend / 4] = 0;
+      blendState.simple[gpu::kMBlendColor / 4] = 0x80402010;
+      for (const uint32_t factor : {0x308u, 0x8001u, 0x8002u, 0x8003u, 0x8004u}) {
+        blendState.simple[gpu::kMSrcBlend / 4] = factor;
+        blendBackend.Draw(blendState, 5, 0, 3, nullptr);
+        webgpu::DrawPacket draw{};
+        std::memcpy(&draw, blendService.commands.back().bytes.data(), sizeof(draw));
+        const auto pipeline = std::find_if(blendService.commands.begin(), blendService.commands.end(), [&](const auto& command) {
+          return command.opcode == Opcode::CreatePipeline && command.resource == draw.pipeline;
+        });
+        webgpu::PipelinePacket actual{};
+        std::memcpy(&actual, pipeline->bytes.data(), sizeof(actual));
+        const uint32_t expected = factor == 0x308 ? 11 : (factor & 1) ? 12 : 13;
+        check(actual.src_color == expected && actual.src_alpha == (factor == 0x308 ? 2 : expected), "vision blend factor mapping changed");
+        check(draw.blend_constant[0] == float(factor >= 0x8003 ? 128 : 64) / 255 && draw.blend_constant[3] == 128 / 255.0f,
+          "vision blend constant lost channel order or alpha replication");
+      }
+      const auto pipelines = blendService.Count(Opcode::CreatePipeline);
+      blendState.simple[gpu::kMBlendColor / 4] = 0x40010203;
+      blendBackend.Draw(blendState, 5, 0, 3, nullptr);
+      check(blendService.Count(Opcode::CreatePipeline) == pipelines, "dynamic vision blend color created a new pipeline");
+      blendState.simple[gpu::kMSrcBlend / 4] = 0xdead;
+      rejects([&] { blendBackend.Draw(blendState, 5, 0, 3, nullptr); }, "57005");
+    }
     {
       Service stencilService;
       MenuBackend stencilBackend(runtime, image, [&](auto opcode, auto resource, auto bytes) {
@@ -576,6 +777,45 @@ int main() {
       check(spec.cube_mask == 1, "cube binding dimension missing from pipeline");
     }
     {
+      Service volumeService;
+      MenuBackend volumeBackend(runtime, image, [&](auto opcode, auto resource, auto bytes) { return volumeService.Execute(opcode, resource, bytes); });
+      volumeBackend.Init(4, 4);
+      image.memory->Ensure(0x1001e000, 4096);
+      const std::array<uint32_t, 5> header{0x40001, 0x1001e000, 0, 0x11120639, 0};
+      std::array<uint8_t, 36> pixels{};
+      for (uint32_t n = 0; n < 9; ++n) { pixels[n * 4 + 2] = uint8_t(n + 10); pixels[n * 4 + 3] = 255; }
+      image.memory->Write({}, header[1], pixels.data(), pixels.size());
+      image.memory->Write({}, 0x10a00, header.data(), sizeof(header));
+      auto volumeState = state;
+      volumeState.textures[0] = 0x10a00;
+      volumeState.tss[0][gpu::kTssAddressW] = 2;
+      volumeBackend.Draw(volumeState, 5, 0, 3, nullptr);
+      webgpu::DrawPacket draw{};
+      std::memcpy(&draw, volumeService.commands.back().bytes.data(), sizeof(draw));
+      const auto upload = std::find_if(volumeService.commands.begin(), volumeService.commands.end(), [&](const auto& command) {
+        return command.opcode == Opcode::CreateTexture && command.resource == draw.texture[0];
+      });
+      check(upload != volumeService.commands.end(), "volume upload missing");
+      webgpu::TexturePacket texture{};
+      std::memcpy(&texture, upload->bytes.data(), sizeof(texture));
+      uint32_t depth = 0;
+      std::memcpy(&depth, upload->bytes.data() + sizeof(texture), 4);
+      check(draw.address_w[0] == 3, "volume W addressing was not preserved");
+      check(texture.depth == 3 && depth == 2 && texture.levels == 2 && upload->bytes.size() == sizeof(texture) + 40,
+        "volume depth and complete mip payload were not retained");
+      for (uint32_t n = 0; n < 9; ++n) {
+        check(upload->bytes[sizeof(texture) + 4 + n * 4] == n + 10, "volume slices or mip order changed");
+      }
+      const auto pipeline = std::find_if(volumeService.commands.begin(), volumeService.commands.end(), [](const auto& command) {
+        return command.opcode == Opcode::CreatePipeline;
+      });
+      webgpu::PipelinePacket volumePipeline{};
+      std::memcpy(&volumePipeline, pipeline->bytes.data(), sizeof(volumePipeline));
+      check(volumePipeline.volume_mask == 1, "volume binding dimension missing from pipeline");
+      check(std::string(pipeline->bytes.begin() + sizeof(webgpu::PipelinePacket), pipeline->bytes.end()).find("texture_3d<f32>") != std::string::npos,
+        "volume shader binding dimension missing");
+    }
+    {
       Service borderService;
       MenuBackend borderBackend(runtime, image, [&](auto opcode, auto resource, auto bytes) { return borderService.Execute(opcode, resource, bytes); });
       borderBackend.Init(4, 4);
@@ -595,8 +835,7 @@ int main() {
       Service shadowService;
       MenuBackend shadowBackend(runtime, image, [&](auto opcode, auto resource, auto bytes) { return shadowService.Execute(opcode, resource, bytes); });
       shadowBackend.Init(4, 4);
-      image.memory->Map(0x1001e000, 4096);
-      image.memory->Commit(0x1001e000, 4096);
+      image.memory->Ensure(0x1001e000, 4096);
       const std::array<uint32_t, 5> color{0x50001, 0x1001e040, 0, 0x1200, surface[4]};
       const std::array<uint32_t, 5> depth{0x50001, 0x1001e000, 0, 0x2e00, surface[4]};
       image.memory->Write({}, 0x10e00, color.data(), sizeof(color));
@@ -610,7 +849,7 @@ int main() {
       auto& pixels = shadowService.pixels.at(colorId);
       std::fill(pixels.begin(), pixels.end(), 17);
       shadowBackend.Sync(color[1], 256);
-      rejects([&] { shadowBackend.Sync(depth[1], 4); }, "depth readback");
+      shadowBackend.Sync(depth[1], 4);
       rejects([&] { shadowBackend.Sync(color[1] + 4, 4); }, "ambiguous");
       shadowState.rt = {0x10e40, 0, 0x1200, surface[4]};
       shadowState.simple[gpu::kMColorWriteEnable / 4] = 0;
@@ -716,6 +955,62 @@ int main() {
         "cached physical texture upload lost changed channels");
     }
     {
+      Service mixedService;
+      MenuBackendLimits mixedLimits;
+      mixedLimits.batchDraws = mixedLimits.batchCommands = true;
+      MenuBackend mixed(runtime, image, [&](auto opcode, auto resource, auto bytes) { return mixedService.Execute(opcode, resource, bytes); }, mixedLimits);
+      mixed.Init(4, 4);
+      image.memory->Ensure(0x10400000, 4096);
+      const uint32_t header[] = {0x50001, 0x10400000, 0, surface[3], surface[4]};
+      image.memory->Write({}, 0x1d000, header, sizeof(header));
+      const gpu::Surface destination{0x1d000, header[1], header[3], header[4]};
+      auto other = state;
+      other.rt = destination;
+      mixed.Clear(other, 0, nullptr, gpu::kClearTarget, 0, 1, 0);
+      mixed.Draw(state, 5, 0, 3, nullptr);
+      mixed.Flush();
+      const auto before = mixedService.commands.size();
+      mixed.Clear(state, 0, nullptr, gpu::kClearTarget, 0, 1, 0);
+      mixed.Draw(state, 5, 0, 3, nullptr);
+      mixed.Copy(state.rt, destination, 0, 0, 0);
+      mixed.Draw(state, 5, 0, 3, nullptr);
+      check(mixedService.commands.size() == before, "mixed rendering crossed the service boundary before a fence");
+      const float changed = 9999;
+      image.memory->Write({}, 0x10011000, &changed, 4);
+      const auto fence = mixed.Fence();
+      check(mixedService.commands.size() == before, "inserting a fence submitted copied render data eagerly");
+      check(mixed.FencePending(fence) && mixedService.commands.size() == before + 1 && mixedService.commands.back().opcode == Opcode::RenderBatch,
+        "mixed rendering did not use one ordered submission or invented completion");
+      const auto& bytes = mixedService.commands.back().bytes;
+      uint32_t count;
+      std::memcpy(&count, bytes.data(), 4);
+      check(count == 4, "mixed render command count changed");
+      size_t offset = 4;
+      const std::array<Opcode, 4> order{Opcode::Clear, Opcode::Draw, Opcode::Copy, Opcode::Draw};
+      for (uint32_t n = 0; n < count; ++n) {
+        std::array<uint32_t, 3> entry;
+        std::memcpy(entry.data(), bytes.data() + offset, 12);
+        check(entry[0] == uint32_t(order[n]), "mixed rendering reordered a clear, draw or copy");
+        if (order[n] == Opcode::Draw) {
+          float captured;
+          std::memcpy(&captured, bytes.data() + offset + 12 + sizeof(webgpu::DrawPacket), 4);
+          check(captured == vertices[0], "mixed rendering retained mutable guest geometry");
+        }
+        offset += 12 + entry[2];
+      }
+      check(offset == bytes.size(), "mixed rendering wrote trailing data");
+      mixed.WaitFence(fence);
+      check(!mixed.FencePending(fence), "mixed render wait did not synchronize the genuine fence");
+      const auto batches = mixedService.Count(Opcode::RenderBatch);
+      for (uint32_t n = 0; n < 257; ++n) { mixed.Clear(state, 0, nullptr, gpu::kClearTarget, n, 1, 0); }
+      check(mixedService.Count(Opcode::RenderBatch) == batches + 1, "mixed command staging did not split at its count budget");
+      const auto lastFence = mixed.Fence();
+      check(mixed.FencePending(lastFence) && mixedService.Count(Opcode::RenderBatch) == batches + 2, "mixed command tail was dropped at its count limit");
+      image.memory->Write({}, 0x10011000, vertices, sizeof(vertices));
+      mixed.Retire();
+      check(mixedService.live.empty(), "mixed rendering leaked resources on retirement");
+    }
+    {
       Service batchedService;
       MenuBackendLimits batchedLimits;
       batchedLimits.batchDraws = true;
@@ -723,14 +1018,19 @@ int main() {
       MenuBackend batchedBackend(runtime, image, [&](auto opcode, auto resource, auto bytes) { return batchedService.Execute(opcode, resource, bytes); }, batchedLimits);
       batchedBackend.Init(4, 4);
       batchedBackend.Draw(state, 5, 0, 3, nullptr);
+      const auto firstFence = batchedBackend.Fence();
+      check(batchedService.Count(Opcode::DrawBatch) == 0, "inserting a fence submitted owned geometry eagerly");
       batchedBackend.Draw(state, 5, 0, 3, nullptr);
+      check(!batchedBackend.Busy(state.streams[0].vb) && batchedService.Count(Opcode::DrawBatch) == 0,
+        "a CPU vertex buffer query submitted copied geometry");
       check(batchedService.Count(Opcode::Draw) == 0 && batchedService.Count(Opcode::DrawBatch) == 0,
         "consecutive mission draws must remain owned and bounded until a submission boundary");
       const float changed = 9999;
       image.memory->Write({}, 0x10011000, &changed, 4);
       const auto fence = batchedBackend.Fence();
-      check(batchedService.Count(Opcode::DrawBatch) == 1 && batchedBackend.FencePending(fence),
-        "a fence must submit staged draws without inventing GPU completion");
+      check(batchedService.Count(Opcode::DrawBatch) == 0, "inserting a later fence broke an owned draw batch");
+      check(batchedBackend.FencePending(fence) && batchedBackend.FencePending(firstFence) && batchedService.Count(Opcode::DrawBatch) == 1,
+        "polling a fence must submit preceding draws without inventing GPU completion");
       const auto batch = std::find_if(batchedService.commands.begin(), batchedService.commands.end(), [](const auto& command) { return command.opcode == Opcode::DrawBatch; });
       uint32_t draws = 0;
       std::memcpy(&draws, batch->bytes.data(), 4);
@@ -747,7 +1047,7 @@ int main() {
       largeState.index_buffer = largeState.index_data = 0;
       largeState.base_vertex = 0;
       batchedBackend.Draw(largeState, 5, 0, uint32_t(triangles.size()), reinterpret_cast<const uint8_t*>(triangles.data()));
-      batchedBackend.Fence();
+      check(batchedBackend.FencePending(batchedBackend.Fence()), "large geometry fence invented completion");
       uint32_t totalVertices = 0, largeBatches = 0;
       for (size_t n = beforeLarge; n < batchedService.commands.size(); ++n) {
         const auto& command = batchedService.commands[n];
@@ -777,6 +1077,7 @@ int main() {
         "resource busy checks must submit owned queued writes before inspecting pending GPU work");
       batchedBackend.Draw(state, 5, 0, 3, nullptr);
       const auto submissions = batchedService.Count(Opcode::DrawBatch);
+      batchedBackend.Fence();
       batchedBackend.Retire();
       check(batchedService.Count(Opcode::DrawBatch) == submissions && batchedService.live.empty(),
         "retirement must discard unsubmitted CPU draws and destroy all acknowledged GPU resources");
@@ -787,7 +1088,7 @@ int main() {
     const auto fallbackLayout = service.Count(Opcode::CreatePipeline);
     shader->stream_stride[0] = 20;
     backend.Draw(state, 5, 0, 3, nullptr);
-    check(service.Count(Opcode::CreatePipeline) == fallbackLayout + 1, "fallback declaration stride is deterministic pipeline layout state");
+    check(service.Count(Opcode::CreatePipeline) == fallbackLayout, "CPU fallback declaration stride duplicated a canonical GPU pipeline");
     const auto dynamicPipelines = service.Count(Opcode::CreatePipeline);
     const auto shaderTranslations = backend.Snapshot().shaderTranslations;
     for (uint32_t n = 0; n < 32; ++n) {
@@ -1217,6 +1518,62 @@ int main() {
       exercise({});
       check(feedbackService.live.empty(), "backend teardown destroys feedback scratch with its owner");
     }
+    for (uint32_t n = 0; n < 8; ++n) {
+      Service feedbackService;
+      MenuBackendLimits feedbackLimits;
+      feedbackLimits.maxResources = n & 1 ? 16 : 6;
+      feedbackLimits.maxResidentBytes = n & 1 ? 458760 : 1u << 20;
+      feedbackLimits.batchDraws = n & 2;
+      feedbackLimits.batchCommands = n & 4;
+      MenuBackend feedback(runtime, image, [&](auto opcode, auto resource, auto bytes) { return feedbackService.Execute(opcode, resource, bytes); }, feedbackLimits);
+      feedback.Init(128, 128);
+      gpu::State sample;
+      sample.vs_handle = 0x44; sample.streams[0] = {0x10000, 20};
+      sample.viewport.w = sample.viewport.h = 128;
+      sample.simple[gpu::kMColorWriteEnable / 4] = 0x01010101;
+      sample.tss[0][gpu::kTssColorOp] = 1;
+      sample.tss[0][gpu::kTssAddressU] = sample.tss[0][gpu::kTssAddressV] = 3;
+      sample.tss[0][gpu::kTssMagFilter] = sample.tss[0][gpu::kTssMinFilter] = 2;
+      sample.tss[0][gpu::kTssMipFilter] = 1;
+      std::array<gpu::Surface, 3> targets;
+      std::array<uint32_t, 3> sourceIds;
+      image.memory->Ensure(0x10300000, 3 * 65536);
+      for (uint32_t n = 0; n < targets.size(); ++n) {
+        const uint32_t header[] = {0x50001, 0x10300000 + n * 65536, 0, surface[3], 127 | (127 << 12) | (7 << 24)};
+        image.memory->Write({}, 0x1a000 + n * 0x100, header, sizeof(header));
+        const uint32_t view[] = {0x40001, header[1], 0, header[3] | 8, header[4]};
+        image.memory->Write({}, 0x1b000 + n * 0x100, view, sizeof(view));
+        targets[n] = {0x1a000 + n * 0x100, header[1], header[3], header[4]};
+        sample.rt = targets[n];
+        feedback.Clear(sample, 0, nullptr, gpu::kClearTarget, 0, 1, 0);
+        sourceIds[n] = feedbackService.commands.back().resource;
+      }
+      for (uint32_t n = 0; n < 18; ++n) {
+        const uint32_t target = n % targets.size();
+        sample.rt = targets[target]; sample.textures[0] = 0x1b000 + target * 0x100;
+        feedbackService.pixels.at(sourceIds[target])[0] = uint8_t(n + 19);
+        feedback.Draw(sample, 5, 0, 3, nullptr);
+        check(feedback.FencePending(feedback.Fence()), "feedback fence invented completion");
+        const auto copy = std::find_if(feedbackService.rendered.rbegin(), feedbackService.rendered.rend(), [](const auto& command) { return command.opcode == Opcode::Copy; });
+        check(copy != feedbackService.rendered.rend() && feedbackService.pixels.at(copy->resource)[0] == n + 19, "recreated feedback did not copy current GPU contents");
+        const auto snapshot = feedback.Snapshot();
+        check(snapshot.resourceCount <= feedbackLimits.maxResources && snapshot.residentBytes <= feedbackLimits.maxResidentBytes, "feedback cache exceeded its live count or byte budget");
+        for (const auto id : sourceIds) { check(feedbackService.live.contains(id), "feedback eviction retired an original render target"); }
+      }
+      feedback.Flush();
+      check(feedbackService.Count(Opcode::Destroy) >= 15, "historical feedback copies were never retired");
+      image.memory->Ensure(0x10330000, 4096);
+      const uint32_t additional[] = {0x50001, 0x10330000, 0, surface[3], 1};
+      image.memory->Write({}, 0x1c000, additional, sizeof(additional));
+      sample.rt = {0x1c000, additional[1], additional[3], additional[4]};
+      sample.textures = {};
+      sample.viewport.w = 2; sample.viewport.h = 1;
+      feedback.Clear(sample, 0, nullptr, gpu::kClearTarget, 0, 1, 0);
+      check(feedback.Snapshot().resourceCount <= feedbackLimits.maxResources && feedback.Snapshot().residentBytes <= feedbackLimits.maxResidentBytes,
+        "new original resources cannot reclaim unused feedback capacity");
+      feedback.Retire();
+      check(feedbackService.live.empty() && feedback.Snapshot().residentBytes == 0, "feedback eviction leaked resources or resident bytes");
+    }
     {
       Service swapService;
       MenuBackend swapBackend(runtime, image, [&](auto opcode, auto resource, auto bytes) { return swapService.Execute(opcode, resource, bytes); });
@@ -1250,6 +1607,29 @@ int main() {
     const uint32_t feedbackBudgetTexture[] = {0x40001, 0x10200000, 0, 0x1200, feedbackBudgetSurface[4]};
     image.memory->Write({}, 0x10c00, feedbackBudgetSurface, sizeof(feedbackBudgetSurface));
     image.memory->Write({}, 0x10d00, feedbackBudgetTexture, sizeof(feedbackBudgetTexture));
+    {
+      Service pinnedService;
+      MenuBackendLimits pinnedLimits;
+      pinnedLimits.maxResources = 2;
+      MenuBackend pinned(runtime, image, [&](auto opcode, auto resource, auto bytes) { return pinnedService.Execute(opcode, resource, bytes); }, pinnedLimits);
+      pinned.Init(128, 128);
+      gpu::State sample;
+      sample.vs_handle = 0x44;
+      sample.streams[0] = {0x10000, 20};
+      sample.rt = {0x10c00, feedbackBudgetSurface[1], feedbackBudgetSurface[3], feedbackBudgetSurface[4]};
+      sample.viewport.w = sample.viewport.h = 128;
+      sample.tss[0][gpu::kTssColorOp] = 1;
+      sample.textures[0] = 0x10d00;
+      sample.tss[0][gpu::kTssAddressU] = sample.tss[0][gpu::kTssAddressV] = 3;
+      sample.tss[0][gpu::kTssMagFilter] = sample.tss[0][gpu::kTssMinFilter] = 2;
+      sample.tss[0][gpu::kTssMipFilter] = 1;
+      pinned.Clear(sample, 0, nullptr, gpu::kClearTarget, 0, 1, 0);
+      rejects([&] { pinned.Draw(sample, 5, 0, 3, nullptr); }, "resource count");
+      check(pinnedService.Count(Opcode::Copy) == 1 && pinnedService.Count(Opcode::Draw) == 0 && pinnedService.Count(Opcode::Destroy) == 0 && pinnedService.live.size() == 2,
+        "later texture stages cannot evict feedback already bound by the current draw");
+      pinned.Retire();
+      check(pinnedService.live.empty() && pinned.Snapshot().residentBytes == 0, "failed pinned draw retains no resources after retirement");
+    }
     for (uint32_t n = 0; n < 2; ++n) {
       Service feedbackBudgetService;
       MenuBackendLimits feedbackLimits;

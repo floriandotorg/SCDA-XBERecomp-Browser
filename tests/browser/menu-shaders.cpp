@@ -303,6 +303,18 @@ int main(int argc, char** argv) {
     auto cubeState = pixel_state;
     cubeState.rs[gpu::kRsPsTextureModes] = 3;
     save("pscube", browser::menu::GenerateShaders(cubeState, 1 | 8 | 512, true, cubeTextures));
+    gpu::TexInfo volumeTextures[4]{};
+    volumeTextures[0].kind = gpu::kTex3D;
+    const auto volume = browser::menu::GenerateShaders(s, 1 | 8 | 512, true, volumeTextures);
+    assert(volume.supported && volume.fragment.find("texture_3d<f32>") != std::string::npos);
+    save("volume", volume);
+    for (uint32_t n = 1; n <= 3; ++n) {
+      auto volumeState = pixel_state;
+      volumeState.rs[gpu::kRsPsTextureModes] = n;
+      const auto shader = browser::menu::GenerateShaders(volumeState, 1 | 8 | 512, true, volumeTextures);
+      assert(shader.supported && shader.fragment.find("texture_3d<f32>") != std::string::npos);
+      save("psvolume" + std::to_string(n), shader);
+    }
     auto reflected = pixel_state;
     reflected.ps = std::make_shared<gpu::PixelShader>(*pixel_state.ps);
     reflected.ps->def[34] = (11u << 24) | (0x20u << 16);
@@ -318,6 +330,17 @@ int main(int argc, char** argv) {
     reflected.rs[gpu::kRsPsTextureModes] = 1 | (17u << 10) | (9u << 15);
     reflectionTextures[3].kind = gpu::kTex2D;
     save("psdotst", browser::menu::GenerateShaders(reflected, 0xffff, true, reflectionTextures));
+    for (const uint32_t mode : {15u, 16u}) {
+      auto dependent = pixel_state;
+      dependent.ps = std::make_shared<gpu::PixelShader>(*pixel_state.ps);
+      dependent.ps->def[34] = (10u << 24) | (0x20u << 16);
+      dependent.ps->def[0] = (0x1au << 24) | (0x20u << 16);
+      dependent.rs[gpu::kRsPsTextureModes] = 4 | (mode << 10);
+      for (uint32_t n = 0; n < 4; ++n) { dependent.tss[n][gpu::kTssTexCoordIndex] = n; }
+      gpu::TexInfo dependentTextures[4]{};
+      dependentTextures[2].kind = gpu::kTex2D;
+      save("psdep" + std::to_string(mode), browser::menu::GenerateShaders(dependent, 0xffff, true, dependentTextures));
+    }
 
     save("flat", flat_shader);
     save("pixel", pixel_shader);

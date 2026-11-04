@@ -70,12 +70,18 @@ private:
     std::array<uint32_t, 9> i3dl2Source{};
     std::vector<std::pair<uint32_t, int32_t>> bins;
     std::vector<std::pair<uint32_t, int32_t>> binVolumes;
+    uint64_t cachedAddress = UINT64_MAX;
+    uint32_t cachedBytes = 0;
+    std::array<uint8_t, 4096> cachedData{};
+    std::array<int16_t, 65 * audio::kMaxChannels> decoded{};
   };
   struct PacketRoute {
     uint32_t voice = 0;
     uint32_t completedPtr = 0;
     uint32_t statusPtr = 0;
     uint32_t packetContext = 0;
+    uint32_t data = 0;
+    uint32_t bytes = 0;
   };
   struct PendingCallback {
     uint32_t voice = 0;
@@ -111,6 +117,10 @@ private:
   bool SoundingLocked(uint64_t now) const;
   void FeedDispatchLocked(const X86Context& ctx);
   void FeedTickLocked(const X86Context& context, uint64_t now);
+  void RenderLocked(const X86Context& context, uint64_t start, size_t frames);
+  float ReadSample(const X86Context& context, VoiceState& state, const audio::Format& format,
+    uint32_t data, uint32_t bytes, uint32_t frame, uint32_t channel);
+  std::array<std::array<float, 6>, 2> Gains(const VoiceState& state, uint32_t channels) const;
   void Write32(const X86Context& ctx, uint32_t address, uint32_t value) const;
   [[noreturn]] void Unsupported(const X86Context& ctx, uint32_t id, const char* operation) const;
 

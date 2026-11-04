@@ -4,6 +4,14 @@
 
 namespace browser {
 
+struct AudioOutput {
+  static constexpr uint32_t kFrames = 16384;
+  std::array<std::atomic<uint32_t>, 8> header{};
+  std::array<float, kFrames * ::audio::kChannels> samples{};
+  void Reset();
+  bool Submit(std::span<const float> source);
+};
+
 struct SilentAudioSnapshot {
   uint64_t submittedFrames = 0;
   uint64_t consumedFrames = 0;
@@ -18,6 +26,7 @@ class SilentAudioSink {
   Memory* const memory_;
   mutable std::mutex lock_;
   std::vector<float> samples_;
+  std::shared_ptr<AudioOutput> output_;
   SilentAudioSnapshot state_;
   struct ClockState {
     std::optional<uint64_t> last;
@@ -27,7 +36,9 @@ class SilentAudioSink {
   static bool AdvanceState(SilentAudioSnapshot& state, ClockState& clock, uint64_t now100ns);
 public:
   static constexpr uint32_t kCapacityFrames = audio::kRate;
-  SilentAudioSink(Runtime& runtime, PreparedImage& image);
+  SilentAudioSink(Runtime& runtime, PreparedImage& image, std::shared_ptr<AudioOutput> output = {});
+  bool NeedsSamples() const;
+  bool HasOutput() const { return bool(output_); }
   bool BelongsTo(Runtime& runtime, PreparedImage& image) const;
   void Submit(const X86Context& context, std::span<const float> samples);
   // Submit with an externally supplied timer sample: the only safe feed path from inside the timer clock

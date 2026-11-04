@@ -19,7 +19,39 @@ X86_FUNC(axis) {
 X86_FUNC(__imp__sub_0004B525) {}
 X86_FUNC(__imp__sub_001D2A4E) {}
 X86_FUNC(__imp__sub_001CDA8A) {}
+X86_FUNC(__imp__sub_00039AD4) {}
 int main() {
+  for (const bool enabled : {false, true}) {
+    browser::Runtime videoRuntime({}, {});
+    browser::PreparedImage videoImage;
+    videoImage.memory = std::make_unique<browser::Memory>();
+    auto& videoMemory = *videoImage.memory;
+    videoMemory.Ensure(0x10000, 4096);
+    auto videoStorage = std::make_shared<browser::MissionInput::SharedStorage>();
+    browser::MissionInput video(videoRuntime, videoImage, {}, videoStorage);
+    if (enabled) { video.ConfigureDevelopmentStart(); }
+    videoRuntime.PublishImageMemory(videoMemory, videoRuntime.KernelRevision(), [&] { videoImage.importsBound = true; videoImage.boundRuntime = &videoRuntime; });
+    bool rejected = false;
+    try { video.ConfigureDevelopmentStart(); } catch (const browser::Fault&) { rejected = true; }
+    check(rejected, "published runtime accepted a changed development mode");
+    X86Context videoContext{};
+    videoContext.host = &videoRuntime;
+    videoContext.esp = 0x10f00;
+    videoContext.eax = 0x12345678;
+    videoRuntime.Launch(videoContext, videoMemory.Base(), [&](X86Context& ctx, uint8_t* base) {
+      const auto before = ctx;
+      check(video.Dispatch(ctx, base, 135) != enabled, "video dispatch ignored development mode");
+      check(ctx.esp == before.esp + (enabled ? 24 : 0) && ctx.eax == (enabled ? 0 : before.eax) && ctx.ecx == before.ecx && ctx.edx == before.edx, "development video skip changed the guest ABI");
+      if (!enabled) { return; }
+      for (const uint32_t stack : {0xfffffff0u, 0x10ff0u}) {
+        ctx = before; ctx.esp = stack;
+        bool rejected = false;
+        try { video.Dispatch(ctx, base, 135); } catch (const browser::Fault&) { rejected = true; }
+        check(rejected && ctx.esp == stack && ctx.eax == before.eax, "invalid development video frame changed registers");
+      }
+    });
+    if (const auto failure = videoRuntime.Join()) { std::rethrow_exception(failure); }
+  }
   const std::array<X86FuncMapping, 1> mappings = {{{0x30000, axis}}};
   browser::Runtime runtime(mappings, {});
   browser::PreparedImage image;

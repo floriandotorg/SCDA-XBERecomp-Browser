@@ -121,10 +121,12 @@ std::shared_ptr<const SdkTrace> InstallSdkProvider(Runtime& runtime, PreparedIma
   auto sharedAudio = std::move(audio);
   runtime.InstallSdkObserver(*memory, [trace, memory, &image, &runtime, policy, graphics, input, launch, route, signatures, sharedAudio](X86Context& ctx, uint32_t id, uint64_t workerId) {
     if (image.memory.get() != memory || !image.importsBound || image.boundRuntime != &runtime || id == 0 || id == 70 ||
-        ((id < 132 || id > 134) && id > (sharedAudio ? BROWSER_AUDIO_LAST_ID : 71)) || (id >= 132 && id <= 134 && !input)) {
+        (id != 136 && (id < 132 || id > 135) && id > (sharedAudio ? BROWSER_AUDIO_LAST_ID : 71)) ||
+        (id >= 132 && id <= 135 && !input) || (id == 136 && !launch)) {
       throw Fault(ctx, ctx.esp, 0, "SDK observer belongs to a stale or unpublished image");
     }
-    if (id >= 132 && id <= 134) { return input->Dispatch(ctx, memory->Base(), id); }
+    if (id >= 132 && id <= 135) { return input->Dispatch(ctx, memory->Base(), id); }
+    if (id == 136) { return launch->Dispatch(ctx, memory->Base(), id); }
     if (id >= BROWSER_AUDIO_FIRST_ID) {
       if (!sharedAudio) {
         throw Fault(ctx, ctx.esp, 0, "audio entry observed without the installed audio provider");

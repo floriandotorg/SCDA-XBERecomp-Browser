@@ -47,6 +47,22 @@ int main() {
     });
     if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
     check(result == browser::Dispatcher::WaitResult::Signaled, "indefinite timer wait stopped sampling its deadline");
+    const auto sampledBeforeDeadline = samples.load();
+    runtime.Launch(context, memory.Base(), [&](X86Context& worker, uint8_t*) {
+      result = dispatcher.WaitGuest(worker, event, -1000000, 5s);
+    });
+    if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+    check(result == browser::Dispatcher::WaitResult::TimedOut, "relative event deadline missed its timeout");
+    check(samples.load() - sampledBeforeDeadline < 30, "timed waits sampled the guest clock every millisecond instead of sleeping to their deadline");
+    const auto unarmed = dispatcher.CreateTimer(false);
+    runtime.Launch(context, memory.Base(), [&](X86Context& worker, uint8_t*) {
+      result = dispatcher.WaitGuest(worker, unarmed, std::nullopt, 5s);
+    });
+    parked();
+    const auto armed = std::chrono::steady_clock::now();
+    dispatcher.SetTimerGuest(unarmed, -200000, 0);
+    if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+    check(result == browser::Dispatcher::WaitResult::Signaled && std::chrono::steady_clock::now() - armed < 1s, "arming a timer did not wake its existing waiter");
     std::atomic<bool> cancelled = false;
     runtime.Launch(context, memory.Base(), [&](X86Context& worker, uint8_t*) {
       try { dispatcher.WaitGuest(worker, event, std::nullopt, 5s); }

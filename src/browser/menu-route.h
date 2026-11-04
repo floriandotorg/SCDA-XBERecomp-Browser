@@ -1,5 +1,6 @@
 #pragma once
 #include "browser/sdk-provider.h"
+#include <array>
 #include <string>
 #include <string_view>
 
@@ -40,6 +41,7 @@ public:
   MenuMissionObservation(Runtime& runtime, PreparedImage& image);
   bool BelongsTo(Runtime& runtime, PreparedImage& image) const;
   static Command Classify(std::u16string_view command);
+  static constexpr std::array<uint32_t, 2> ReturnAddresses() { return {0x18890a, 0x18892e}; }
   void Observe(const X86Context& ctx, uint8_t* base, uint32_t target, uint64_t workerId) noexcept;
   SnapshotData Snapshot() const;
 private:

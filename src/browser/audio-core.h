@@ -3,13 +3,14 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
 namespace browser::audio {
 
 inline constexpr uint32_t kRate = 48000;
-inline constexpr uint32_t kMaxVoices = 64;
+inline constexpr uint32_t kMaxVoices = 256;
 inline constexpr uint32_t kMaxPacketsPerVoice = 32;
 inline constexpr uint32_t kMaxChannels = 8;
 inline constexpr uint32_t kMaxSampleRate = 384000;
@@ -55,6 +56,8 @@ struct Format {
 
 std::optional<uint32_t> FramesOf(const Format& format, uint64_t bytes);
 std::optional<uint32_t> BytesOf(const Format& format, uint32_t frames);
+std::optional<float> DecodePcm(const Format& format, std::span<const uint8_t> frame, uint32_t channel);
+bool DecodeAdpcm(std::span<const uint8_t> block, uint32_t channels, std::span<int16_t> decoded);
 
 struct Completion {
   uint32_t voice = 0;
@@ -75,6 +78,12 @@ struct StreamInfo {
   uint32_t packetSize = 0;
   uint32_t reserved1 = 0;
   uint32_t reserved2 = 0;
+};
+
+struct SampleCursor {
+  uint64_t token = 0;
+  uint32_t frame = 0;
+  uint32_t fraction = 0;
 };
 
 class Voice {
@@ -114,6 +123,7 @@ public:
   bool StreamReady() const;
   StreamInfo GetStreamInfo() const;
   uint32_t PlayFrames(uint64_t now) const;
+  std::optional<SampleCursor> Sample(uint64_t now) const;
   std::pair<uint32_t, uint32_t> CurrentPosition(uint64_t now) const;
   AudioError Lock(uint32_t offsetBytes, uint32_t bytes, uint32_t flags, LockRange& out) const;
 

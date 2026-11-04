@@ -582,7 +582,7 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     if (f[8] != 1 && f[8] != 5 && f[8] != 0) {
       return reject("stage " + std::to_string(n) + " result argument " + std::to_string(f[8]));
     }
-    if (textures[n].kind != gpu::kTexNone && textures[n].kind != gpu::kTex2D && textures[n].kind != gpu::kTexCube) {
+    if (textures[n].kind != gpu::kTexNone && textures[n].kind != gpu::kTex2D && textures[n].kind != gpu::kTexCube && textures[n].kind != gpu::kTex3D) {
       return reject("stage " + std::to_string(n) + " texture dimensionality");
     }
     if (textures[n].shadow > 2 || textures[n].flags) {
@@ -656,7 +656,7 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
   fragment += Varyings(key.flat);
   for (int n = 0; n < 4; ++n) {
     const auto name = std::to_string(n);
-    fragment += "@group(0) @binding(" + std::to_string(1 + n * 2) + ") var tex" + name + (textures[n].shadow ? ": texture_depth_2d;\n" : textures[n].kind == gpu::kTexCube ? ": texture_cube<f32>;\n" : ": texture_2d<f32>;\n");
+    fragment += "@group(0) @binding(" + std::to_string(1 + n * 2) + ") var tex" + name + (textures[n].shadow ? ": texture_depth_2d;\n" : textures[n].kind == gpu::kTexCube ? ": texture_cube<f32>;\n" : textures[n].kind == gpu::kTex3D ? ": texture_3d<f32>;\n" : ": texture_2d<f32>;\n");
     fragment += "@group(0) @binding(" + std::to_string(2 + n * 2) + ") var smp" + name + ": sampler;\n";
   }
   for (uint32_t n = 0; n < 4; ++n) {
@@ -684,14 +684,14 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
       break;
     }
     const auto name = std::to_string(n);
-    std::string uv = "i.t" + name + (textures[n].kind == gpu::kTexCube ? ".xyz" : ".xy");
+    std::string uv = "i.t" + name + (textures[n].kind == gpu::kTexCube || textures[n].kind == gpu::kTex3D ? ".xyz" : ".xy");
     if (key.proj & (1u << n)) {
       uv = "(" + uv + " / i.t" + name + ".w)";
     }
     if (textures[n].rect) {
       uv += " / u.texsize[" + name + "].xy";
     }
-    if (textures[n].kind != gpu::kTexCube) { uv += " + u.texsize[" + name + "].zw"; }
+    if (textures[n].kind == gpu::kTex2D) { uv += " + u.texsize[" + name + "].zw"; }
     if (textures[n].shadow) {
       auto coordinate = "(i.t" + name + ".xy / i.t" + name + ".w)";
       if (textures[n].rect) { coordinate += " / u.texsize[" + name + "].xy"; }

@@ -2,13 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createMenuRuntime } from '../../src/browser/menu-runtime.mjs';
 
-const fixture = (ready = Promise.resolve()) => {
+const fixture = (ready = Promise.resolve(), options = {}) => {
   const events = [];
   let factory;
   let callbacks;
   let owned = true;
   const abort = new AbortController();
   const runtime = createMenuRuntime({
+    gamepad: false,
+    ...options,
     acquireCanvas: () => ({ offscreen: true }),
     createRuntime: (options) => { factory = options.createServices; return { marker: true }; },
     createGPU: (options) => {
@@ -16,6 +18,7 @@ const fixture = (ready = Promise.resolve()) => {
       return { ready, webgpuMailbox: options.mailbox, cancel: () => events.push('cancel'), dispose: async () => events.push('dispose') };
     },
     createInput: (options) => { events.push(['input', options]); return { dispose: () => events.push('input-dispose') }; },
+    createAudio: (options) => { events.push(['audio', options]); return { dispose: () => events.push('audio-dispose') }; },
     onPresented: (details) => events.push(['presented', details]),
     onAdapter: (details) => events.push(['adapter', details]),
     onDiagnostic: (details) => events.push(['diagnostic', details]),
@@ -24,6 +27,22 @@ const fixture = (ready = Promise.resolve()) => {
   return { runtime, context, events, abort, retire: () => { owned = false; },
     start: () => factory(context), get callbacks() { return callbacks; } };
 };
+
+test('runtime replacement retires browser audio before rebinding shared transport', async () => {
+  const harness = fixture();
+  const services = await harness.start();
+  const buffer = new SharedArrayBuffer(400000);
+  const input = { generation: 3, phase: 'input', buffer, byteOffset: 8, words: 2, audioOffset: 32, audioSamplesOffset: 64 };
+  services.handle(input);
+  assert.equal(harness.events.filter(event => event[0] === 'audio').length, 1);
+  services.handle({ generation: 3, phase: 'restarting' });
+  assert.equal(harness.events.filter(event => event === 'audio-dispose').length, 1);
+  services.handle(input);
+  assert.equal(harness.events.filter(event => event[0] === 'audio').length, 2);
+  services.cancel();
+  await services.dispose();
+  assert.equal(harness.events.filter(event => event === 'audio-dispose').length, 2);
+});
 
 test('menu services use only completed genuine Present events to activate host rendering state', async () => {
   const harness = fixture();
@@ -125,4 +144,31 @@ test('runtime replacement disposes the old input producer before republishing se
   assert.deepEqual(harness.events.filter(event => event === 'input-dispose' || event[0] === 'input')
     .map(event => typeof event === 'string' ? event : event[0]), ['input', 'input-dispose', 'input']);
   await services.dispose();
+});
+
+test('mission gamepad publication is required and retires polling before runtime replacement', async () => {
+  const pads = [];
+  const harness = fixture(Promise.resolve(), { gamepad: true, createGamepad: options => {
+    const pad = { options, disposed: false };
+    pads.push(pad);
+    return { dispose: () => { pad.disposed = true; } };
+  } });
+  const services = await harness.start();
+  const input = { phase: 'input', buffer: new SharedArrayBuffer(128), byteOffset: 8, words: 2, gamepadOffset: 32 };
+  services.handle(input);
+  assert.equal(pads.length, 1);
+  assert.equal(pads[0].options.byteOffset, 32);
+  assert.equal(pads[0].options.signal, harness.abort.signal);
+  services.handle({ phase: 'restarting' });
+  assert.equal(pads[0].disposed, true);
+  services.handle(input);
+  assert.equal(pads.length, 2);
+  services.cancel();
+  assert.equal(pads[1].disposed, true);
+  await services.dispose();
+  const missing = fixture(Promise.resolve(), { gamepad: true });
+  const other = await missing.start();
+  other.handle({ ...input, gamepadOffset: undefined });
+  assert.equal(missing.events.find(event => event[0] === 'report')[1].code, 'INPUT_PROTOCOL');
+  await other.dispose();
 });

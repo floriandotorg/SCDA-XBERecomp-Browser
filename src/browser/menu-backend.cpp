@@ -81,37 +81,57 @@ uint32_t typeBytes(uint32_t type) {
     default: throw std::runtime_error("menu backend unsupported vertex format");
   }
 }
-void convert(uint32_t type, const uint8_t* bytes, float* output) {
+void convertColumn(uint32_t type, const uint8_t* first, uint32_t stride, std::span<const uint32_t> numbers, float* output, size_t pitch) {
+  const auto each = [&](auto convertOne) {
+    for (const uint32_t number : numbers) {
+      convertOne(first + size_t(number) * stride, output);
+      output += pitch;
+    }
+  };
   if (type == 0x72) {
-    std::memcpy(output, bytes, 8);
-    std::memcpy(output + 3, bytes + 8, 4);
+    each([](const uint8_t* bytes, float* out) { std::memcpy(out, bytes, 8); std::memcpy(out + 3, bytes + 8, 4); });
     return;
   }
   const uint32_t count = type >> 4;
   switch (type & 15) {
     case 0:
-      output[0] = bytes[2] / 255.0f; output[1] = bytes[1] / 255.0f;
-      output[2] = bytes[0] / 255.0f; output[3] = bytes[3] / 255.0f;
+      each([](const uint8_t* bytes, float* out) {
+        out[0] = bytes[2] / 255.0f; out[1] = bytes[1] / 255.0f; out[2] = bytes[0] / 255.0f; out[3] = bytes[3] / 255.0f;
+      });
       break;
-    case 1: case 5:
-      for (uint32_t n = 0; n < count; ++n) {
-        int16_t value;
-        std::memcpy(&value, bytes + n * 2, 2);
-        output[n] = (type & 15) == 1 ? std::max(value / 32767.0f, -1.0f) : float(value);
-      }
+    case 1:
+      each([count](const uint8_t* bytes, float* out) {
+        for (uint32_t n = 0; n < count; ++n) {
+          int16_t value;
+          std::memcpy(&value, bytes + n * 2, 2);
+          out[n] = std::max(value / 32767.0f, -1.0f);
+        }
+      });
       break;
-    case 2: std::memcpy(output, bytes, count * 4); break;
+    case 5:
+      each([count](const uint8_t* bytes, float* out) {
+        for (uint32_t n = 0; n < count; ++n) {
+          int16_t value;
+          std::memcpy(&value, bytes + n * 2, 2);
+          out[n] = float(value);
+        }
+      });
+      break;
+    case 2: each([count](const uint8_t* bytes, float* out) { std::memcpy(out, bytes, count * 4); }); break;
     case 4:
-      for (uint32_t n = 0; n < count; ++n) { output[n] = bytes[n] / 255.0f; }
+      each([count](const uint8_t* bytes, float* out) {
+        for (uint32_t n = 0; n < count; ++n) { out[n] = bytes[n] / 255.0f; }
+      });
       break;
-    case 6: {
-      uint32_t value;
-      std::memcpy(&value, bytes, 4);
-      output[0] = std::max((int32_t(value << 21) >> 21) / 1023.0f, -1.0f);
-      output[1] = std::max((int32_t(value << 10) >> 21) / 1023.0f, -1.0f);
-      output[2] = std::max((int32_t(value) >> 22) / 511.0f, -1.0f);
+    case 6:
+      each([](const uint8_t* bytes, float* out) {
+        uint32_t value;
+        std::memcpy(&value, bytes, 4);
+        out[0] = std::max((int32_t(value << 21) >> 21) / 1023.0f, -1.0f);
+        out[1] = std::max((int32_t(value << 10) >> 21) / 1023.0f, -1.0f);
+        out[2] = std::max((int32_t(value) >> 22) / 511.0f, -1.0f);
+      });
       break;
-    }
   }
 }
 gpu::VertexShader layoutOf(const gpu::State& state) {
@@ -182,7 +202,10 @@ uint32_t blendFactor(uint32_t value, bool alpha) {
     case 0x305: return 10;
     case 0x306: return alpha ? 9 : 7;
     case 0x307: return alpha ? 10 : 8;
-    default: throw std::runtime_error("menu backend unsupported blend factor");
+    case 0x308: return alpha ? 2 : 11;
+    case 0x8001: case 0x8003: return 12;
+    case 0x8002: case 0x8004: return 13;
+    default: throw std::runtime_error("menu backend unsupported blend factor " + std::to_string(value));
   }
 }
 uint32_t blendOperation(uint32_t value) {
@@ -212,6 +235,7 @@ struct MenuBackend::Impl {
     uint32_t command = 0;
     uint32_t feedback = 0;
     uint64_t feedbackVersion = 0;
+    uint64_t feedbackUsed = 0;
     gpu::TextureDesc desc;
     uint32_t headerAddress = 0;
     std::vector<uint8_t> header;
@@ -230,17 +254,25 @@ struct MenuBackend::Impl {
   PreparedImage& image;
   Memory* memory;
   Execute execute;
+  Execute post;
   MenuBackendLimits limits;
   ShaderInventory inventory;
   std::function<void(const FrameMetrics&)> metricsSink;
   uint64_t commandWaitMicroseconds = 0, readbackWaitMicroseconds = 0, uploadWaitMicroseconds = 0, drawWaitMicroseconds = 0;
   mutable std::recursive_mutex mutex;
   std::map<uint64_t, Resource> resources;
-  std::map<std::vector<uint8_t>, uint32_t> pipelines;
+  struct Pipeline { uint32_t id; uint64_t used; };
+  std::map<std::vector<uint8_t>, Pipeline> pipelines;
+  uint64_t pipelineSequence = 0;
+  uint64_t feedbackSequence = 0;
+  std::set<uint32_t> feedbackPins;
   std::map<std::vector<uint8_t>, menu::ShaderResult> shaderCache;
   uint64_t shaderTranslations = 0;
   size_t shaderCacheBytes = 0;
-  std::map<uint32_t, std::pair<uint32_t, uint64_t>> uploadVersions;
+  struct UploadVersion { uint32_t id; uint64_t version, used; };
+  std::map<uint32_t, UploadVersion> uploadVersions;
+  std::set<uint32_t> releasedResources;
+  uint64_t uploadSequence = 0;
   uint32_t white = 0;
   uint32_t width = 0, height = 0;
   uint32_t submitted = 0, completed = 0;
@@ -257,9 +289,9 @@ struct MenuBackend::Impl {
   bool retiring = false;
   bool retired = false;
 
-  Impl(Runtime& owner, PreparedImage& prepared, Execute exchange, MenuBackendLimits budget)
-    : runtime(owner), image(prepared), memory(prepared.memory.get()), execute(std::move(exchange)), limits(budget) {
-    require(memory && execute && (!image.boundRuntime || image.boundRuntime == &runtime), "menu backend requires its runtime and prepared image");
+  Impl(Runtime& owner, PreparedImage& prepared, Execute exchange, Execute posted, MenuBackendLimits budget)
+    : runtime(owner), image(prepared), memory(prepared.memory.get()), execute(std::move(exchange)), post(std::move(posted)), limits(budget) {
+    require(memory && execute && post && (!image.boundRuntime || image.boundRuntime == &runtime), "menu backend requires its runtime and prepared image");
   }
   void requireOwner() const {
     require(memory == image.memory.get() && (!image.boundRuntime || image.boundRuntime == &runtime), "menu backend foreign prepared image or runtime");
@@ -288,16 +320,29 @@ struct MenuBackend::Impl {
     return shaderCache.emplace(std::move(key), std::move(translated)).first->second;
   }
   webgpu::Result send(webgpu::Opcode opcode, uint32_t resource, std::span<const uint8_t> bytes = {}) {
-    if (opcode != webgpu::Opcode::DrawBatch) { flushDraws(); }
+    if (limits.batchCommands && (opcode == webgpu::Opcode::Clear || opcode == webgpu::Opcode::Copy)) {
+      uint32_t depth = 0;
+      if (opcode == webgpu::Opcode::Clear) {
+        require(bytes.size() >= sizeof(webgpu::ClearPacket), "menu backend truncated staged clear");
+        webgpu::ClearPacket packet;
+        std::memcpy(&packet, bytes.data(), sizeof(packet));
+        depth = packet.depth_target;
+      }
+      stage(opcode, resource, depth, bytes);
+      return {webgpu::Status::Ok, submitted, resource, {}};
+    }
+    if (opcode != webgpu::Opcode::DrawBatch && opcode != webgpu::Opcode::RenderBatch) { flushDraws(); }
     requireOwner();
     require(bytes.size() <= webgpu::MaxBytes, "menu backend command payload budget exceeded");
     const auto started = std::chrono::steady_clock::now();
-    auto result = execute(opcode, resource, bytes);
+    const bool deferred = limits.postCommands && (opcode == webgpu::Opcode::Draw || opcode == webgpu::Opcode::DrawBatch ||
+      opcode == webgpu::Opcode::RenderBatch || opcode == webgpu::Opcode::Clear || opcode == webgpu::Opcode::Copy);
+    auto result = (deferred ? post : execute)(opcode, resource, bytes);
     const uint64_t elapsed = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
     commandWaitMicroseconds += elapsed;
     if (opcode == webgpu::Opcode::Readback) { readbackWaitMicroseconds += elapsed; }
     if (opcode == webgpu::Opcode::CreateTexture || opcode == webgpu::Opcode::CreatePipeline || opcode == webgpu::Opcode::UploadDepth) { uploadWaitMicroseconds += elapsed; }
-    if (opcode == webgpu::Opcode::Draw || opcode == webgpu::Opcode::DrawBatch) { drawWaitMicroseconds += elapsed; }
+    if (opcode == webgpu::Opcode::Draw || opcode == webgpu::Opcode::DrawBatch || opcode == webgpu::Opcode::RenderBatch) { drawWaitMicroseconds += elapsed; }
     if (result.status != webgpu::Status::Ok) {
       throw std::runtime_error("menu backend GPU service failure: " + std::string(result.bytes.begin(), result.bytes.end()));
     }
@@ -317,7 +362,7 @@ struct MenuBackend::Impl {
   void flushDraws() {
     if (!stagedDrawCount) { return; }
     std::memcpy(stagedDraws.data(), &stagedDrawCount, 4);
-    const auto result = send(webgpu::Opcode::DrawBatch, 0, stagedDraws);
+    const auto result = send(limits.batchCommands ? webgpu::Opcode::RenderBatch : webgpu::Opcode::DrawBatch, 0, stagedDraws);
     for (auto& [key, item] : resources) {
       if (stagedTargets.contains(item.id)) { item.command = result.command; }
     }
@@ -325,15 +370,20 @@ struct MenuBackend::Impl {
   }
   std::optional<uint32_t> draw(uint32_t resource, const webgpu::DrawPacket& packet, std::span<const uint8_t> bytes) {
     if (!limits.batchDraws) { return send(webgpu::Opcode::Draw, resource, bytes).command; }
+    stage(webgpu::Opcode::Draw, resource, packet.depth_target, bytes);
+    return std::nullopt;
+  }
+  void stage(webgpu::Opcode opcode, uint32_t resource, uint32_t depth, std::span<const uint8_t> bytes) {
     requireOwner();
-    require(bytes.size() + 12 <= webgpu::MaxBytes, "menu backend staged draw exceeds packet budget");
-    if (stagedDrawCount == 256 || stagedDraws.size() + bytes.size() + 8 > webgpu::MaxBytes) { flushDraws(); }
+    const uint32_t headerBytes = limits.batchCommands ? 12 : 8;
+    require(bytes.size() + headerBytes + 4 <= webgpu::MaxBytes, "menu backend staged draw exceeds packet budget");
+    if (stagedDrawCount == 256 || stagedDraws.size() + bytes.size() + headerBytes > webgpu::MaxBytes) { flushDraws(); }
     if (!stagedDrawCount) { stagedDraws.reserve(webgpu::MaxBytes); stagedDraws.resize(4); }
+    if (limits.batchCommands) { append(stagedDraws, uint32_t(opcode)); }
     append(stagedDraws, resource); append(stagedDraws, uint32_t(bytes.size())); appendBytes(stagedDraws, bytes);
     if (resource) { stagedTargets.insert(resource); }
-    if (packet.depth_target) { stagedTargets.insert(packet.depth_target); }
+    if (depth) { stagedTargets.insert(depth); }
     ++stagedDrawCount;
-    return std::nullopt;
   }
   template<class T> webgpu::Result sendPacket(webgpu::Opcode opcode, uint32_t resource, const T& packet) {
     std::vector<uint8_t> bytes;
@@ -380,11 +430,12 @@ struct MenuBackend::Impl {
       }
     }
     if (surface) { desc.cube = false; desc.depth = 1; desc.levels = 1; }
-    if (desc.depth != 1 || (desc.cube && (desc.width != desc.height || desc.linear))) {
+    if ((desc.depth > 1 && (desc.cube || desc.linear)) || (desc.cube && (desc.width != desc.height || desc.linear))) {
       throw std::runtime_error("menu backend unsupported texture dimension: format=" + std::to_string(format) + " width=" + std::to_string(desc.width) +
         " height=" + std::to_string(desc.height) + " depth=" + std::to_string(desc.depth) + " levels=" + std::to_string(desc.levels) + " cube=" + std::to_string(desc.cube));
     }
-    require(desc.width <= 4096 && desc.height <= 4096, "menu backend texture dimension budget exceeded");
+    require(desc.width <= 4096 && desc.height <= 4096 && desc.depth <= 2048 &&
+      (desc.depth == 1 || (desc.width <= 2048 && desc.height <= 2048)), "menu backend texture dimension budget exceeded");
     return desc;
   }
   uint64_t resourceBytes(const gpu::TextureDesc& desc, bool depth) {
@@ -398,6 +449,23 @@ struct MenuBackend::Impl {
   }
   size_t resourceCount() const {
     return resources.size() + size_t(white != 0) + std::count_if(resources.begin(), resources.end(), [](const auto& entry) { return entry.second.feedback != 0; });
+  }
+  void trimFeedback(size_t slots, size_t bytes, const Resource* retained = nullptr) {
+    if (slots > limits.maxResources || bytes > limits.maxResidentBytes) { return; }
+    while (resourceCount() + slots > limits.maxResources || resident + bytes > limits.maxResidentBytes) {
+      auto oldest = resources.end();
+      for (auto found = resources.begin(); found != resources.end(); ++found) {
+        const auto& candidate = found->second;
+        if (&candidate != retained && candidate.feedback && !feedbackPins.contains(candidate.feedback) &&
+            (oldest == resources.end() || candidate.feedbackUsed < oldest->second.feedbackUsed)) { oldest = found; }
+      }
+      if (oldest == resources.end()) { return; }
+      auto& retired = oldest->second;
+      send(webgpu::Opcode::Destroy, retired.feedback);
+      const size_t retiredBytes = size_t(retired.desc.width) * retired.desc.height * 4;
+      resident -= retiredBytes; retired.residentBytes -= retiredBytes;
+      retired.feedback = 0; retired.feedbackVersion = 0; retired.feedbackUsed = 0;
+    }
   }
   void observeView(Resource& item, uint32_t header) {
     for (auto& [data, other] : resources) {
@@ -437,7 +505,7 @@ struct MenuBackend::Impl {
     if (found != resources.end()) {
       auto& item = found->second;
       const bool compatible = item.depth == depth && item.desc.format == desc.format && item.desc.width == desc.width && item.desc.height == desc.height &&
-        item.desc.pitch == desc.pitch && item.desc.levels == desc.levels && item.desc.cube == desc.cube && item.desc.linear == desc.linear && item.uploaded.size() == bytes;
+        item.desc.depth == desc.depth && item.desc.pitch == desc.pitch && item.desc.levels == desc.levels && item.desc.cube == desc.cube && item.desc.linear == desc.linear && item.uploaded.size() == bytes;
       if (!compatible) {
         if (item.dirty || !item.late.empty() || item.views.contains(headerAddress)) { incompatible("incompatible storage", item); }
         replacedStorage = true;
@@ -474,12 +542,16 @@ struct MenuBackend::Impl {
     }
     const size_t residentBytes = size_t(bytes) + (depth ? size_t(desc.width) * desc.height * 4 : rgba.size());
     const size_t oldBytes = found == resources.end() ? 0 : found->second.residentBytes + found->second.late.size();
+    trimFeedback(found == resources.end() ? 1 : 0, residentBytes > oldBytes ? residentBytes - oldBytes : 0,
+      found == resources.end() ? nullptr : &found->second);
     require(resourceCount() < limits.maxResources || found != resources.end(), "menu backend resource count budget exceeded");
     require(residentBytes <= limits.maxResidentBytes && resident - std::min(resident, oldBytes) <= limits.maxResidentBytes - residentBytes, ("menu backend resident byte budget exceeded: resident=" + std::to_string(resident) + " replacement=" + std::to_string(oldBytes) + " request=" + std::to_string(residentBytes) + " limit=" + std::to_string(limits.maxResidentBytes)).c_str());
     const uint32_t id = newId();
-    webgpu::TexturePacket packet{desc.width, desc.height, depth ? 1u : desc.cube ? 2u : 0u, desc.levels};
+    webgpu::TexturePacket packet{desc.width, desc.height, depth ? 1u : desc.cube ? 2u : desc.depth > 1 ? 3u : 0u, desc.levels};
     std::vector<uint8_t> payload;
-    append(payload, packet); appendBytes(payload, rgba);
+    append(payload, packet);
+    if (desc.depth > 1) { append(payload, desc.depth); }
+    appendBytes(payload, rgba);
     const auto result = send(webgpu::Opcode::CreateTexture, id, payload);
     uint64_t version = 1;
     if (found != resources.end()) {
@@ -553,9 +625,14 @@ struct MenuBackend::Impl {
   }
   uint32_t feedbackTexture(Resource& item) {
     require(!item.depth, "menu backend unsupported depth feedback sampling");
+    require(feedbackSequence != UINT64_MAX, "menu backend feedback cache sequence exhausted");
     if (!item.feedback) {
       const size_t bytes = size_t(item.desc.width) * item.desc.height * 4;
-      require(resourceCount() < limits.maxResources, "menu backend feedback resource count budget exceeded");
+      require(bytes <= limits.maxResourceBytes && bytes <= limits.maxResidentBytes, "menu backend feedback resident byte budget exceeded");
+      trimFeedback(1, bytes, &item);
+      require(resourceCount() < limits.maxResources, ("menu backend feedback resource count budget exceeded: originals=" + std::to_string(resources.size()) +
+        " feedback=" + std::to_string(resourceCount() - resources.size() - size_t(white != 0)) + " pinned=" + std::to_string(feedbackPins.size()) +
+        " limit=" + std::to_string(limits.maxResources)).c_str());
       require(bytes <= limits.maxResourceBytes && bytes <= limits.maxResidentBytes && resident <= limits.maxResidentBytes - bytes, "menu backend feedback resident byte budget exceeded");
       std::vector<uint8_t> payload;
       append(payload, webgpu::TexturePacket{item.desc.width, item.desc.height, 0});
@@ -564,6 +641,8 @@ struct MenuBackend::Impl {
       send(webgpu::Opcode::CreateTexture, id, payload);
       item.feedback = id; item.residentBytes += bytes; resident += bytes;
     }
+    item.feedbackUsed = ++feedbackSequence;
+    feedbackPins.insert(item.feedback);
     if (item.feedbackVersion != item.version) {
       sendPacket(webgpu::Opcode::Copy, item.feedback, webgpu::CopyPacket{item.id, item.desc.width, item.desc.height});
       item.feedbackVersion = item.version;
@@ -572,6 +651,7 @@ struct MenuBackend::Impl {
   }
   uint32_t whiteTexture() {
     if (!white) {
+      trimFeedback(1, 8);
       require(resourceCount() < limits.maxResources, "menu backend resource count budget exceeded");
       require(limits.maxResidentBytes >= 8 && resident <= limits.maxResidentBytes - 8, "menu backend white texture resident budget exceeded");
       const webgpu::TexturePacket packet{1, 1, 0};
@@ -607,8 +687,18 @@ struct MenuBackend::Impl {
     return false;
   }
   std::vector<uint8_t> readback(Resource& item) {
-    require(!item.depth, "menu backend unsupported depth readback resource format");
     const auto result = send(webgpu::Opcode::Readback, item.id);
+    if (item.depth) {
+      require(result.bytes.size() == uint64_t(item.desc.width) * item.desc.height * 4, "menu backend depth readback size mismatch");
+      auto bytes = item.uploaded;
+      const uint32_t pixelBytes = item.desc.format == 0x30 ? 2 : 4;
+      for (uint32_t n = 0; n < item.desc.width * item.desc.height; ++n) {
+        uint32_t value = word(result.bytes, n * 4);
+        if (pixelBytes == 2) { value = uint32_t((uint64_t(value >> 8) * 65535 + 8388607) / 16777215); }
+        std::memcpy(bytes.data() + n / item.desc.width * item.desc.pitch + n % item.desc.width * pixelBytes, &value, pixelBytes);
+      }
+      return bytes;
+    }
     auto encoded = menu::EncodeSurface(item.desc, item.uploaded, result.bytes);
     require(encoded.supported, encoded.diagnostic.c_str());
     return std::move(encoded.bytes);
@@ -618,7 +708,7 @@ struct MenuBackend::Impl {
     memory->CheckRange({}, item.desc.data + offset, size);
     const uint32_t rows = item.desc.linear ? item.desc.height : 1;
     const size_t pitch = item.desc.linear ? item.desc.pitch : 0;
-    const size_t rowBytes = item.desc.linear ? size_t(item.desc.width) * 4 : item.uploaded.size();
+    const size_t rowBytes = item.desc.linear ? size_t(item.desc.width) * (item.depth && item.desc.format == 0x30 ? 2 : 4) : item.uploaded.size();
     for (uint32_t n = 0; n < rows; ++n) {
       const size_t first = std::max(size_t(offset), size_t(n) * pitch);
       const size_t last = std::min(size_t(offset) + size, size_t(n) * pitch + rowBytes);
@@ -647,12 +737,15 @@ struct MenuBackend::Impl {
 };
 
 MenuBackend::MenuBackend(Runtime& runtime, PreparedImage& image, std::shared_ptr<webgpu::Transport> transport, MenuBackendLimits limits)
-  : MenuBackend(runtime, image, [transport](auto opcode, auto resource, auto bytes) {
+  : impl_(std::make_unique<Impl>(runtime, image, [transport](auto opcode, auto resource, auto bytes) {
     require(bool(transport), "menu backend missing injected GPU transport");
     return transport->Execute(opcode, resource, bytes);
-  }, limits) {}
+  }, [transport](auto opcode, auto resource, auto bytes) {
+    require(bool(transport), "menu backend missing injected GPU transport");
+    return transport->Post(opcode, resource, bytes);
+  }, limits)) {}
 MenuBackend::MenuBackend(Runtime& runtime, PreparedImage& image, Execute execute, MenuBackendLimits limits)
-  : impl_(std::make_unique<Impl>(runtime, image, std::move(execute), limits)) {}
+  : impl_(std::make_unique<Impl>(runtime, image, execute, execute, limits)) {}
 MenuBackend::~MenuBackend() {
   try { Retire(); } catch (...) {}
 }
@@ -673,7 +766,7 @@ void MenuBackend::Retire() {
   } scope{impl_->retiring};
   while (!impl_->pipelines.empty()) {
     const auto found = impl_->pipelines.begin();
-    impl_->send(webgpu::Opcode::Destroy, found->second);
+    impl_->send(webgpu::Opcode::Destroy, found->second.id);
     impl_->pipelines.erase(found);
   }
   while (!impl_->resources.empty()) {
@@ -692,6 +785,8 @@ void MenuBackend::Retire() {
   }
   impl_->resident = 0;
   impl_->shaderCache.clear(); impl_->shaderCacheBytes = 0;
+  impl_->uploadVersions.clear();
+  impl_->releasedResources.clear();
   impl_->initialized = false;
   impl_->retired = true;
 }
@@ -699,7 +794,7 @@ MenuBackend::SnapshotData MenuBackend::Snapshot() const {
   std::lock_guard lock(impl_->mutex);
   return {uint32_t(impl_->pipelines.size()), uint32_t(impl_->resourceCount()), impl_->resident,
     impl_->submittedCount, impl_->completedCount, impl_->frames, impl_->storageViewFailure,
-    impl_->shaderTranslations, uint32_t(impl_->shaderCacheBytes), uint32_t(impl_->shaderCache.size())};
+    impl_->shaderTranslations, uint32_t(impl_->shaderCacheBytes), uint32_t(impl_->shaderCache.size()), uint32_t(impl_->uploadVersions.size())};
 }
 bool MenuBackend::Init(uint32_t width, uint32_t height) {
   std::lock_guard lock(impl_->mutex);
@@ -712,6 +807,7 @@ bool MenuBackend::Init(uint32_t width, uint32_t height) {
 void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
   std::lock_guard lock(impl_->mutex);
   impl_->requireOwner();
+  impl_->feedbackPins.clear();
   require(impl_->initialized, "menu backend draw before initialization");
   require(count <= impl_->limits.maxVertices, "menu backend vertex budget exceeded");
   impl_->checkState(input);
@@ -754,6 +850,7 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   std::vector<RenderResourceRequest> requests;
   std::map<uint32_t, size_t> requestIndex;
   const auto addRequest = [&](RenderResourceKind kind, uint32_t header, uint32_t data, uint32_t bytes, uint64_t version, uint32_t gpuId = 0) {
+    if (header) { impl_->releasedResources.erase(header); }
     if (kind == RenderResourceKind::Texture || kind == RenderResourceKind::Surface) {
       kind = kind == RenderResourceKind::Texture ? RenderResourceKind::TextureReference : RenderResourceKind::SurfaceReference;
       bytes = 0;
@@ -773,11 +870,18 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
       const uint32_t identity = header ? header : data;
       auto found = impl_->uploadVersions.find(identity);
       if (found == impl_->uploadVersions.end()) {
-        require(impl_->uploadVersions.size() < budget.maxResources, "menu backend upload resource count budget exceeded");
-        found = impl_->uploadVersions.emplace(identity, std::pair{impl_->newId(), uint64_t(0)}).first;
+        require(budget.maxResources, "menu backend upload resource cache is disabled");
+        if (impl_->uploadVersions.size() >= budget.maxResources) {
+          const auto oldest = std::min_element(impl_->uploadVersions.begin(), impl_->uploadVersions.end(), [](const auto& left, const auto& right) {
+            return left.second.used < right.second.used;
+          });
+          impl_->uploadVersions.erase(oldest);
+        }
+        found = impl_->uploadVersions.emplace(identity, Impl::UploadVersion{impl_->newId(), 0, 0}).first;
       }
-      require(found->second.second != UINT64_MAX, "menu backend upload version budget exceeded");
-      id = found->second.first; version = ++found->second.second;
+      require(found->second.version != UINT64_MAX && impl_->uploadSequence != UINT64_MAX, "menu backend upload version budget exceeded");
+      found->second.used = ++impl_->uploadSequence;
+      id = found->second.id; version = ++found->second.version;
     }
     requests.push_back({id, version, kind, header, data, bytes});
   };
@@ -804,12 +908,13 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
         texinfo[n].shadow = format == 0x2c || format == 0x30 ? 2 : 1;
       }
       textureFormats[n] = item.desc.format;
-      texinfo[n].kind = item.desc.cube ? gpu::kTexCube : gpu::kTex2D; texinfo[n].rect = item.desc.linear;
+      texinfo[n].kind = item.desc.cube ? gpu::kTexCube : item.desc.depth > 1 ? gpu::kTex3D : gpu::kTex2D; texinfo[n].rect = item.desc.linear;
       texsize[n] = {float(item.desc.width), float(item.desc.height), item.renderTarget ? -0.5f / item.desc.width : 0, item.renderTarget ? -0.5f / item.desc.height : 0};
       packet.texture[n] = input.rt.data && item.desc.data == address(input.rt.data) ? impl_->feedbackTexture(item) : item.id;
       addRequest(RenderResourceKind::Texture, input.textures[n], item.desc.data, uint32_t(item.uploaded.size()), item.version, item.id);
       const auto& sampling = input.tss[n];
       packet.sampler[n][0] = samplerAddress(sampling[gpu::kTssAddressU]);
+      if (item.desc.depth > 1) { packet.address_w[n] = samplerAddress(sampling[gpu::kTssAddressW]); }
       packet.sampler[n][1] = samplerAddress(sampling[gpu::kTssAddressV]);
       const uint32_t mag = sampling[gpu::kTssMagFilter], min = sampling[gpu::kTssMinFilter], mip = sampling[gpu::kTssMipFilter];
       require(mag >= 1 && mag <= 2 && min >= 1 && min <= 2 && mip <= 2, "menu backend unsupported sampler filter");
@@ -866,7 +971,7 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   webgpu::PipelinePacket pipeline{};
   pipeline.vertex_mask = budget.compactVertices ? regs : 0;
   pipeline.color_target = colorTarget != nullptr;
-  for (uint32_t n = 0; n < 4; ++n) { if (texinfo[n].kind == gpu::kTexCube) { pipeline.cube_mask |= 1u << n; } if (texinfo[n].shadow) { pipeline.shadow_mask |= 1u << n; } }
+  for (uint32_t n = 0; n < 4; ++n) { if (texinfo[n].kind == gpu::kTexCube) { pipeline.cube_mask |= 1u << n; } if (texinfo[n].shadow) { pipeline.shadow_mask |= 1u << n; } if (texinfo[n].kind == gpu::kTex3D) { pipeline.volume_mask |= 1u << n; } }
   pipeline.vertex_bytes = uint32_t(shaders.vertex.size()); pipeline.fragment_bytes = uint32_t(shaders.fragment.size());
   pipeline.topology = prim == 1 ? 1 : prim <= 4 ? 2 : 4;
   pipeline.cull = 1; pipeline.front_face = 1;
@@ -882,6 +987,15 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     pipeline.src_alpha = blendFactor(state.simple[gpu::kMSrcBlend / 4], true);
     pipeline.dst_alpha = blendFactor(state.simple[gpu::kMDestBlend / 4], true);
     pipeline.color_op = pipeline.alpha_op = blendOperation(state.simple[gpu::kMBlendOp / 4]);
+    const uint32_t source = state.simple[gpu::kMSrcBlend / 4], destination = state.simple[gpu::kMDestBlend / 4];
+    const bool colorConstant = source == 0x8001 || source == 0x8002 || destination == 0x8001 || destination == 0x8002;
+    const bool alphaConstant = source == 0x8003 || source == 0x8004 || destination == 0x8003 || destination == 0x8004;
+    require(!colorConstant || !alphaConstant, "menu backend unsupported mixed color and alpha blend constants");
+    const uint32_t constant = state.simple[gpu::kMBlendColor / 4];
+    packet.blend_constant[3] = float(constant >> 24) / 255;
+    packet.blend_constant[0] = alphaConstant ? packet.blend_constant[3] : float((constant >> 16) & 255) / 255;
+    packet.blend_constant[1] = alphaConstant ? packet.blend_constant[3] : float((constant >> 8) & 255) / 255;
+    packet.blend_constant[2] = alphaConstant ? packet.blend_constant[3] : float(constant & 255) / 255;
   }
   const uint32_t mask = state.simple[gpu::kMColorWriteEnable / 4];
   pipeline.write_mask = ((mask >> 16) & 1) | ((mask >> 8) & 1) << 1 | (mask & 1) << 2 | ((mask >> 24) & 1) << 3;
@@ -920,23 +1034,27 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     packet.stencil_reference = state.simple[gpu::kMStencilRef / 4] & 255;
   }
   std::vector<uint8_t> key;
-  append(key, pipeline); append(key, regs); append(key, prim);
-  for (const auto& element : layout.inputs) { append(key, element.stream); append(key, element.offset); append(key, element.type); }
-  for (const auto& stream : state.streams) { append(key, stream.stride); }
-  append(key, layout.stream_stride); append(key, state.vs_handle);
-  append(key, state.rt.format); append(key, state.rt.size); append(key, packet.depth_target ? state.zs.format : 0u);
+  append(key, pipeline);
   key.insert(key.end(), shaders.vertex.begin(), shaders.vertex.end()); key.insert(key.end(), shaders.fragment.begin(), shaders.fragment.end());
   auto foundPipeline = impl_->pipelines.find(key);
+  require(budget.maxPipelines && impl_->pipelineSequence != UINT64_MAX, "menu backend pipeline cache budget exceeded");
   if (foundPipeline == impl_->pipelines.end()) {
-    require(impl_->pipelines.size() < budget.maxPipelines, "menu backend pipeline count budget exceeded");
+    if (impl_->pipelines.size() >= budget.maxPipelines) {
+      const auto oldest = std::min_element(impl_->pipelines.begin(), impl_->pipelines.end(), [](const auto& left, const auto& right) {
+        return left.second.used < right.second.used;
+      });
+      impl_->send(webgpu::Opcode::Destroy, oldest->second.id);
+      impl_->pipelines.erase(oldest);
+    }
     std::vector<uint8_t> bytes;
     append(bytes, pipeline); bytes.insert(bytes.end(), shaders.vertex.begin(), shaders.vertex.end()); bytes.insert(bytes.end(), shaders.fragment.begin(), shaders.fragment.end());
     const uint32_t id = impl_->newId();
     try { impl_->send(webgpu::Opcode::CreatePipeline, id, bytes); }
     catch (const std::exception& error) { throw std::runtime_error(menu::DescribeShaderFailure(shaders, error.what())); }
-    foundPipeline = impl_->pipelines.emplace(std::move(key), id).first;
+    foundPipeline = impl_->pipelines.emplace(std::move(key), Impl::Pipeline{id, 0}).first;
   }
-  packet.pipeline = foundPipeline->second;
+  foundPipeline->second.used = ++impl_->pipelineSequence;
+  packet.pipeline = foundPipeline->second.id;
   auto constants = menu::BuildConstants(state, target.desc.width, target.desc.height, texsize);
   if (depthBias) {
     const float offset = std::bit_cast<float>(state.simple[gpu::kMDepthOffset / 4]), slope = std::bit_cast<float>(state.simple[gpu::kMSlopeScale / 4]);
@@ -1003,15 +1121,12 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
       } else { batchNumbers.push_back(number); }
     }
     vertices.assign(batchNumbers.size() * vertexRegisters * 4, 0);
-    for (uint32_t n = 0; n < batchNumbers.size(); ++n) {
-      const uint32_t vertex = n;
-      const uint32_t number = batchNumbers[vertex];
-      for (uint32_t n = 0; n < sourceCount; ++n) {
-        auto* output = vertices.data() + size_t(vertex) * vertexRegisters * 4 + n * 4;
-        output[3] = 1;
-        const auto& source = sources[n];
-        if (source.type) { convert(source.type, source.first + size_t(number) * source.stride, output); }
-      }
+    const size_t pitch = size_t(vertexRegisters) * 4;
+    for (uint32_t n = 0; n < sourceCount; ++n) {
+      float* column = vertices.data() + n * 4;
+      for (size_t vertex = 0; vertex < batchNumbers.size(); ++vertex) { column[vertex * pitch + 3] = 1; }
+      const auto& source = sources[n];
+      if (source.type) { convertColumn(source.type, source.first, source.stride, batchNumbers, column, pitch); }
     }
     packet.vertex_count = uint32_t(batchNumbers.size()); packet.vertex_bytes = uint32_t(vertices.size() * 4);
     packet.index_count = uint32_t(batchIndices.size()); packet.index_bytes = uint32_t(batchIndices.size() * 2);
@@ -1031,6 +1146,7 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
 }
 void MenuBackend::Clear(const gpu::State& state, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z, uint32_t stencil) {
   std::lock_guard lock(impl_->mutex);
+  impl_->feedbackPins.clear();
   require(impl_->initialized, "menu backend clear before initialization");
   require(count <= 4096 && (!count || rects), "menu backend invalid clear rectangle count or pointer");
   require((flags & ~(gpu::kClearTarget | gpu::kClearZ | gpu::kClearStencil)) == 0 && (!(flags & gpu::kClearTarget) || (flags & gpu::kClearTarget) == gpu::kClearTarget), "menu backend unsupported clear flags or color channels");
@@ -1080,6 +1196,7 @@ void MenuBackend::Clear(const gpu::State& state, uint32_t count, const uint8_t* 
 }
 void MenuBackend::Copy(const gpu::Surface& source, const gpu::Surface& destination, uint32_t count, uint32_t sourceRects, uint32_t destinationPoints) {
   std::lock_guard lock(impl_->mutex);
+  impl_->feedbackPins.clear();
   require(impl_->initialized, "menu backend copy before initialization");
   require(count <= 4096 && (!count || sourceRects) && (count || (!sourceRects && !destinationPoints)), "menu backend invalid partial copy list");
   const auto rectangles = count ? impl_->read(sourceRects, uint64_t(count) * 16) : std::vector<uint8_t>{};
@@ -1148,6 +1265,7 @@ bool MenuBackend::HasGpuContents(uint32_t location) const {
 }
 void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
   std::lock_guard lock(impl_->mutex);
+  impl_->feedbackPins.clear();
   require(impl_->initialized, "menu backend present before initialization");
   auto& item = impl_->surface(front);
   const auto result = impl_->sendPacket(webgpu::Opcode::Present, item.id, webgpu::PresentPacket{uint32_t(pillarbox)});
@@ -1236,13 +1354,24 @@ bool MenuBackend::Busy(uint32_t resource) {
     if (item.views.contains(resource)) { return item.command > impl_->completed; }
   }
   if (impl_->uploadVersions.contains(resource)) { return false; }
-  return impl_->byAddress(resource).command > impl_->completed;
+  require(!impl_->releasedResources.contains(resource), "menu backend unknown resource");
+  const uint32_t location = address(resource);
+  if (std::any_of(impl_->resources.begin(), impl_->resources.end(), [&](const auto& entry) {
+    return location >= entry.second.desc.data && uint64_t(location) < uint64_t(entry.second.desc.data) + entry.second.uploaded.size();
+  })) { return impl_->byAddress(resource).command > impl_->completed; }
+  const auto header = impl_->read(resource, 12);
+  require((word(header, 0) & 0x70000) == 0 && (word(header, 0) & 0x78ffff) && word(header, 4), "menu backend unknown CPU upload resource");
+  return false;
 }
 void MenuBackend::WaitResource(uint32_t resource) { if (Busy(resource)) { Flush(); } }
 bool MenuBackend::ReleaseResource(uint32_t header, uint32_t data) {
   std::lock_guard lock(impl_->mutex);
   impl_->requireOwner();
   impl_->uploadVersions.erase(header);
+  if (header && impl_->limits.maxResources) {
+    impl_->releasedResources.insert(header);
+    if (impl_->releasedResources.size() > impl_->limits.maxResources) { impl_->releasedResources.erase(impl_->releasedResources.begin()); }
+  }
   auto found = std::find_if(impl_->resources.begin(), impl_->resources.end(), [&](const auto& entry) {
     return entry.second.desc.data == address(data) && entry.second.views.contains(header);
   });

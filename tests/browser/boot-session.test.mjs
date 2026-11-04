@@ -65,6 +65,27 @@ const executedFixture = () => {
   return result;
 };
 
+test('development mission start is explicit and configured before guest binding', async () => {
+  for (const enabled of [false, true]) {
+    const { options, data, module, calls, messages } = executedFixture();
+    module._image_development_boot = () => { calls.push('development'); return 1; };
+    module._image_bind = () => { calls.push('bind'); return 1; };
+    await createBootSession(options)({ data: { ...data, developmentStart: enabled } });
+    assert.equal(calls.includes('development'), enabled);
+    if (enabled) { assert.ok(calls.indexOf('development') < calls.indexOf('bind')); }
+    assert.equal(messages[0].developmentStart, enabled);
+  }
+});
+
+test('unsupported or malformed development launch requests cannot enter the guest', async () => {
+  for (const mode of ['enabled', 1, true]) {
+    const { options, data, module, messages } = executedFixture();
+    module._image_execute = () => { throw new Error('must not execute'); };
+    await createBootSession(options)({ data: { ...data, developmentStart: mode } });
+    assert.equal(messages[0].code, 'DEVELOPMENT_START');
+  }
+});
+
 test('recoverable file operation diagnostics retain generation ownership', async () => {
   const { options, data, module } = executedFixture();
   const progress = [];
@@ -772,5 +793,61 @@ test('mission graphics diagnostics retain their bounded renderer residency witho
     await createBootSession(options)({ data });
     assert.equal(messages[0].code === 'GRAPHICS_PROTOCOL', !mission);
     if (mission) { assert.equal(messages[0].graphics.residentBytes, String(128 * 1024 * 1024)); }
+  }
+});
+
+test('audio transport publishes bounded disjoint native storage before guest execution', async () => {
+  for (const [header, samples, valid] of [[512, 1024, true], [0, 1024, false], [512, 0, false], [512, 520, false],
+    [112, 1024, false], [400, 1024, false], [128, 1024, false], [512, 500000, false]]) {
+    const { options, data, module, messages } = executedFixture();
+    const heap = new Uint8Array(new SharedArrayBuffer(500000));
+    heap.set(module.HEAPU8);
+    module.HEAPU8 = heap;
+    module._image_input_address = () => 112;
+    module._image_input_words = () => 2;
+    module._image_motion_address = () => 400;
+    module._image_metrics_address = () => 128;
+    module._image_metrics_words = () => 42;
+    module._image_audio_address = () => header;
+    module._image_audio_samples_address = () => samples;
+    let executions = 0;
+    module._image_execute = () => { ++executions; return 1; };
+    const progress = [];
+    options.onProgress = message => progress.push(message);
+    await createBootSession(options)({ data });
+    assert.equal(executions, valid ? 1 : 0);
+    if (valid) {
+      const input = progress.find(message => message.phase === 'input');
+      assert.equal(input.audioOffset, header);
+      assert.equal(input.audioSamplesOffset, samples);
+    } else { assert.equal(messages[0].code, 'INPUT_PROTOCOL'); }
+  }
+});
+
+test('gamepad input publication validates both exports and every shared span before execution', async () => {
+  for (const [offset, words, valid] of [[448, 8, true], [449, 8, false], [499980, 8, false], [448, 7, false],
+    [0, 8, false], [undefined, 8, false], [448, undefined, false], [4, 8, false], [112, 8, false],
+    [128, 8, false], [400, 8, false], [512, 8, false], [1024, 8, false]]) {
+    const { options, data, module, messages } = executedFixture();
+    const heap = new Uint8Array(new SharedArrayBuffer(500000));
+    heap.set(module.HEAPU8);
+    module.HEAPU8 = heap;
+    module._image_input_address = () => 112;
+    module._image_input_words = () => 2;
+    module._image_motion_address = () => 400;
+    module._image_metrics_address = () => 128;
+    module._image_metrics_words = () => 42;
+    module._image_audio_address = () => 512;
+    module._image_audio_samples_address = () => 1024;
+    if (offset !== undefined) { module._image_gamepad_address = () => offset; }
+    if (words !== undefined) { module._image_gamepad_words = () => words; }
+    let executions = 0;
+    module._image_execute = () => { ++executions; return 1; };
+    const progress = [];
+    options.onProgress = message => progress.push(message);
+    await createBootSession(options)({ data });
+    assert.equal(executions, valid ? 1 : 0);
+    if (valid) { assert.equal(progress.find(message => message.phase === 'input').gamepadOffset, offset); }
+    else { assert.equal(messages[0].code, 'INPUT_PROTOCOL'); }
   }
 });

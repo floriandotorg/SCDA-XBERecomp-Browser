@@ -4,6 +4,7 @@
 
 X86_FUNC(__imp__sub_004B8EC0);
 X86_FUNC(sub_004B8EC0) {
+  browser::Memory::PauseExecution pause;
   auto& runtime = browser::Runtime::From(ctx);
   if (!base || !runtime.HasPublishedImage() || !runtime.OwnsCurrentContext(ctx) || browser::Memory::HasBorrow()) {
     throw browser::Fault(ctx, 0x4b8ec0, 0, "loading work query requires its published current guest worker without a lease");

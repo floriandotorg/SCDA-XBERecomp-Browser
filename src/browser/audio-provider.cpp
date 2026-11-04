@@ -1,4 +1,6 @@
 #include "browser/audio-provider.h"
+#include <bit>
+#include <cmath>
 #include "browser/audio-effects.h"
 #include "browser/audio-entries.h"
 #include "kernel/disc_index.h"
@@ -294,10 +296,113 @@ void AudioProvider::FeedTickLocked(const X86Context& context, uint64_t now) {
   while (true) {
     const SilentAudioSnapshot snapshot = sink_->Snapshot();
     if (snapshot.paused) { return; }
-    const uint64_t space = SilentAudioSink::kCapacityFrames - std::min<uint64_t>(snapshot.queuedFrames, SilentAudioSink::kCapacityFrames);
+    const uint32_t capacity = sink_->HasOutput() ? 8192 : SilentAudioSink::kCapacityFrames;
+    const uint64_t space = capacity - std::min<uint64_t>(snapshot.queuedFrames, capacity);
     if (!space || !SoundingLocked(snapshot.consumedFrames)) { return; }
     const size_t frames = size_t(std::min<uint64_t>(space, kFeedChunkFrames));
+    RenderLocked(context, snapshot.submittedFrames, frames);
     sink_->SubmitAtTime(context, now, std::span(silence_.data(), frames * ::audio::kChannels));
+  }
+}
+
+float AudioProvider::ReadSample(const X86Context& context, VoiceState& state, const audio::Format& format,
+    uint32_t data, uint32_t bytes, uint32_t frame, uint32_t channel) {
+  if (!data || channel >= format.channels || frame >= audio::FramesOf(format, bytes).value_or(0)) { return 0; }
+  const uint32_t blockFrames = format.tag == audio::kFormatXboxAdpcm ? 64 : 128;
+  const uint32_t offset = format.tag == audio::kFormatXboxAdpcm ? frame / 64 * format.align : frame / 128 * 128 * format.align;
+  const uint64_t address = uint64_t(data) + offset;
+  const uint32_t count = std::min<uint32_t>(bytes - offset, format.tag == audio::kFormatXboxAdpcm ? format.align : 128 * format.align);
+  if (address + count > (uint64_t(1) << 32) || count > state.cachedData.size()) { throw Fault(context, data, bytes, "audio sample block exceeds guest memory"); }
+  if (state.cachedAddress != address || state.cachedBytes != count) {
+    memory_->Read(context, uint32_t(address), state.cachedData.data(), count);
+    if (format.tag == audio::kFormatXboxAdpcm && !audio::DecodeAdpcm(std::span(state.cachedData).first(count), format.channels, state.decoded)) {
+      throw Fault(context, uint32_t(address), count, "audio ADPCM block is invalid");
+    }
+    state.cachedAddress = address;
+    state.cachedBytes = count;
+  }
+  if (format.tag == audio::kFormatXboxAdpcm) { return state.decoded[(frame % blockFrames) * format.channels + channel] / 32768.0f; }
+  const auto decoded = audio::DecodePcm(format, std::span(state.cachedData).subspan((frame % blockFrames) * format.align, format.align), channel);
+  if (!decoded) { throw Fault(context, uint32_t(address), count, "audio PCM frame is invalid"); }
+  return *decoded;
+}
+
+std::array<std::array<float, 6>, 2> AudioProvider::Gains(const VoiceState& state, uint32_t channels) const {
+  std::array<std::array<float, 6>, 2> gains{};
+  const auto db = [](int64_t value) { return value <= -10000 ? 0.0f : std::pow(10.0f, float(value) / 2000); };
+  float attenuation = 1, pan = 0;
+  if (state.is3d) {
+    std::array<float, 3> delta{}, front{}, top{};
+    for (uint32_t n = 0; n < 3; ++n) {
+      delta[n] = std::bit_cast<float>(state.position[n]) - std::bit_cast<float>(listenerPosition_[n]);
+      front[n] = std::bit_cast<float>(listenerFront_[n]);
+      top[n] = std::bit_cast<float>(listenerTop_[n]);
+    }
+    const float distance = std::hypot(delta[0], delta[1], delta[2]);
+    const float minimum = state.minDistance ? std::bit_cast<float>(state.minDistance) : 1;
+    const float maximum = state.maxDistance ? std::bit_cast<float>(state.maxDistance) : 1e9f;
+    if (!std::isfinite(distance) || !std::isfinite(minimum) || !std::isfinite(maximum) || minimum <= 0 || maximum < minimum) { return gains; }
+    if (distance > minimum) { attenuation = minimum / std::min(distance, maximum); }
+    const std::array<float, 3> right{top[1] * front[2] - top[2] * front[1], top[2] * front[0] - top[0] * front[2], top[0] * front[1] - top[1] * front[0]};
+    const float length = std::hypot(right[0], right[1], right[2]);
+    if (distance > 0 && length > 0) { pan = std::clamp((delta[0] * right[0] + delta[1] * right[1] + delta[2] * right[2]) / (distance * length), -1.0f, 1.0f); }
+    if (!std::isfinite(pan)) { return gains; }
+  }
+  std::array<int32_t, 32> volumes{};
+  for (const auto& [bin, volume] : state.bins) { volumes[bin] = volume; }
+  for (const auto& [bin, volume] : state.binVolumes) { volumes[bin] = volume; }
+  const size_t count = state.bins.empty() ? 2 : state.bins.size();
+  bool speakers = false;
+  for (uint32_t n = 0; n < count; ++n) {
+    const uint32_t bin = state.bins.empty() ? n : state.bins[n].first;
+    speakers |= bin < 10 && bin != 3 && volumes[bin] > -10000;
+  }
+  for (uint32_t n = 0; n < count; ++n) {
+    const uint32_t channel = channels == 1 ? 0 : n % 2;
+    const uint32_t bin = state.bins.empty() ? n : state.bins[n].first;
+    const float value = attenuation * db(state.volumeMb) * db(-int64_t(state.headroomMb)) * db(volumes[bin]);
+    const auto add = [&](uint32_t speaker) {
+      const float spatial = state.is3d && channels == 1 && speaker != 2 && speaker != 3 ? std::sqrt(1 + ((speaker & 1) ? pan : -pan)) : 1;
+      const float level = value * spatial;
+      if (std::isfinite(level)) { gains[channel][speaker] = std::max(gains[channel][speaker], level); }
+    };
+    if (!speakers) { add(0); add(1); }
+    else if (bin < 6) { add(bin); }
+    else if (bin < 10) { add(bin - 6 + ((bin >= 8) ? 2 : 0)); }
+  }
+  return gains;
+}
+
+void AudioProvider::RenderLocked(const X86Context& context, uint64_t start, size_t frames) {
+  std::fill_n(silence_.begin(), frames * ::audio::kChannels, 0.0f);
+  if (!sink_->NeedsSamples()) { return; }
+  auto lease = memory_->Borrow();
+  for (auto& [id, state] : states_) {
+    const auto* voice = bank_.Find(id);
+    if (!voice) { continue; }
+    if (voice->IsStream() ? !voice->Active() || voice->Paused() || !voice->QueuedPackets() : !(voice->Status(start) & audio::kStatusPlaying)) { continue; }
+    const auto& format = voice->GetFormat();
+    const auto gains = Gains(state, format.channels);
+    state.cachedAddress = UINT64_MAX;
+    for (uint32_t n = 0; n < frames; ++n) {
+      const auto cursor = voice->Sample(start + n);
+      if (!cursor) { continue; }
+      uint32_t data = state.data, bytes = voice->BufferBytes();
+      if (state.stream) {
+        const auto packet = tokens_.find(cursor->token);
+        if (packet == tokens_.end()) { throw Fault(context, id, 0, "audio mixer lost its stream packet"); }
+        data = packet->second.data;
+        bytes = packet->second.bytes;
+      }
+      const uint32_t next = std::min(cursor->frame + 1, audio::FramesOf(format, bytes).value_or(1) - 1);
+      for (const uint32_t channel : {0u, 1u}) {
+        if (channel >= format.channels) { continue; }
+        const float first = ReadSample(context, state, format, data, bytes, cursor->frame, channel);
+        const float second = ReadSample(context, state, format, data, bytes, next, channel);
+        const float sample = first + (second - first) * (float(cursor->fraction) / audio::kRate);
+        for (const uint32_t speaker : {0u, 1u, 2u, 3u, 4u, 5u}) { silence_[n * ::audio::kChannels + speaker] += sample * gains[channel][speaker]; }
+      }
+    }
   }
 }
 
@@ -803,7 +908,7 @@ uint32_t AudioProvider::Handle(const X86Context& ctx, uint32_t id, uint64_t now,
     if (completedPtr) { memory_->CheckRange(ctx, completedPtr, 4); }
     if (statusPtr) { memory_->CheckRange(ctx, statusPtr, 4); }
     const uint64_t token = ++nextToken_;
-    tokens_.emplace(token, PacketRoute{args[0], completedPtr, statusPtr, packetContext});
+    tokens_.emplace(token, PacketRoute{args[0], completedPtr, statusPtr, packetContext, data, size});
     try {
       const audio::AudioError error = voice->ProcessPacket(now, token, size);
       if (error == audio::AudioError::kPacketLimit) { throw Fault(ctx, args[0], 0, "stream packet budget exhausted"); }
@@ -932,7 +1037,8 @@ bool AudioProvider::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
   uint32_t result = 0;
   {
     std::lock_guard lock(mutex_);
-    const uint64_t now = sink_->Snapshot().consumedFrames;
+    const auto clock = sink_->Snapshot();
+    const uint64_t now = sink_->HasOutput() ? clock.submittedFrames : clock.consumedFrames;
     AdvanceAllLocked(ctx, now);
     result = Handle(ctx, id, now, deliver);
     FeedDispatchLocked(ctx);

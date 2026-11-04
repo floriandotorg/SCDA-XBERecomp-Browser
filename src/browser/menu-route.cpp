@@ -166,7 +166,8 @@ void MenuMissionObservation::Observe(const X86Context& ctx, uint8_t* base, uint3
     event.fsBase = ctx.fs_base;
     auto lease = memory_->Borrow();
     memory_->Read(ctx, ctx.esp, &event.returnAddress, 4);
-    if (event.returnAddress != 0x18890a && event.returnAddress != 0x18892e) { return; }
+    const auto returns = ReturnAddresses();
+    if (std::find(returns.begin(), returns.end(), event.returnAddress) == returns.end()) { return; }
     try { Inspect(ctx, event); } catch (...) { event.state = State::Unavailable; }
     std::lock_guard lock(observationLock_);
     event.sequence = evidence_.total + 1;

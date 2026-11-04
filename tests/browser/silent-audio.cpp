@@ -321,7 +321,32 @@ void serializedPublication() {
   check(calls == 20000 && queue->Pending() == 0, "observer required pending timers or deferred delivery");
 }
 
+void outputRing() {
+  const auto owned = std::make_unique<browser::AudioOutput>();
+  auto& output = *owned;
+  std::vector<float> samples(browser::AudioOutput::kFrames * audio::kChannels, 0.25f);
+  check(!output.Submit(samples), "disabled browser output accepted samples");
+  output.header[3] = 1;
+  check(output.Submit(samples), "bounded browser output rejected a full ring");
+  check(output.header[0] == browser::AudioOutput::kFrames && output.samples[0] == 0.25f,
+    "browser output did not publish interleaved samples");
+  check(!output.Submit(std::span(samples).first(6)), "browser output overwrote unread samples");
+  output.header[1] = browser::AudioOutput::kFrames;
+  check(output.Submit(std::span(samples).first(6)), "browser output failed to wrap");
+  check(output.header[0] == browser::AudioOutput::kFrames + 1 && output.samples[0] == 0.25f,
+    "browser output published the wrong wrap position");
+  const uint32_t epoch = output.header[2];
+  output.Reset();
+  check(!output.header[3] && output.header[2] == epoch + 1, "runtime reset left browser audio enabled or stale");
+  output.header[0] = UINT32_MAX;
+  output.header[1] = UINT32_MAX;
+  output.header[3] = 1;
+  check(output.Submit(std::span(samples).first(12)) && output.header[0] == 1,
+    "browser output counters failed to wrap at uint32");
+}
+
 int main() {
+  outputRing();
   arithmetic();
   submitAfterIdle();
   ownership();

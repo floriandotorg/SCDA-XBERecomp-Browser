@@ -16,6 +16,7 @@ public:
   static constexpr uint64_t MetadataOffset = 0x800;
   static constexpr uint32_t SectorSize = 512;
   static constexpr uint32_t MaximumTransfer = SectorSize;
+  explicit RawCache(uint64_t capacity = CacheFatx::Capacity);
   uint32_t Read(uint64_t offset, std::span<uint8_t> output) const;
   uint32_t Write(uint64_t offset, std::span<const uint8_t> input);
   std::shared_ptr<CacheFatx> Partition(uint32_t partition) const;
@@ -23,7 +24,7 @@ public:
 private:
   mutable std::mutex lock_;
   std::array<uint8_t, SectorSize> metadata_{};
-  const std::shared_ptr<CacheFatx> partition_ = std::make_shared<CacheFatx>();
+  const std::shared_ptr<CacheFatx> partition_;
 };
 
 }

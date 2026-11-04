@@ -3,6 +3,8 @@
 
 namespace browser {
 
+RawCache::RawCache(uint64_t capacity) : partition_(std::make_shared<CacheFatx>(capacity)) {}
+
 uint32_t RawCache::Read(uint64_t offset, std::span<uint8_t> output) const {
   if (offset != MetadataOffset || output.size() != SectorSize) { return 0xc000000d; }
   std::lock_guard lock(lock_);

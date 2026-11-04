@@ -1,6 +1,8 @@
 import { createBootRuntime } from './boot-runtime.mjs';
 import { createMenuInput } from './menu-input.mjs';
+import { createGamepadInput } from './gamepad-input.mjs';
 import { createMissionControls } from './mission-controls.mjs';
+import { createBrowserAudio } from './browser-audio.mjs';
 import { MISSION_METRICS_WORDS, readMissionMetrics } from './mission-metrics.mjs';
 import { createMailbox } from './webgpu-transport.mjs';
 import { startGPUWorker } from './webgpu-service.mjs';
@@ -22,7 +24,7 @@ const waitReady = async (ready, signal, timeoutMs) => {
 };
 
 export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRuntime, createGPU = startGPUWorker,
-  createInput = createMenuInput, createMotion = createMissionControls, onPresented = () => {}, onAdapter = () => {}, onDiagnostic = () => {},
+  gamepad = true, createGamepad = createGamepadInput, createInput = createMenuInput, createMotion = createMissionControls, createAudio = createBrowserAudio, onPresented = () => {}, onAdapter = () => {}, onDiagnostic = () => {},
   readyTimeoutMs = 20000, ...runtimeOptions } = {}) => {
   if (typeof acquireCanvas !== 'function') { throw new TypeError('A fresh owned canvas is required for each menu runtime.'); }
   if (!Number.isInteger(readyTimeoutMs) || readyTimeoutMs < 1 || readyTimeoutMs > 30000) { throw new RangeError('Invalid GPU initialization deadline.'); }
@@ -33,7 +35,10 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
     if (!owned()) { throw new DOMException('Stopped.', 'AbortError'); }
     const mailbox = createMailbox();
     let producer;
+    let controller;
     let motion;
+    let audio;
+    let audioClosing;
     let metrics;
     let cancelled = false;
     let disposed;
@@ -64,12 +69,14 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
     const cancel = () => {
       if (cancelled) { return; }
       cancelled = true;
+      audioClosing = audio?.dispose();
       motion?.dispose();
+      controller?.dispose();
       producer?.dispose();
       gpu.cancel();
     };
     const dispose = () => {
-      disposed ??= (async () => { cancel(); await gpu.dispose(); })();
+      disposed ??= (async () => { cancel(); await Promise.all([gpu.dispose(), audioClosing]); })();
       return disposed;
     };
     try {
@@ -94,9 +101,13 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
             return true;
           }
           if (data.phase === 'restarting' && live()) {
+            void audio?.dispose();
+            audio = undefined;
             motion?.dispose();
             motion = undefined;
             metrics = undefined;
+            controller?.dispose();
+            controller = undefined;
             producer?.dispose();
             producer = undefined;
             return true;
@@ -106,7 +117,12 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
           if (!live()) { return true; }
           try {
             if (producer || data.words !== 2) { throw new Error('Unexpected menu input storage publication.'); }
+            if (gamepad && !data.gamepadOffset) { throw new Error('Missing shared gamepad input storage.'); }
+            if (gamepad) { controller = createGamepad({ buffer: data.buffer, byteOffset: data.gamepadOffset, signal }); }
             producer = createInput({ buffer: data.buffer, byteOffset: data.byteOffset, signal });
+            if (data.audioOffset) {
+              audio = createAudio({ buffer: data.buffer, byteOffset: data.audioOffset, samplesOffset: data.audioSamplesOffset, signal });
+            }
             if (data.metricsOffset) { metrics = new Uint32Array(data.buffer, data.metricsOffset, MISSION_METRICS_WORDS); }
             if (data.motionOffset) {
               motion = createMotion({ buffer: data.buffer, byteOffset: data.motionOffset, signal,

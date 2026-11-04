@@ -26,23 +26,60 @@ ${operations}
   if (ctx.edx) { --ctx.edx; Deep(ctx, base); }
   ++ctx.ebx;
 }
+X86_FUNC(Leaf) {
+${operations}
+  if (ctx.ecx) { goto loc_00013010; }
+  ctx.eax = 19;
+  ctx.esp += 4; return;
+loc_00013010:
+  ctx.eax = 37;
+  ctx.esp += 4; return;
+}
+X86_FUNC(VectorLeaf) {
+  { uint32_t ea = 0x10000; ctx.xmm[0] = *X86_PTR(X86Xmm, ea); }
+  { uint32_t ea = 0x10010; *X86_PTR(X86Xmm, ea) = ctx.xmm[0]; }
+  ctx.esp += 4; return;
+}
+X86_FUNC(StackLeaf) {
+  { X86_PUSH32(ctx.eax); }
+  { uint32_t value = X86_MEM32(ctx.esp); ctx.edx = value; ctx.esp += 4; }
+  ctx.esp += 4; return;
+}
 int main() {
   browser::Memory memory;
   memory.Map(0x10000, 4096); memory.Commit(0x10000, 4096);
   X86Context ctx{}; ctx.edx = 100000;
+  for (uint32_t n = 0; n < 2; ++n) {
+    ctx.ecx = n;
+    Leaf(ctx, memory.Base());
+    if (ctx.eax != (n ? 37 : 19) || browser::Memory::HasBorrow()) { return 4; }
+  }
+  VectorLeaf(ctx, memory.Base());
+  const auto vector = memory.Load<X86Xmm>(ctx, 0x10010);
+  for (uint32_t n = 0; n < 4; ++n) { if (vector.u[n] != ctx.xmm[0].u[n]) { return 5; } }
+  ctx.esp = 0x10f00; ctx.eax = 0x12345678;
+  StackLeaf(ctx, memory.Base());
+  if (ctx.edx != ctx.eax || ctx.esp != 0x10f04 || browser::Memory::HasBorrow()) { return 6; }
+  ctx.edx = 100000;
   sub_00011000(ctx, memory.Base());
   if (ctx.edx || browser::Memory::HasBorrow()) { return 1; }
   ctx.edx = 4096;
   Deep(ctx, memory.Base());
   if (ctx.ebx != 4097 || browser::Memory::HasBorrow()) { return 3; }
   memory.Decommit(0x10000, 4096);
-  bool rejected = false;
-  try { sub_00011000(ctx, memory.Base()); } catch (const browser::Fault&) { rejected = true; }
-  if (!rejected || browser::Memory::HasBorrow()) { return 2; }
+  for (const auto function : {Leaf, sub_00011000}) {
+    bool rejected = false;
+    try { function(ctx, memory.Base()); } catch (const browser::Fault&) { rejected = true; }
+    if (!rejected || browser::Memory::HasBorrow()) { return 2; }
+  }
   memory.Commit(0x10000, 4096);
   std::puts("memory-block-execution-ok");
 }`;
-  writeFileSync(`${directory}/guest.cpp`, adaptMemory(source, { blocks: true }));
+  const adapted = adaptMemory(source, { blocks: true });
+  assert.match(adapted, /X86_FUNC\(Leaf\) \{\n\s*browser::Memory::BlockScope guestMemoryBlock/);
+  assert.match(adapted, /browser::BlockPointer<X86Xmm>\(guestMemoryBlock, ctx,/);
+  assert.match(adapted, /browser::BlockPush32\(guestMemoryBlock, ctx,/);
+  writeFileSync(`${directory}/guest.cpp`, adapted);
   const run = (command, args) => {
     const result = spawnSync(command, args, { encoding: 'utf8', timeout: 120000 });
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);

@@ -2,6 +2,7 @@
 #include "audio/output.h"
 
 #include <cstdio>
+#include <array>
 
 using namespace browser::audio;
 
@@ -558,7 +559,73 @@ static void CandidateRegressions() {
   CHECK(bank.Erase(0x4000) == AudioError::kNone);
 }
 
+static void MixerCursors() {
+  const auto halfRate = *Format::Make(1, 1, 24000, 2, 16);
+  auto buffer = Voice::Buffer(halfRate, 8);
+  CHECK(!buffer.Sample(0));
+  CHECK(buffer.Play(100, kPlayLooping) == AudioError::kNone);
+  CHECK(buffer.Sample(100)->frame == 0 && buffer.Sample(100)->fraction == 0);
+  CHECK(buffer.Sample(101)->frame == 0 && buffer.Sample(101)->fraction == 24000);
+  CHECK(buffer.Sample(102)->frame == 1 && buffer.Sample(102)->fraction == 0);
+  CHECK(buffer.Sample(108)->frame == 0 && buffer.Sample(108)->fraction == 0);
+  CHECK(buffer.Stop(103) == AudioError::kNone);
+  CHECK(!buffer.Sample(104));
+  CHECK(buffer.Play(110, kPlayFromStart) == AudioError::kNone);
+  CHECK(buffer.Sample(117)->frame == 3 && buffer.Sample(117)->fraction == 24000);
+  CHECK(!buffer.Sample(118));
+  auto stream = Voice::Stream(halfRate, 2);
+  CHECK(stream.ProcessPacket(0, 10, 4) == AudioError::kNone);
+  CHECK(stream.ProcessPacket(0, 20, 4) == AudioError::kNone);
+  CHECK(stream.Sample(3)->token == 10 && stream.Sample(3)->frame == 1 && stream.Sample(3)->fraction == 24000);
+  CHECK(stream.Sample(4)->token == 20 && stream.Sample(4)->frame == 0);
+  CHECK(!stream.Sample(8));
+  CHECK(stream.QueuedPackets() == 2);
+  std::vector<Completion> completed;
+  stream.Advance(4, completed);
+  CHECK(completed.size() == 1 && completed[0].token == 10);
+  CHECK(stream.Sample(5)->token == 20 && stream.Sample(5)->fraction == 24000);
+  CHECK(stream.Pause(5, true) == AudioError::kNone);
+  CHECK(!stream.Sample(6));
+  CHECK(stream.Pause(10, false) == AudioError::kNone);
+  CHECK(stream.Sample(10)->token == 20 && stream.Sample(10)->fraction == 24000);
+}
+
+static void AudioDecoding() {
+  const std::array<uint8_t, 4> pcm{0, 128, 255, 127};
+  CHECK(DecodePcm(kPcmStereo, pcm, 0) == -1.0f);
+  CHECK(DecodePcm(kPcmStereo, pcm, 1) == 32767.0f / 32768);
+  CHECK(DecodePcm(kPcmMono8, pcm, 0) == -1.0f);
+  CHECK(DecodePcm(kPcmMono8, std::span(pcm).subspan(1), 0) == 0.0f);
+  std::array<uint8_t, 72> block{};
+  block[0] = 0xe8;
+  block[1] = 3;
+  block[4] = 0x18;
+  block[5] = 0xfc;
+  block[8] = 0x11;
+  block[12] = 0x99;
+  std::array<int16_t, 130> decoded{};
+  CHECK(DecodeAdpcm(block, 2, decoded));
+  CHECK(decoded[0] == 1000 && decoded[1] == -1000);
+  CHECK(decoded[2] == 1001 && decoded[3] == -1001);
+  CHECK(decoded[4] == 1002 && decoded[5] == -1002);
+  CHECK(!DecodeAdpcm(std::span(block).first(71), 2, decoded));
+  CHECK(!DecodeAdpcm(block, 0, decoded));
+  CHECK(!DecodeAdpcm(block, 9, decoded));
+  CHECK(!DecodeAdpcm(block, 2, std::span(decoded).first(129)));
+  block.fill(0x77);
+  block[0] = 0;
+  block[1] = 0;
+  block[2] = 255;
+  block[4] = 0;
+  block[5] = 0;
+  block[6] = 255;
+  CHECK(DecodeAdpcm(block, 2, decoded));
+  CHECK(decoded[2] == 32767 && decoded[129] == 32767);
+}
+
 int main() {
+  AudioDecoding();
+  MixerCursors();
   Formats();
   FrameMath();
   BankLimits();

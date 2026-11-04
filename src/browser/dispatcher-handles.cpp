@@ -55,6 +55,16 @@ uint32_t DispatcherHandles::CreateEvent(bool notification, bool signaled) {
   return Create(Kind::Event, notification, signaled ? 1 : 0, 1);
 }
 
+std::function<void()> DispatcherHandles::BeginFileIo(uint32_t handle) {
+  auto object = Pin(handle);
+  dispatcher_.ResetEvent(object->id);
+  return [object = std::move(object)]() mutable {
+    if (!object) { throw Fault({}, 0, 0, "file read event completed twice"); }
+    auto pinned = std::exchange(object, {});
+    pinned->dispatcher.SetEvent(pinned->id);
+  };
+}
+
 uint32_t DispatcherHandles::PublishThread(uint32_t handle) {
   std::lock_guard lock(lock_);
   if (handle < 0x70000004 || handle >= 0x71000000 || handle % 4 ||

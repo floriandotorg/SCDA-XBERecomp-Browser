@@ -15,8 +15,10 @@ struct MenuBackendLimits {
   uint32_t maxExpandedVertices = 0;
   uint32_t maxPipelines = 256;
   bool batchDraws = false;
+  bool batchCommands = false;
   bool compactVertices = false;
   bool indexedVertices = false;
+  bool postCommands = false;
 };
 
 class MenuBackend final : public gpu::Backend {
@@ -43,6 +45,7 @@ public:
     uint64_t shaderTranslations = 0;
     uint32_t shaderCacheBytes = 0;
     uint32_t shaderCacheEntries = 0;
+    uint32_t uploadCacheEntries = 0;
   };
   SnapshotData Snapshot() const;
   bool Init(uint32_t width, uint32_t height) override;

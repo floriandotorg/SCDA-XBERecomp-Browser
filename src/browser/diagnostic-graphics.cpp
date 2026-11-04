@@ -5,6 +5,7 @@
 #include "image_symbols.h"
 #include <algorithm>
 #include <bit>
+#include <sstream>
 
 #define DG_CAT_(left, right) left##right
 #define DG_CAT(left, right) DG_CAT_(left, right)
@@ -515,6 +516,7 @@ void DiagnosticGraphics::ApplyCommands(const X86Context& ctx) {
   decodedWords_ = capturedWords_;
 }
 void DiagnosticGraphics::CaptureState(const X86Context& ctx, bool forceViewport) {
+  auto lease = memory_->Borrow();
   const auto surface = [&](uint32_t offset) {
     gpu::Surface result;
     memory_->Read(ctx, device + offset, &result.header, 4);
@@ -874,7 +876,19 @@ void DiagnosticGraphics::CreateDevice(X86Context& ctx, uint8_t* base) {
     : frame[4] == 0x40 && pp[0] && pp[0] <= 2048 && pp[1] && pp[1] <= 2048 && pp[2] == 18 && pp[3] == 1 &&
       !pp[4] && !pp[5] && !pp[6] && !pp[7] && !pp[8] && !pp[9] && !pp[10] && !pp[11] && !pp[12];
   if (frame[1] != 0 || frame[2] != 1 || frame[3] != 0 || !frame[6] || !presentation) {
-    throw Fault(ctx, frame[5], sizeof(pp), "diagnostic graphics unsupported CreateDevice presentation contract");
+    std::ostringstream diagnostic;
+    diagnostic << "diagnostic graphics unsupported CreateDevice presentation contract callers=" << std::hex;
+    uint32_t cursor = ctx.ebp;
+    for (uint32_t n = 0; cursor && n < 12; ++n) {
+      try {
+        std::array<uint32_t, 2> caller{};
+        memory_->Read(ctx, cursor, caller.data(), sizeof(caller));
+        diagnostic << caller[1] << ',';
+        if (caller[0] <= cursor || caller[0] - cursor > 0x10000) { break; }
+        cursor = caller[0];
+      } catch (const Fault&) { break; }
+    }
+    throw Fault(ctx, frame[5], sizeof(pp), diagnostic.str().c_str());
   }
   const auto overlaps = [](uint32_t left, uint32_t leftBytes, uint32_t right, uint32_t rightBytes) {
     return uint64_t(left) < uint64_t(right) + rightBytes && uint64_t(right) < uint64_t(left) + leftBytes;

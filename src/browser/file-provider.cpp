@@ -19,6 +19,7 @@ class FileProvider {
   std::mutex readStagingMutex_;
   std::vector<uint8_t> readStaging_;
   uint32_t maximumReadBytes_;
+  uint32_t maximumHandles_;
   std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic_;
   std::function<void(FileOperationDiagnostic)> operationDiagnostic_;
   std::array<uint32_t, 2> operationReports_{};
@@ -142,13 +143,16 @@ public:
 
   FileProvider(Runtime& runtime, PreparedImage& image, std::shared_ptr<const kernel::DiscIndex> disc,
       std::shared_ptr<TemporaryFilesystem> temporary, std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic, std::shared_ptr<RawCache> cache,
-      std::function<void(FileOperationDiagnostic)> operationDiagnostic, uint32_t maximumReadBytes)
+      std::function<void(FileOperationDiagnostic)> operationDiagnostic, uint32_t maximumReadBytes, uint32_t maximumHandles)
     : runtime_(runtime), image_(image), disc_(std::move(disc)),
       temporary_(temporary ? std::move(temporary) : std::make_shared<TemporaryFilesystem>()),
-      rawCache_(cache ? std::move(cache) : std::make_shared<RawCache>()), maximumReadBytes_(maximumReadBytes),
+      rawCache_(cache ? std::move(cache) : std::make_shared<RawCache>()), maximumReadBytes_(maximumReadBytes), maximumHandles_(maximumHandles),
       fileOpenDiagnostic_(std::move(fileOpenDiagnostic)), operationDiagnostic_(std::move(operationDiagnostic)) {
-    if (maximumReadBytes < (1u << 20) || maximumReadBytes > (8u << 20) || (maximumReadBytes & (maximumReadBytes - 1))) {
-      throw Fault({}, 202, maximumReadBytes, "file read budget must be a power of two between one and eight MiB");
+    if (maximumReadBytes < (1u << 20) || maximumReadBytes > (32u << 20) || (maximumReadBytes & (maximumReadBytes - 1))) {
+      throw Fault({}, 202, maximumReadBytes, "file read budget must be a power of two between one and thirty-two MiB");
+    }
+    if (maximumHandles != 64 && maximumHandles != 256) {
+      throw Fault({}, 202, maximumHandles, "file handle budget must select the default or story profile");
     }
   }
 
@@ -214,17 +218,21 @@ public:
     bool directory = false;
     bool createEntry = false;
     bool overwriteEntry = false;
-    const bool overwrite = create && disposition == 5 && (options == 0x60 || options == 0x64) && access == 0x40100080;
+    const bool streamingWrite = create && disposition == 5 && options == 0x48 && access == 0x40100080 && frame[6] == 0;
+    const bool overwrite = create && disposition == 5 && (options == 0x60 || options == 0x64 || streamingWrite) && access == 0x40100080;
     const bool noReadCache = create && disposition == 1 && options == 0x6c && access == 0x80100080 && frame[6] == 0x80;
     const bool readMetadata = create && disposition == 3 && options == 0x60 && access == 0x80100080 && frame[6] == 4;
     const bool writableOpenIf = create && disposition == 3 && options == 0x60 &&
       (access == 0x40100080 || access == 0xc0100080) && frame[6] == 0x80;
     const bool deleteOpen = create && disposition == 1 && (options == 0x60 || options == 0x64) && access == 0x110080;
-    if (!status && create && ((allocation && (options != 0x22 || (disposition != 2 && disposition != 3))) || (frame[6] & ~0x94u) || disposition < 1 || (disposition > 3 && !overwrite))) { status = 0xc00000bb; }
-    if (!status && create && !overwrite && !noReadCache && !readMetadata && !writableOpenIf && !deleteOpen && !(options & 1) && options != 0x22 &&
+    const bool readonlyOpen = create && disposition == 1 && (options == 0x60 || options == 0x64) && access == 0x80100080 && frame[6] == 1;
+    const bool streamingRead = create && disposition == 1 && options == 0x48 && access == 0x80100080 && frame[6] == 0;
+    if (!status && create && ((allocation && (options != 0x22 || (disposition != 2 && disposition != 3))) ||
+        (!readonlyOpen && (frame[6] & ~0x94u)) || disposition < 1 || (disposition > 3 && !overwrite))) { status = 0xc00000bb; }
+    if (!status && create && !overwrite && !noReadCache && !readMetadata && !writableOpenIf && !deleteOpen && !streamingRead && !(options & 1) && options != 0x22 &&
         (disposition != 1 || (options != 0x60 && options != 0x64) || !(access & 0x80000001u) || (access & ~0x80120089u))) { status = 0xc00000bb; }
     if (!status && create && !(options & 1) && (frame[6] & 0x10)) { status = 0xc000000d; }
-    const uint32_t allowedOptions = (create ? 0x804067u : 0x804079u) | (noReadCache ? 8u : 0u);
+    const uint32_t allowedOptions = (create ? 0x804067u : 0x804079u) | (noReadCache || streamingRead || streamingWrite ? 8u : 0u);
     if (!status && (object[2] & ~0x40u || share & ~7u || options & ~allowedOptions ||
         (options & 0x41) == 0x41 || (options & 0x30) == 0x30)) { status = 0xc00000bb; }
     if (!status) {
@@ -253,7 +261,7 @@ public:
       }
     }
     auto storage = cache ? rawCache_->Partition(RawCache::FirstPartition)->Filesystem() : temporary_;
-    if (!status && !raw && (options & 0x18) && (!noReadCache || temporary)) { status = 0xc00000bb; }
+    if (!status && !raw && (options & 0x18) && !streamingRead && !streamingWrite && (!noReadCache || temporary)) { status = 0xc00000bb; }
     if (!status && !raw && (options & 1) && path.size() > 1 && path.back() == '\\' && path[path.size() - 2] != '\\') {
       path.pop_back();
     }
@@ -303,7 +311,7 @@ public:
       }
       if (!status && directory && (options & 0x40)) { status = 0xc00000ba; }
       if (!status && !directory && (options & 1)) { status = 0xc0000103; }
-      if (!status && (files_.size() + links_.size() >= 64 || nextHandle_ > 0x71fffffc)) { status = 0xc000009a; }
+      if (!status && (files_.size() + links_.size() >= maximumHandles_ || nextHandle_ > 0x71fffffc)) { status = 0xc000009a; }
     }
     const bool reads = (access & 0x80000001u) != 0;
     const bool writes = (access & 0x40000006u) != 0;
@@ -367,7 +375,7 @@ public:
     std::lock_guard lock(lock_);
     const auto alias = aliases_.find(name.size() == 6 ? name.substr(4) : "");
     if (!status && alias == aliases_.end()) { status = 0xc0000034; }
-    if (!status && (files_.size() + links_.size() >= 64 || nextHandle_ > 0x71fffffc)) { status = 0xc000009a; }
+    if (!status && (files_.size() + links_.size() >= maximumHandles_ || nextHandle_ > 0x71fffffc)) { status = 0xc000009a; }
     runtime_.Checkpoint(ctx);
     if (!status) {
       const uint32_t handle = nextHandle_;
@@ -491,8 +499,9 @@ public:
     else if (length < required) { status = 0xc0000023; }
     std::array<uint32_t, 8> result{};
     if (!status && !filesystem) {
-      if (frame[6] == 0x70000) { result = {uint32_t(CacheFatx::Capacity / (512 * 32)), 0, 12, 1, 32, CacheFatx::SectorSize, 0, 0}; }
-      else { result = {0, 0, uint32_t(CacheFatx::Capacity), 0, 0, RawCache::FirstPartition, 0, 0}; }
+      const uint64_t capacity = rawCache_->Partition(RawCache::FirstPartition)->CapacityBytes();
+      if (frame[6] == 0x70000) { result = {uint32_t(capacity / (512 * 32)), 0, 12, 1, 32, CacheFatx::SectorSize, 0, 0}; }
+      else { result = {0, 0, uint32_t(capacity), 0, 0, RawCache::FirstPartition, 0, 0}; }
     }
     runtime_.Checkpoint(ctx);
     if (!status && filesystem) { status = rawCache_->Partition(RawCache::FirstPartition)->Dismount(); }
@@ -511,6 +520,8 @@ public:
     std::string path;
     uint64_t explicitOffset = 0;
     uint32_t status = 0;
+    bool synchronous = true;
+    std::function<void()> complete;
     const auto overlaps = [](uint32_t first, uint32_t size, uint32_t second, uint32_t count) {
       return size && count && uint64_t(first) < uint64_t(second) + count && uint64_t(second) < uint64_t(first) + size;
     };
@@ -544,9 +555,22 @@ public:
       if (file == files_.end()) { status = 0xc0000008; }
       else if (file->second.directory) { status = 0xc00000ba; }
       else if (!file->second.reads) { status = 0xc0000022; }
-      else if (!file->second.synchronous || file->second.alertable || frame[2] || frame[3] || frame[4]) { status = 0xc00000bb; }
+      else if (file->second.alertable || frame[3] ||
+          (file->second.synchronous ? bool(frame[2] || frame[4]) : !frame[8])) { status = 0xc00000bb; }
       else if (frame[7] > maximumReadBytes_ || (frame[8] && (explicitOffset >> 63) && explicitOffset != UINT64_MAX - 1)) { status = 0xc000000d; }
-      else { selected = file->second.disc; path = file->second.path; }
+      else {
+        synchronous = file->second.synchronous;
+        if (!synchronous && explicitOffset >> 63) { status = 0xc000000d; }
+        if (!status && frame[2]) {
+          if (!image_.beginFileIo) { status = 0xc00000bb; }
+          else {
+            auto event = image_.beginFileIo(frame[2] & ~1u);
+            status = event.status;
+            complete = std::move(event.complete);
+          }
+        }
+        if (!status) { selected = file->second.disc; path = file->second.path; }
+      }
       if (status) {
         runtime_.Checkpoint(ctx);
         ReportOperationLocked(frame[1], 219, 0, status, frame[7]);
@@ -574,7 +598,7 @@ public:
       discReads_.lastBytes = count;
     }
     std::lock_guard stagingLock(readStagingMutex_);
-    if (count && readStaging_.capacity() < maximumReadBytes_) { std::vector<uint8_t>(maximumReadBytes_).swap(readStaging_); }
+    if (readStaging_.capacity() < count) { std::vector<uint8_t>(count).swap(readStaging_); }
     readStaging_.resize(count);
     auto& bytes = readStaging_;
     uint32_t failedOffset = 0, failedBytes = count;
@@ -603,30 +627,35 @@ public:
       const std::string reason = "ISO read failed: " + path + " offset=" + std::to_string(offset + failedOffset) + " bytes=" + std::to_string(failedBytes);
       throw Fault(ctx, frame[6], count, reason.c_str());
     }
-    auto transition = memory.Mutate();
-    RequireOwner(ctx, base);
-    runtime_.Checkpoint(ctx);
-    validate();
-    std::lock_guard lock(lock_);
-    const auto file = files_.find(frame[1]);
-    if (file == files_.end() || file->second.disc != selected) { status = 0xc0000008; }
-    runtime_.Checkpoint(ctx);
-    if (!status && count) {
-      memory.Write(ctx, frame[6], bytes.data(), count);
-      selected->position = offset + count;
-      file->second.position = selected->position;
-      if (file->second.path.ends_with(".XBE")) {
-        discReads_.executableBytes += count;
-        ++discReads_.executableOperations;
-      } else {
-        discReads_.assetBytes += count;
-        ++discReads_.assetOperations;
+    {
+      auto transition = memory.Mutate();
+      RequireOwner(ctx, base);
+      runtime_.Checkpoint(ctx);
+      validate();
+      std::lock_guard lock(lock_);
+      const auto file = files_.find(frame[1]);
+      if (file == files_.end() || file->second.disc != selected) { status = 0xc0000008; }
+      runtime_.Checkpoint(ctx);
+      if (!status && count) {
+        memory.Write(ctx, frame[6], bytes.data(), count);
+        if (synchronous) {
+          selected->position = offset + count;
+          file->second.position = selected->position;
+        }
+        if (file->second.path.ends_with(".XBE")) {
+          discReads_.executableBytes += count;
+          ++discReads_.executableOperations;
+        } else {
+          discReads_.assetBytes += count;
+          ++discReads_.assetOperations;
+        }
       }
+      const std::array<uint32_t, 2> result = {status, status ? 0u : count};
+      memory.Write(ctx, frame[5], result.data(), sizeof(result));
+      ctx.eax = status;
+      ctx.esp += sizeof(frame);
     }
-    const std::array<uint32_t, 2> result = {status, status ? 0u : count};
-    memory.Write(ctx, frame[5], result.data(), sizeof(result));
-    ctx.eax = status;
-    ctx.esp += sizeof(frame);
+    if (complete) { complete(); }
     return true;
   }
 
@@ -754,66 +783,89 @@ public:
     if (read && DiscTransfer(ctx, base)) { return; }
     RequireOwner(ctx, base);
     auto& memory = *image_.memory;
-    auto transition = memory.Mutate();
-    runtime_.Checkpoint(ctx);
-    std::array<uint32_t, 9> frame;
-    if (uint64_t(ctx.esp) + sizeof(frame) > UINT32_MAX) { throw Fault(ctx, ctx.esp, sizeof(frame), "write frame overflow"); }
-    memory.Read(ctx, ctx.esp, frame.data(), sizeof(frame));
-    const uint32_t statusOutput = frame[5], input = frame[6], length = frame[7];
-    const auto overlaps = [](uint32_t first, uint32_t size, uint32_t second, uint32_t count) {
-      return uint64_t(first) < uint64_t(second) + count && uint64_t(second) < uint64_t(first) + size;
-    };
-    if (!statusOutput || (statusOutput & 3) || (!input && length) ||
-        overlaps(statusOutput, 8, ctx.esp, sizeof(frame)) || overlaps(input, length, statusOutput, 8) ||
-        overlaps(input, length, ctx.esp, sizeof(frame))) { throw Fault(ctx, input, length, "invalid write spans"); }
-    memory.CheckRange(ctx, statusOutput, 8);
-    std::lock_guard lock(lock_);
-    uint32_t status = 0;
-    const auto file = files_.find(frame[1]);
-    uint64_t offset = 0;
-    if (file == files_.end()) { status = 0xc0000008; }
-    else if (file->second.raw) {
-      if (!file->second.synchronous || frame[2] || frame[3] || frame[4] || !frame[8]) { status = 0xc00000bb; }
-      else if ((read && !file->second.reads) || (!read && !file->second.writeData)) { status = 0xc0000022; }
-      else if (file->second.cache && read) { status = 0xc00000bb; }
-      else {
-        if (overlaps(frame[8], 8, statusOutput, 8) || overlaps(frame[8], 8, input, length) ||
-            overlaps(frame[8], 8, ctx.esp, sizeof(frame))) { throw Fault(ctx, frame[8], 8, "invalid raw offset span"); }
-        memory.Read(ctx, frame[8], &offset, sizeof(offset));
-        if (file->second.cache) {
-          if (!length || length > CacheFatx::MaximumTransfer || offset % CacheFatx::SectorSize ||
-              length % CacheFatx::SectorSize || offset > CacheFatx::Capacity || length > CacheFatx::Capacity - offset) { status = 0xc000000d; }
-        } else if (offset != RawCache::MetadataOffset || length != RawCache::SectorSize) { status = 0xc000000d; }
+    std::function<void()> complete;
+    {
+      auto transition = memory.Mutate();
+      runtime_.Checkpoint(ctx);
+      std::array<uint32_t, 9> frame;
+      if (uint64_t(ctx.esp) + sizeof(frame) > UINT32_MAX) { throw Fault(ctx, ctx.esp, sizeof(frame), "write frame overflow"); }
+      memory.Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+      const uint32_t statusOutput = frame[5], input = frame[6], length = frame[7];
+      const auto overlaps = [](uint32_t first, uint32_t size, uint32_t second, uint32_t count) {
+        return uint64_t(first) < uint64_t(second) + count && uint64_t(second) < uint64_t(first) + size;
+      };
+      if (!statusOutput || (statusOutput & 3) || (!input && length) ||
+          overlaps(statusOutput, 8, ctx.esp, sizeof(frame)) || overlaps(input, length, statusOutput, 8) ||
+          overlaps(input, length, ctx.esp, sizeof(frame))) { throw Fault(ctx, input, length, "invalid write spans"); }
+      memory.CheckRange(ctx, statusOutput, 8);
+      std::lock_guard lock(lock_);
+      uint32_t status = 0;
+      const auto file = files_.find(frame[1]);
+      uint64_t offset = 0;
+      if (file == files_.end()) { status = 0xc0000008; }
+      else if (file->second.raw) {
+        if (!file->second.synchronous || frame[2] || frame[3] || frame[4] || !frame[8]) { status = 0xc00000bb; }
+        else if ((read && !file->second.reads) || (!read && !file->second.writeData)) { status = 0xc0000022; }
+        else if (file->second.cache && read) { status = 0xc00000bb; }
+        else {
+          if (overlaps(frame[8], 8, statusOutput, 8) || overlaps(frame[8], 8, input, length) ||
+              overlaps(frame[8], 8, ctx.esp, sizeof(frame))) { throw Fault(ctx, frame[8], 8, "invalid raw offset span"); }
+          memory.Read(ctx, frame[8], &offset, sizeof(offset));
+          if (file->second.cache) {
+            if (!length || length > CacheFatx::MaximumTransfer || offset % CacheFatx::SectorSize ||
+              length % CacheFatx::SectorSize || offset > rawCache_->Partition(RawCache::FirstPartition)->CapacityBytes() ||
+              length > rawCache_->Partition(RawCache::FirstPartition)->CapacityBytes() - offset) { status = 0xc000000d; }
+          } else if (offset != RawCache::MetadataOffset || length != RawCache::SectorSize) { status = 0xc000000d; }
+        }
       }
+      else if (!file->second.temporary) { status = 0xc0000022; }
+      else if (file->second.directory) { status = 0xc00000ba; }
+      else if (read ? !file->second.reads : !file->second.writeData) { status = 0xc0000022; }
+      else if (frame[3] || (file->second.synchronous ? bool(frame[2] || frame[4] || frame[8]) : !frame[8])) { status = 0xc00000bb; }
+      else if (read && length > maximumReadBytes_) { status = 0xc00000bb; }
+      else if (!read && length > Storage(file->second)->Usage().capacity) { status = 0xc000007f; }
+      if (!status && !file->second.raw) {
+        if (length) { memory.CheckRange(ctx, input, length); }
+        offset = file->second.position;
+        if (!file->second.synchronous) {
+          if (overlaps(frame[8], 8, statusOutput, 8) || overlaps(frame[8], 8, input, length) ||
+              overlaps(frame[8], 8, ctx.esp, sizeof(frame))) { throw Fault(ctx, frame[8], 8, "invalid asynchronous offset span"); }
+          memory.Read(ctx, frame[8], &offset, sizeof(offset));
+          if (offset >> 63) { status = 0xc000000d; }
+          if (!status && frame[2]) {
+            if (!image_.beginFileIo) { status = 0xc00000bb; }
+            else {
+              auto event = image_.beginFileIo(frame[2] & ~1u);
+              status = event.status;
+              complete = std::move(event.complete);
+            }
+          }
+        }
+      }
+      std::vector<uint8_t> bytes;
+      if (!status) {
+        if (length) { memory.CheckRange(ctx, input, length); }
+        bytes.resize(length);
+        if (!read && length) { memory.Read(ctx, input, bytes.data(), length); }
+      }
+      runtime_.Checkpoint(ctx);
+      if (!status && file->second.raw && file->second.cache) { status = rawCache_->Partition(RawCache::FirstPartition)->WriteRaw(offset, bytes); }
+      else if (!status && file->second.raw) { status = read ? rawCache_->Read(offset, bytes) : rawCache_->Write(offset, bytes); }
+      else if (!status && read) {
+        bytes.resize(Storage(file->second)->Read(file->second.path, offset, bytes));
+        if (length && bytes.empty()) { status = 0xc0000011; }
+      }
+      else if (!status) { status = Storage(file->second)->Write(file->second.path, offset, bytes); }
+      const uint32_t count = uint32_t(bytes.size());
+      if (!status && read && count) { memory.Write(ctx, input, bytes.data(), count); }
+      if (!status && file->second.synchronous) { file->second.position = offset + count; }
+      ReportOperationLocked(frame[1], read ? 219 : 236, 0, status, length);
+      const std::array<uint32_t, 2> result = {status, status ? 0u : count};
+      memory.Write(ctx, statusOutput, result.data(), sizeof(result));
+      ctx.eax = status;
+      ctx.esp += sizeof(frame);
     }
-    else if (!file->second.temporary) { status = 0xc0000022; }
-    else if (file->second.directory) { status = 0xc00000ba; }
-    else if (read ? !file->second.reads : !file->second.writeData) { status = 0xc0000022; }
-    else if (!file->second.synchronous || frame[2] || frame[3] || frame[4] || frame[8]) { status = 0xc00000bb; }
-    else if (read && length > maximumReadBytes_) { status = 0xc00000bb; }
-    else if (!read && length > Storage(file->second)->Usage().capacity) { status = 0xc000007f; }
-    std::vector<uint8_t> bytes;
-    if (!status) {
-      if (length) { memory.CheckRange(ctx, input, length); }
-      bytes.resize(length);
-      if (!read && length) { memory.Read(ctx, input, bytes.data(), length); }
-    }
-    runtime_.Checkpoint(ctx);
-    if (!status && file->second.raw && file->second.cache) { status = rawCache_->Partition(RawCache::FirstPartition)->WriteRaw(offset, bytes); }
-    else if (!status && file->second.raw) { status = read ? rawCache_->Read(offset, bytes) : rawCache_->Write(offset, bytes); }
-    else if (!status && read) {
-      bytes.resize(Storage(file->second)->Read(file->second.path, file->second.position, bytes));
-      if (length && bytes.empty()) { status = 0xc0000011; }
-    }
-    else if (!status) { status = Storage(file->second)->Write(file->second.path, file->second.position, bytes); }
-    const uint32_t count = uint32_t(bytes.size());
-    if (!status && read && count) { memory.Write(ctx, input, bytes.data(), count); }
-    if (!status) { file->second.position = file->second.raw ? offset + count : file->second.position + count; }
-    ReportOperationLocked(frame[1], read ? 219 : 236, 0, status, length);
-    const std::array<uint32_t, 2> result = {status, status ? 0u : count};
-    memory.Write(ctx, statusOutput, result.data(), sizeof(result));
-    ctx.eax = status;
-    ctx.esp += sizeof(frame);
+    if (complete) { complete(); }
   }
 
   void SetInformation(X86Context& ctx, uint8_t* base) {
@@ -930,7 +982,7 @@ public:
       else if (frame[5] != 14 || file->second.raw) { status = 0xc00000bb; }
       else if (frame[4] != 8) { status = 0xc0000004; }
       else if (file->second.directory) { status = 0xc00000ba; }
-      else if (!file->second.synchronous || file->second.alertable) { status = 0xc00000bb; }
+      else if (file->second.alertable || (!file->second.synchronous && !file->second.reads && !file->second.writeData)) { status = 0xc00000bb; }
       else {
         memory.Read(ctx, frame[3], &position, sizeof(position));
         if (position >> 63) { status = 0xc000000d; }
@@ -1065,13 +1117,13 @@ std::function<bool(uint32_t)> InstallFileProvider(Runtime& runtime, PreparedImag
     std::shared_ptr<const kernel::DiscIndex> disc, std::shared_ptr<TemporaryFilesystem> temporary, std::vector<KernelDataExport>* dataExports,
     std::function<DiscReadSnapshot()>* discReads, std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic,
     std::function<bool(uint32_t)>* ownsHandle, std::shared_ptr<RawCache> cache,
-    std::function<void(FileOperationDiagnostic)> operationDiagnostic, uint32_t maximumReadBytes) {
+    std::function<void(FileOperationDiagnostic)> operationDiagnostic, uint32_t maximumReadBytes, uint32_t maximumHandles) {
   runtime.Checkpoint({});
   if (!image.memory || image.importsBound || runtime.ActiveWorkers() || !image.diagnosticImports.empty() || image.boundRuntime || image.diagnosticRuntime || runtime.KernelTarget(202) ||
       (dataExports && std::any_of(dataExports->begin(), dataExports->end(), [](const auto& entry) { return entry.ordinal == 40 || entry.ordinal == 326; }))) {
     throw Fault({}, 202, 0, "file provider requires an unpublished stopped image");
   }
-  auto provider = std::make_shared<FileProvider>(runtime, image, std::move(disc), std::move(temporary), std::move(fileOpenDiagnostic), std::move(cache), std::move(operationDiagnostic), maximumReadBytes);
+  auto provider = std::make_shared<FileProvider>(runtime, image, std::move(disc), std::move(temporary), std::move(fileOpenDiagnostic), std::move(cache), std::move(operationDiagnostic), maximumReadBytes, maximumHandles);
   if (dataExports) { provider->InstallData(*dataExports); }
   runtime.RegisterKernel(67, [provider](X86Context& ctx, uint8_t* base) { provider->CreateAlias(ctx, base); });
   runtime.RegisterKernel(69, [provider](X86Context& ctx, uint8_t* base) { provider->DeleteAlias(ctx, base); });

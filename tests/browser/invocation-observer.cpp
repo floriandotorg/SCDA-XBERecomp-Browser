@@ -87,5 +87,24 @@ int main() {
   }
   borrowed.Cancel();
   rejected([&] { borrowed.InstallInvocationObserver(memory, callback); });
+  browser::Memory filteredMemory;
+  filteredMemory.Ensure(0x10000, 4096);
+  browser::Runtime filtered(mappings, continuations, [] { return uint64_t(0); });
+  uint32_t filteredObservations = 0;
+  filtered.InstallInvocationObserver(filteredMemory, [&](const X86Context&, uint8_t*, uint32_t, uint64_t) { ++filteredObservations; }, {0x5555});
+  filtered.PublishImageMemory(filteredMemory, filtered.KernelRevision(), [] {});
+  X86Context call{};
+  call.host = &filtered;
+  call.esp = 0x10800;
+  filtered.Launch(call, filteredMemory.Base(), [&](X86Context& ctx, uint8_t* base) {
+    const auto returnTo = [&](uint32_t address) { filteredMemory.Write(ctx, ctx.esp, &address, 4); };
+    returnTo(0x4444);
+    filtered.Invoke(ctx, base, 0x1000);
+    check(filteredObservations == 0 && ctx.eax == 7, "filtered observer saw an unrelated return address");
+    returnTo(0x5555);
+    filtered.Invoke(ctx, base, 0x1000);
+    check(filteredObservations == 1 && ctx.eax == 14, "filtered observer missed its return address");
+  });
+  check(!filtered.Join(), "filtered observer changed worker completion");
   std::puts("invocation-observer-ok");
 }

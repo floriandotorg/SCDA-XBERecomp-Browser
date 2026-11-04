@@ -28,6 +28,8 @@ class TimerQueue {
   uint64_t order_ = 0;
   bool expiryInstalled_ = false;
   bool tickInstalled_ = false;
+  std::optional<uint32_t> tickWritten_;
+  std::optional<uint64_t> observed_;
   std::function<void(const X86Context&, uint64_t)> clockObserver_;
   void RequireWorker(const X86Context& context) const;
   bool ArmLocked(const X86Context& context, uint32_t timer, int64_t dueTime, uint32_t dpc, bool publish);

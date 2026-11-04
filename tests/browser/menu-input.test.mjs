@@ -348,3 +348,25 @@ test('Escape unlocks capture without also pressing the game Back button', async 
   assert.equal(words[0], 1024);
   input.dispose();
 });
+
+test('mission keyboard reaches OPSAT, stick clicks and vision directions without reserved shortcuts', async () => {
+  const { input, words, key, focusTarget, MENU_INPUT } = await fixture();
+  const actions = [
+    ['Tab', 'select', 131072], ['KeyF', 'leftThumb', 262144], ['Digit1', 'rightThumb', 524288],
+    ['Digit2', 'left', 4], ['Digit3', 'right', 8], ['Digit4', 'up', 1], ['Digit5', 'down', 2],
+    ['KeyC', 'back', 1024], ['ShiftLeft', 'y', 4096], ['ShiftRight', 'y', 4096],
+  ];
+  for (const [code, name, mask] of actions) {
+    assert.equal(MENU_INPUT[name], mask);
+    assert.equal(key('keydown', code).defaultPrevented, true);
+    assert.equal(words[0], mask);
+    key('keyup', code);
+    assert.equal(words[0], 0);
+  }
+  key('keydown', 'Tab');
+  key('keydown', 'KeyF');
+  key('keydown', 'Digit1');
+  focusTarget.dispatchEvent(new Event('blur'));
+  assert.equal(words[0], 0);
+  input.dispose();
+});

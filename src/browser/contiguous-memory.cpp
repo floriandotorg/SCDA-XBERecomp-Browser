@@ -114,7 +114,7 @@ public:
       const uint32_t low = ordinal == 166 ? frame[2] : 0;
       const uint32_t high = ordinal == 166 ? frame[3] : UINT32_MAX;
       const uint32_t alignment = ordinal == 166 ? frame[4] : 0;
-      if (ordinal == 166 && frame[5] != 4 && frame[5] != 0x404) {
+      if (ordinal == 166 && frame[5] != 4 && frame[5] != 0x204 && frame[5] != 0x404) {
         throw Fault(ctx, frame[5], 0, "unsupported contiguous allocation protection");
       }
       ctx.eax = Allocate(ctx, memory, frame[1], low, high, alignment);

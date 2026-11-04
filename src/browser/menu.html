@@ -23,8 +23,10 @@
     <input id="iso" type="file" accept=".iso,application/x-iso9660-image" aria-describedby="selected privacy">
     <p id="selected">No ISO selected.</p>
     <p id="privacy">Your ISO stays on this device and is read only. Stop keeps the selection for another attempt.</p>
-    <p>Storage is temporary: a 64 MiB virtual cache (including filesystem metadata), a separate 32 MiB profile/save volume, and at most 256 entries per volume. These are virtual limits, not physical console geometry. The shared Wasm heap is capped at 256 MiB, so all quotas may not fit simultaneously. Stop, restart and refresh discard writes. Durable saves are not available.</p>
+    <p>Storage is temporary and bounded. Stop or refresh discards cache, profile and save writes. Mission reloads keep session data. Durable saves are not available.</p>
     <div role="group" aria-label="Host controls">
+      <label><input id="development-start" type="checkbox"> Development: start Iceland without the title and profile menus</label>
+      <p>Development start bypasses the front end for debugging. Level loading still runs. Use a normal start to verify the complete game flow.</p>
       <button id="boot" type="button" disabled>Start</button>
       <button id="stop" type="button" disabled>Stop</button>
     </div>
@@ -35,10 +37,14 @@
       <input id="sensitivity" type="range" min="0.05" max="10" step="0.05" value="1">
       <p id="capture-status" role="status">Start a mission session to enable mouse capture.</p>
     </div>
+    <div role="group" aria-label="Audio controls">
+      <button id="enable-audio" type="button" disabled>Enable audio</button>
+      <p id="audio-status" role="status">Start a mission session to enable audio.</p>
+    </div>
     <p id="status" role="status" aria-live="polite" aria-atomic="true">Select an ISO to begin.</p>
     <p id="loading" role="status" aria-live="polite"></p>
     <p id="detail" role="alert" aria-atomic="true"></p>
-    <p id="keys">Game keys: WASD moves and arrows navigate. Enter starts or pauses, Space or Z confirms. Capture mouse to look around; Escape unlocks it. When unlocked, Escape or Backspace returns. X and Y press those controller buttons; Q/E press Black/White and [/] press the left/right triggers. Focus the canvas to play. Switching windows or focusing host controls releases held buttons.</p>
+    <p id="keys">Game keys: WASD moves and arrows navigate. Enter starts or pauses, Space or Z confirms. Capture mouse to look around; Escape unlocks it. When unlocked, Escape or Backspace returns. C crouches, Shift jumps, F presses the left stick (back to wall), 1 presses the right stick (EEV/scope), and Tab opens OPSAT. 2/3/4/5 press left/right/up/down for vision and gadget views. X and Y press those controller buttons; Q/E press Black/White and [/] press the left/right triggers. Standard gamepads also work, including both analog sticks and triggers. Focus the canvas to play. Switching windows or focusing host controls releases held buttons.</p>
     <canvas id="game" width="640" height="480" tabindex="0" aria-label="Original game output" aria-describedby="keys"></canvas>
     <details>
       <summary>WebGPU diagnostics</summary>

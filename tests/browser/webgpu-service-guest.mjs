@@ -38,7 +38,7 @@ globalThis.onmessage = async event => {
     execute(Opcode.Configure, 0, words(4, 4));
     execute(Opcode.CreateTexture, 1, join(words(2, 2, 0, 1), new Uint8Array(texels.flat())));
     const pipeline = (compare = 8, write = 15, depthWrite = 1, stencil = [0, 0, 0, 0, 0, 0, 0], fragmentBytes = fragment.length, colorTarget = 1) =>
-      words(vertex.length, fragmentBytes, 4, 1, 1, 0, 2, 1, 1, 2, 1, 1, write, 1, depthWrite, compare, ...stencil, 0, colorTarget, 0, 0);
+      words(vertex.length, fragmentBytes, 4, 1, 1, 0, 2, 1, 1, 2, 1, 1, write, 1, depthWrite, compare, ...stencil, 0, colorTarget, 0, 0, 0);
     execute(Opcode.CreatePipeline, 3, join(pipeline(), vertex, fragment));
     execute(Opcode.CreatePipeline, 6, join(pipeline(4), vertex, fragment));
     execute(Opcode.CreatePipeline, 7, join(pipeline(8, 0, 0, [1, 8, 1, 1, 3, 255, 16]), vertex, fragment));
@@ -59,7 +59,7 @@ globalThis.onmessage = async event => {
       const vertices = new Float32Array(64 * 3);
       vertices.set([-1, -1, 0, 1, 0, 1, 0, 0], 0); vertices.set([3, -1, 0, 1, 2, 1, 0, 0], 64); vertices.set([-1, 3, 0, 1, 0, -1, 0, 0], 128);
       const sampling = words(...Array(4).fill([1, 1, 1, 1, 1, 0, 32]).flat());
-      const draw = (indices, pipeline = 3, reference = 0, image = 1) => join(words(pipeline, image, image, image, image, 4, 3, indices.length, indices.BYTES_PER_ELEMENT === 4 ? 1 : 0, vertices.byteLength, indices.byteLength, 16), floats(0, 0, width, 4, 0, 1), words(0, 0, width, 4), sampling, words(reference), vertices, indices, floats(1, 1, 1, 1));
+      const draw = (indices, pipeline = 3, reference = 0, image = 1, blend = [0, 0, 0, 0], addressW = [1, 1, 1, 1]) => join(words(pipeline, image, image, image, image, 4, 3, indices.length, indices.BYTES_PER_ELEMENT === 4 ? 1 : 0, vertices.byteLength, indices.byteLength, 16), floats(0, 0, width, 4, 0, 1), words(0, 0, width, 4), sampling, words(reference), floats(...blend), words(...addressW), vertices, indices, floats(1, 1, 1, 1));
       if (event.data.invalidBatch) {
         const invalid = draw(new Uint8Array());
         new Uint32Array(invalid.buffer, 0, 51)[20] = width + 1;
@@ -100,12 +100,32 @@ globalThis.onmessage = async event => {
       new Uint32Array(rightDraw.buffer)[20] = width / 2;
       execute(Opcode.DrawBatch, 0, join(words(2, 2, leftDraw.byteLength), leftDraw, words(2, rightDraw.byteLength), rightDraw));
       if (execute(Opcode.Readback, 2).some((value, n) => value !== pixels[n])) { throw new Error('batched draws lost owned packet state or render-pass ordering'); }
+      const clear = join(floats(0, 0, 0, 0, 1), words(0, 7, 4, 0));
+      const copy = words(2, width, 4, 0, 0, 0, 0, 0);
+      execute(15, 0, join(words(4), words(Opcode.Clear, 2, clear.byteLength), clear,
+        words(Opcode.Draw, 2, leftDraw.byteLength), leftDraw, words(Opcode.Copy, 5, copy.byteLength), copy,
+        words(Opcode.Draw, 2, rightDraw.byteLength), rightDraw));
+      if (execute(Opcode.Readback, 2).some((value, n) => value !== pixels[n])) { throw new Error('mixed render batch changed final draw pixels'); }
+      if (execute(Opcode.Readback, 5).some((value, n) => value !== (Math.floor(n / 4) % width < width / 2 ? pixels[n] : 0))) {
+        throw new Error('mixed render batch copied after a later draw or lost its clear');
+      }
+      const wholeDraw = draw(new Uint8Array());
+      const partialClear = join(floats(33 / 255, 66 / 255, 99 / 255, 128 / 255, 1), words(0, 1, 0, 1), words(0, 0, width / 2, 4));
+      const opaqueCopy = words(2, width, 4, 0, 0, 0, 0, 1);
+      execute(15, 0, join(words(4), words(Opcode.Draw, 2, wholeDraw.byteLength), wholeDraw,
+        words(Opcode.Clear, 2, partialClear.byteLength), partialClear, words(Opcode.Copy, 5, opaqueCopy.byteLength), opaqueCopy,
+        words(Opcode.Draw, 2, wholeDraw.byteLength), wholeDraw));
+      if (execute(Opcode.Readback, 2).some((value, n) => value !== pixels[n])) { throw new Error('mixed partial clear corrupted a later draw'); }
+      if (execute(Opcode.Readback, 5).some((value, n) => value !== (n % 4 === 3 ? 255 : Math.floor(n / 4) % width < width / 2 ? [33, 66, 99][n % 4] : pixels[n]))) {
+        throw new Error('mixed partial clear, copy or opaque alpha ordering changed pixels');
+      }
+      execute(Opcode.Copy, 5, copy);
       const compactPipeline = pipeline();
       compactPipeline[26] = 3;
       execute(Opcode.CreatePipeline, 17, join(compactPipeline, vertex, fragment));
       const compactVertices = new Float32Array(24);
       for (let n = 0; n < 3; ++n) { compactVertices.set(vertices.subarray(n * 64, n * 64 + 8), n * 8); }
-      const compactDraw = join(draw(new Uint8Array()).subarray(0, 204), compactVertices, new Uint16Array([0, 1, 2]), floats(1, 1, 1, 1));
+      const compactDraw = join(draw(new Uint8Array()).subarray(0, 236), compactVertices, new Uint16Array([0, 1, 2]), floats(1, 1, 1, 1));
       const compactWords = new Uint32Array(compactDraw.buffer, 0, 51);
       compactWords[0] = 17; compactWords[7] = 3; compactWords[9] = compactVertices.byteLength; compactWords[10] = 6;
       execute(Opcode.Clear, 2, join(floats(0, 0, 0, 0, 1), words(0, 7, 4, 0)));
@@ -133,14 +153,29 @@ globalThis.onmessage = async event => {
       execute(Opcode.DrawBatch, 0, join(words(141), ...samplerDraws));
       if (execute(Opcode.Readback, 2).some((value, n) => value !== pixels[n])) { throw new Error('sampler eviction or shared upload arenas corrupted final draw'); }
       execute(Opcode.Destroy, 17);
+      const depth16Values = [0, 1, 65535, 65534, 32768, 32767, 4660, 49374];
+      const packedDepth16 = Uint32Array.from({ length: width * 4 }, (_, n) => depth16Values[n % depth16Values.length] << 8);
+      execute(Opcode.UploadDepth, 4, join(words(width, 4, 16), words(1, 0, 0, 0, 0, 0, 0, 0), packedDepth16));
+      const depth16Readback = execute(Opcode.Readback, 4);
+      const depth16Words = new Uint32Array(depth16Readback.buffer, depth16Readback.byteOffset, depth16Readback.byteLength / 4);
+      if (depth16Words.length !== packedDepth16.length || depth16Words.some((value, n) => (value & 255) !== 0 || Math.round((value >>> 8) * 65535 / 16777215) !== depth16Values[n % depth16Values.length])) {
+        throw new Error('D16 depth readback changed imported values or stencil');
+      }
       const packedDepth = new Uint32Array(width * 4);
       const stencilMask = new Uint32Array(8);
+      const depthValues = [0, 1, 0xffffff, 0xfffffe, 0x800000, 0x7fffff, 0x123456, 0xc0ffee];
       for (let n = 0; n < packedDepth.length; ++n) {
         const stencil = ((n % 4) * 85 + Math.floor(n / width) * 17) & 255;
-        packedDepth[n] = (((n + Math.floor(n / width)) % 2 ? 0xc00000 : 0x400000) << 8) | stencil;
+        packedDepth[n] = (depthValues[(n + Math.floor(n / width)) % depthValues.length] << 8) | stencil;
         stencilMask[stencil >>> 5] |= 1 << (stencil & 31);
       }
       execute(Opcode.UploadDepth, 4, join(words(width, 4, 24), stencilMask, packedDepth));
+      const packedReadback = execute(Opcode.Readback, 4);
+      const expectedDepthBytes = new Uint8Array(packedDepth.buffer);
+      if (packedReadback.length !== expectedDepthBytes.length || packedReadback.some((value, n) => value !== expectedDepthBytes[n])) {
+        const mismatch = packedReadback.findIndex((value, n) => value !== expectedDepthBytes[n]);
+        throw new Error(`depth readback lost packed D24 depth or nonuniform stencil at ${mismatch}: ${packedReadback[mismatch]} instead of ${expectedDepthBytes[mismatch]}; words ${Array.from(new Uint32Array(packedReadback.buffer, packedReadback.byteOffset, packedReadback.byteLength / 4)).slice(0, 16)}`);
+      }
       const shadowFragment = encoder.encode('@group(0) @binding(1) var image: texture_depth_2d; @fragment fn fs_main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> { return vec4<f32>(select(0.0, 1.0, textureLoad(image, vec2<i32>(p.xy), 0) > 0.5)); }');
       const shadowPipeline = pipeline(8, 15, 0, undefined, shadowFragment.length);
       shadowPipeline[13] = 0;
@@ -149,7 +184,7 @@ globalThis.onmessage = async event => {
       const shadowDraw = draw(new Uint8Array(), 16, 0, 4);
       new Uint32Array(shadowDraw.buffer)[5] = 0;
       execute(Opcode.Draw, 2, shadowDraw);
-      if (execute(Opcode.Readback, 2).some((value, n) => value !== ((packedDepth[Math.floor(n / 4)] >>> 8) > 0x800000 ? 255 : 0))) { throw new Error('completed sampled depth target changed'); }
+      if (execute(Opcode.Readback, 2).some((value, n) => value !== ((packedDepth[Math.floor(n / 4)] >>> 8) > 0x7fffff ? 255 : 0))) { throw new Error('completed sampled depth target changed'); }
       execute(Opcode.Destroy, 16);
       execute(Opcode.Clear, 2, join(floats(0, 0, 0, 0, 0), words(0, 1, 0, 0)));
       const importedStencil = execute(Opcode.Readback, 4, words(1));
@@ -168,7 +203,7 @@ globalThis.onmessage = async event => {
       vertices[2] = vertices[66] = vertices[130] = 0.5;
       execute(Opcode.Draw, 2, draw(new Uint8Array(), 6));
       const depthPixels = execute(Opcode.Readback, 2);
-      if (depthPixels.some((value, n) => value !== ((Math.floor(n / 4) + Math.floor(n / (width * 4))) % 2 ? pixels[n] : 0))) {
+      if (depthPixels.some((value, n) => value !== ((packedDepth[Math.floor(n / 4)] >>> 8) > 0x7fffff ? pixels[n] : 0))) {
         throw new Error('nonuniform imported depth comparison changed: ' + JSON.stringify({ actual: [...depthPixels], original: [...pixels] }));
       }
       execute(Opcode.Clear, 2, join(floats(0, 0, 0, 0, 0), words(0, 1, 0, 0)));
@@ -196,6 +231,25 @@ globalThis.onmessage = async event => {
       execute(Opcode.Draw, 2, draw(new Uint8Array(), 11, 0, 10));
       if (execute(Opcode.Readback, 2).some((value, n) => value !== [255, 0, 0, 255][n % 4])) { throw new Error('disabled mip filtering did not clamp the biased sample'); }
       sampling[6] = 32;
+      const blendFragment = encoder.encode('@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.8, 0.4, 0.2, 0.5); }');
+      const blendPipeline = pipeline(8, 15, 0, undefined, blendFragment.length);
+      blendPipeline[5] = 1;
+      blendPipeline[6] = blendPipeline[9] = 12;
+      blendPipeline[7] = blendPipeline[10] = 13;
+      execute(Opcode.CreatePipeline, 18, join(blendPipeline, vertex, blendFragment));
+      execute(Opcode.Clear, 2, join(floats(0.2, 0.3, 0.4, 0.25, 1), words(0, 1, 0, 0)));
+      const blendLeft = draw(new Uint8Array(), 18, 0, 1, [0.25, 0.5, 0.75, 0.5]);
+      const blendRight = draw(new Uint8Array(), 18, 0, 1, [0.75, 0.25, 0.5, 0.25]);
+      new Uint32Array(blendLeft.buffer)[20] = width / 2;
+      new Uint32Array(blendRight.buffer)[18] = width / 2;
+      new Uint32Array(blendRight.buffer)[20] = width / 2;
+      execute(Opcode.DrawBatch, 0, join(words(2, 2, blendLeft.byteLength), blendLeft, words(2, blendRight.byteLength), blendRight));
+      const blended = execute(Opcode.Readback, 2);
+      if (blended.some((value, n) => {
+        const expected = Math.floor(n / 4) % width < width / 2 ? [0.35, 0.35, 0.25, 0.375] : [0.65, 0.325, 0.3, 0.3125];
+        return Math.abs(value - expected[n % 4] * 255) > 2;
+      })) { throw new Error('dynamic vision blend constant changed numeric pixels or leaked between batched draws'); }
+      execute(Opcode.Destroy, 18);
       const cubeColors = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255], [255, 0, 255, 255], [0, 255, 255, 255]];
       execute(Opcode.CreateTexture, 12, join(words(1, 1, 2, 1), new Uint8Array(cubeColors.flat())));
       const directions = ['1,0,0', '-1,0,0', '0,1,0', '0,-1,0', '0,0,1', '0,0,-1'];
@@ -209,6 +263,30 @@ globalThis.onmessage = async event => {
         execute(Opcode.Destroy, 13);
       }
       execute(Opcode.Destroy, 12);
+
+      const red = [255, 0, 0, 255], green = [0, 255, 0, 255], blue = [0, 0, 255, 255];
+      const volumePixels = new Uint8Array([...Array(4).fill(red).flat(), ...Array(4).fill(green).flat(), ...blue]);
+      execute(Opcode.CreateTexture, 12, join(words(2, 2, 3, 2, 2), volumePixels));
+      for (const [z, level, addressW, linear, expected] of [[0.25, 0, 1, false, red], [0.75, 0, 1, false, green],
+        [1.25, 0, 2, false, red], [1.25, 0, 1, false, green], [1.25, 0, 3, false, green], [0.5, 0, 1, true, [128, 128, 0, 255]], [0.25, 1, 1, false, blue]]) {
+        const volumeFragment = encoder.encode('@group(0) @binding(1) var image: texture_3d<f32>; @group(0) @binding(2) var sampling: sampler; @fragment fn fs_main() -> @location(0) vec4<f32> { return textureSampleLevel(image, sampling, vec3<f32>(0.5,0.5,' + z + '), ' + level + '.0); }');
+        const volumePipeline = pipeline(8, 15, 0, undefined, volumeFragment.length);
+        volumePipeline[27] = 15;
+        execute(Opcode.CreatePipeline, 13, join(volumePipeline, vertex, volumeFragment));
+        const volumeDraw = draw(new Uint8Array(), 13, 0, 12, [0, 0, 0, 0], Array(4).fill(addressW));
+        if (linear) {
+          const fields = new Uint32Array(volumeDraw.buffer);
+          for (let n = 0; n < 4; ++n) { fields[24 + n * 7] = fields[25 + n * 7] = 2; }
+        }
+        execute(Opcode.Draw, 2, volumeDraw);
+        if (execute(Opcode.Readback, 2).some((value, channel) => Math.abs(value - expected[channel % 4]) > 1)) {
+          throw new Error('volume slices, interpolation, mip levels or W addressing changed: ' + [z, level, addressW, linear]);
+        }
+        execute(Opcode.Destroy, 13);
+      }
+      execute(Opcode.Destroy, 12);
+      execute(Opcode.CreateTexture, 12, join(words(2, 2, 3, 2, 0), volumePixels), Status.Error);
+      execute(Opcode.CreateTexture, 12, join(words(2, 2, 3, 2, 2), volumePixels.slice(0, -4)), Status.Error);
 
       const rectangles = new Int32Array([-1, 1, 2, 3, width - 1, 0, width + 2, 1]);
       const inside = pixel => {
@@ -225,7 +303,7 @@ globalThis.onmessage = async event => {
         const clearStencil = execute(Opcode.Readback, 4, words(1));
         if (clearStencil.some((value, n) => value !== (inside(n) && (flags & 4) ? 73 : importedStencil[n]))) { throw new Error('partial stencil clear changed its rectangle or neighboring stencil: ' + flags); }
         execute(Opcode.Draw, 2, draw(new Uint8Array(), 6));
-        if (execute(Opcode.Readback, 2).some((value, n) => value !== ((inside(Math.floor(n / 4)) && (flags & 2)) || (packedDepth[Math.floor(n / 4)] >>> 8) > 0x800000 ? pixels[n] : clearPixels[n]))) { throw new Error('partial depth clear changed its rectangle or neighboring depth: ' + flags); }
+        if (execute(Opcode.Readback, 2).some((value, n) => value !== ((inside(Math.floor(n / 4)) && (flags & 2)) || (packedDepth[Math.floor(n / 4)] >>> 8) > 0x7fffff ? pixels[n] : clearPixels[n]))) { throw new Error('partial depth clear changed its rectangle or neighboring depth: ' + flags); }
       }
       const beforeDepthOnly = execute(Opcode.Readback, 2);
       execute(Opcode.Clear, 0, join(floats(0, 0, 0, 0, 1), words(22, 6, 4, 0)));
@@ -278,6 +356,10 @@ globalThis.onmessage = async event => {
     execute(Opcode.CreatePipeline, 77, join(words(3, 3, 4, 1, 1, 0, 2, 1, 1, 2, 1, 1, 15, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 1), encoder.encode('badbad')), Status.Error);
     execute(Opcode.Destroy, 999, undefined, Status.Error);
     execute(Opcode.DrawBatch, 0, words(1, 999, 0), Status.Error);
+    execute(15, 0, words(1, Opcode.Readback, 2, 0), Status.Error);
+    execute(15, 0, words(1, Opcode.Clear, 2, 36), Status.Error);
+    execute(15, 0, words(0), Status.Error);
+    execute(15, 0, words(257), Status.Error);
     execute(Opcode.Destroy, 15);
     execute(Opcode.Destroy, 1);
     execute(Opcode.Destroy, 3);

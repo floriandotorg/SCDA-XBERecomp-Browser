@@ -138,15 +138,18 @@ int main() {
       auto lease = memory.Borrow();
       fault([&] { runtime.Invoke(current, memory.Base(), runtime.KernelTarget(166)); });
     });
-    const uint32_t combined = invoke(166, {0xfffffff0, 1, 0, UINT32_MAX, 0, 0x404});
-    check(combined == 0x80103000 && pages() == 5, "write combined allocation did not share ledger");
-    uint32_t marker = 0x12345678;
-    memory.Write({}, combined, &marker, sizeof(marker));
-    uint32_t value = 0;
-    memory.Read({}, combined + 0x70000000, &value, sizeof(value));
-    check(value == marker, "write combined allocation lost physical alias");
-    release(combined);
-    const std::array<uint32_t, 6> unsupported{0xfffffff0, 1, 0, UINT32_MAX, 0, 0x204};
+    for (const uint32_t protection : {0x404u, 0x204u}) {
+      const uint32_t allocation = invoke(166, {0xfffffff0, 1, 0, UINT32_MAX, 0, protection});
+      check(allocation == 0x80103000 && pages() == 5, "cache-mode allocation did not share the bounded physical ledger");
+      uint32_t marker = 0x12345678;
+      memory.Write({}, allocation, &marker, sizeof(marker));
+      uint32_t value = 0;
+      memory.Read({}, allocation + 0x70000000, &value, sizeof(value));
+      check(value == marker, "cache-mode allocation lost coherent physical aliases");
+      release(allocation);
+      check(pages() == 4, "cache-mode allocation did not release its real page");
+    }
+    const std::array<uint32_t, 6> unsupported{0xfffffff0, 1, 0, UINT32_MAX, 0, 0x604};
     memory.Write({}, context.esp, unsupported.data(), sizeof(unsupported));
     owned(runtime, memory, context, [&](X86Context& current) {
       auto foreign = current;

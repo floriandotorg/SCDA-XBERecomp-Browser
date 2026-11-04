@@ -28,6 +28,8 @@ export const mountBootShell = ({ root = document, createRuntime = createBootRunt
     boot.disabled = !state.source || active || state.stopping || state.code === 'TEARDOWN';
     stop.disabled = !active || state.stopping;
     input.disabled = state.stopping || state.code === 'TEARDOWN';
+    const development = root.querySelector('#development-start');
+    if (development) { development.disabled = active || state.stopping; }
     status.textContent = state.stopping ? 'Stopping guest workers and cancelling pending reads.' :
       state.phase === 'stopped' && state.code === 'SINGLE_PLAYER_LAUNCH_REQUEST' ? 'Single player launch boundary reached.' : phaseText[state.phase];
     selected.textContent = state.source ? `${state.source.name ?? 'Local ISO'} (${state.source.size.toLocaleString()} bytes)` : 'No ISO selected.';

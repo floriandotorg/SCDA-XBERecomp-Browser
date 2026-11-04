@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Browser audio transport fixture</title></head>
+<body>
+<button id="enable-audio">Enable audio</button>
+<p id="audio-status" role="status"></p>
+<pre id="result">ready</pre>
+<script type="module">
+import { createBrowserAudio } from '../../src/browser/browser-audio.mjs';
+import { AUDIO_FRAMES } from '../../src/browser/audio-transport.mjs';
+const buffer = new SharedArrayBuffer(32 + AUDIO_FRAMES * 24);
+const header = new Uint32Array(buffer, 0, 8);
+const samples = new Float32Array(buffer, 32);
+let analyser;
+const transport = createBrowserAudio({ buffer, byteOffset: 0, samplesOffset: 32,
+  createNode: (context, options) => {
+    if (new URLSearchParams(location.search).get('sink') === 'none') { void context.setSinkId({ type: 'none' }); }
+    analyser = context.createAnalyser();
+    const node = new AudioWorkletNode(context, 'mission-audio', options);
+    node.connect(analyser);
+    return node;
+  },
+});
+let targetFrames = 8192;
+let position = 0;
+const produce = () => {
+  if (!Atomics.load(header, 3)) { return; }
+  const write = Atomics.load(header, 0), read = Atomics.load(header, 1);
+  const frames = Math.max(0, targetFrames - ((write - read) >>> 0));
+  for (let n = 0; n < frames; ++n) {
+    const offset = ((write + n) % AUDIO_FRAMES) * 6;
+    samples[offset] = Math.sin(position++ * Math.PI / 50) * 0.1;
+    samples[offset + 1] = samples[offset];
+  }
+  Atomics.store(header, 0, (write + frames) >>> 0);
+};
+const timer = setInterval(produce, 10);
+globalThis.audioTest = {
+  snapshot: () => {
+    const waveform = new Float32Array(2048);
+    analyser?.getFloatTimeDomainData(waveform);
+    return { ...transport.snapshot(), peak: Math.max(...waveform.map(Math.abs)), contextTime: analyser?.context.currentTime,
+      baseLatency: analyser?.context.baseLatency, outputLatency: analyser?.context.outputLatency };
+  },
+  setTarget: value => {
+    if (![2048, 4096, 8192].includes(value)) { throw new Error('Invalid test target.'); }
+    targetFrames = value;
+  },
+  jitter: async () => {
+    const before = transport.snapshot();
+    const until = performance.now() + 160;
+    while (performance.now() < until) {}
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const after = transport.snapshot();
+    return { targetFrames, underrunFrames: after.underrunFrames - before.underrunFrames };
+  },
+  stop: async () => { clearInterval(timer); await transport.dispose(); },
+};
+addEventListener('pagehide', () => { void audioTest.stop(); }, { once: true });
+</script>
+</body>
+</html>

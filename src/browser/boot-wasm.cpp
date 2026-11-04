@@ -53,6 +53,7 @@ constexpr size_t worker_capacity = 2;
 #endif
 struct StoryState {
 #ifdef BROWSER_MISSION
+  std::shared_ptr<browser::AudioOutput> audio = std::make_shared<browser::AudioOutput>();
   std::array<std::atomic<uint32_t>, 42> metrics{};
   std::shared_ptr<browser::MissionInput::SharedStorage> motion = std::make_shared<browser::MissionInput::SharedStorage>();
 #endif
@@ -60,13 +61,14 @@ struct StoryState {
   std::shared_ptr<browser::MenuInput::SharedStorage> input = std::make_shared<browser::MenuInput::SharedStorage>();
 #endif
   std::shared_ptr<browser::TemporaryFilesystem> profile = std::make_shared<browser::TemporaryFilesystem>(32u << 20);
-  std::shared_ptr<browser::RawCache> cache = std::make_shared<browser::RawCache>();
+  std::shared_ptr<browser::RawCache> cache = std::make_shared<browser::RawCache>(browser::CacheFatx::StoryCapacity);
   std::optional<std::array<uint8_t, 4096>> launchPage;
   std::optional<browser::DiagnosticGraphics::PersistedDisplay> display;
   std::array<uint8_t, 16> driveKey{};
   std::array<uint8_t, 21> serial{};
   bool initialized = false;
   uint32_t restarts = 0;
+  bool developmentStart = false;
 };
 struct Session {
 #ifdef BROWSER_MISSION
@@ -142,6 +144,9 @@ struct Session {
 #endif
       worker_capacity), image(browser::PrepareImage(std::move(bytes), {X86ImageBase, X86ImageEnd, X86EntryPoint})) {
     if (!runtime.Find(X86EntryPoint)) { throw std::runtime_error("generated entry body is absent"); }
+#ifdef BROWSER_MISSION
+    runtime.ReuseTimerSamples(1);
+#endif
     browser::InstallSectionProvider(runtime, *image);
     browser::InstallKernelProvider(runtime, *image->memory);
     browser::QueryContiguousMemoryUsage contiguousUsage;
@@ -151,10 +156,12 @@ struct Session {
     restoredAllocations = contiguousAccess;
     browser::MenuBackendLimits rendererLimits;
 #ifdef BROWSER_MISSION
+    rendererLimits.maxResources = 512;
     rendererLimits.maxResidentBytes = 128u << 20;
     rendererLimits.batchDraws = true;
     rendererLimits.compactVertices = true;
     rendererLimits.indexedVertices = true;
+    rendererLimits.postCommands = true;
     rendererLimits.maxVertices = 65536;
     rendererLimits.maxExpandedVertices = 196608;
 #endif
@@ -191,7 +198,7 @@ struct Session {
     auto fileCloser = browser::InstallFileProvider(runtime, *image, mountedDisc, std::move(profileStorage), &dataExports, &snapshotDiscReads,
       std::move(reportFileOpen), &synchronizationRoutes->ownsFile, story ? story->cache : nullptr, std::move(reportFileOperation),
 #ifdef BROWSER_MISSION
-      4u << 20
+      32u << 20, 256
 #else
       1u << 20
 #endif
@@ -230,7 +237,11 @@ struct Session {
     browser::InstallDpcProvider(runtime, *image);
     const auto timers = browser::InstallTimerProvider(runtime, *image);
     dataExports.push_back(browser::InstallTimerTickCount(runtime, *image, timers));
-    silentAudio = std::make_shared<browser::SilentAudioSink>(runtime, *image);
+    silentAudio = std::make_shared<browser::SilentAudioSink>(runtime, *image
+#ifdef BROWSER_MISSION
+      , story ? story->audio : nullptr
+#endif
+    );
     dataExports.push_back(browser::InstallVirtualDriveKey(runtime, *image));
     const auto platform = browser::InstallPlatformProfile(runtime, *image);
     dataExports.insert(dataExports.end(), platform.begin(), platform.end());
@@ -263,9 +274,10 @@ struct Session {
     }
     route = std::make_shared<browser::MenuRoute>(runtime, *image);
     missionObserver = std::make_shared<browser::MenuMissionObservation>(runtime, *image);
+    constexpr auto observedReturns = browser::MenuMissionObservation::ReturnAddresses();
     runtime.InstallInvocationObserver(*image->memory, [observer = missionObserver](const X86Context& ctx, uint8_t* base, uint32_t target, uint64_t workerId) {
       observer->Observe(ctx, base, target, workerId);
-    });
+    }, {observedReturns.begin(), observedReturns.end()});
     std::shared_ptr<browser::SdkGraphics> controls = input;
 #ifdef BROWSER_MISSION
     missionControls = std::make_shared<browser::MissionInput>(runtime, *image, input, story->motion, [this](const auto& sample) {
@@ -279,6 +291,7 @@ struct Session {
       simulation[2] = std::bit_cast<uint32_t>(sample.deltaSeconds);
     });
     controls = missionControls;
+    if (story->developmentStart) { missionControls->ConfigureDevelopmentStart(); }
 #endif
     sdkObserver = browser::InstallSdkProvider(runtime, *image, browser::SdkPolicy::UnavailableXNet, graphics, controls, launcher, route, audioProvider);
 #else
@@ -310,6 +323,7 @@ struct Session {
 };
 std::vector<uint8_t> input;
 std::unique_ptr<Session> session;
+std::shared_ptr<browser::AudioOutput> publishedAudioStorage;
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
 std::shared_ptr<browser::MenuInput> publishedInputStorage;
 #endif
@@ -353,6 +367,21 @@ EMSCRIPTEN_KEEPALIVE int image_prepare(uint32_t base, uint32_t end, uint32_t ent
   } catch (const std::runtime_error&) {
     return 0;
   }
+}
+
+EMSCRIPTEN_KEEPALIVE int image_development_boot() {
+#ifdef BROWSER_MISSION
+  if (!session || !session->story || session->story->launchPage || session->image->importsBound || session->runtime.ActiveWorkers()) { return 0; }
+  try {
+    session->missionControls->ConfigureDevelopmentStart();
+    session->launcher->ConfigureDevelopmentStart();
+    session->story->launchPage = browser::DevelopmentIcelandLaunchPage();
+    session->story->developmentStart = true;
+    return 1;
+  } catch (const std::runtime_error&) { return 0; }
+#else
+  return 0;
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE int image_declare_import(uint32_t ordinal, uint32_t kind) {
@@ -509,6 +538,20 @@ EMSCRIPTEN_KEEPALIVE uint32_t image_disc_reads_word(uint32_t index) {
   return uint32_t(values[index / 2] >> ((index % 2) * 32));
 }
 
+EMSCRIPTEN_KEEPALIVE uintptr_t image_audio_address() {
+#ifdef BROWSER_MISSION
+  if (!session || !session->story) { return 0; }
+  publishedAudioStorage = session->story->audio;
+  return reinterpret_cast<uintptr_t>(publishedAudioStorage->header.data());
+#else
+  return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE uintptr_t image_audio_samples_address() {
+  return publishedAudioStorage ? reinterpret_cast<uintptr_t>(publishedAudioStorage->samples.data()) : 0;
+}
+
 EMSCRIPTEN_KEEPALIVE uint32_t image_audio_info(uint32_t field) {
   if (!session) { return 0; }
   const auto& snapshot = session->audioTrace;
@@ -540,6 +583,21 @@ EMSCRIPTEN_KEEPALIVE uintptr_t image_input_address() {
       publishedInputStorage->SharedAddress() != session->input->SharedAddress())) { return 0; }
   publishedInputStorage = session->input;
   return reinterpret_cast<uintptr_t>(publishedInputStorage->SharedAddress());
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uintptr_t image_gamepad_address() {
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+  return session && session->input && publishedInputStorage == session->input ?
+    reinterpret_cast<uintptr_t>(publishedInputStorage->GamepadAddress()) : 0;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_gamepad_words() {
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+  return session && session->input && publishedInputStorage == session->input ? publishedInputStorage->GamepadWords() : 0;
 #else
   return 0;
 #endif

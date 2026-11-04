@@ -184,7 +184,7 @@ struct Fixture {
     put(0x844, 0x40);
   }
   std::shared_ptr<kernel::DiscIndex> disc;
-  explicit Fixture(Mode mode = Mode::Normal) : runtime(Mappings(mode == Mode::WeakAudio), {}, [this] {
+  explicit Fixture(Mode mode = Mode::Normal, std::shared_ptr<browser::AudioOutput> output = {}) : runtime(Mappings(mode == Mode::WeakAudio), {}, [this] {
     if (clockStep.load() && ++clockSamples > 256) { throw std::runtime_error("audio refill repeatedly resampled its advancing clock"); }
     return source.fetch_add(clockStep.load());
   }) {
@@ -196,7 +196,7 @@ struct Fixture {
     writeVtables(*image.memory, mode == Mode::BrokenVtable);
     queue = browser::InstallTimerProvider(runtime, image);
     tick = browser::InstallTimerTickCount(runtime, image, queue);
-    sink = std::make_shared<browser::SilentAudioSink>(runtime, image);
+    sink = std::make_shared<browser::SilentAudioSink>(runtime, image, std::move(output));
     if (mode != Mode::NoInstall && mode != Mode::NoAudio) {
       audio = browser::InstallAudioProvider(runtime, image, sink, disc);
     }
@@ -997,7 +997,99 @@ void advancingRefillClock() {
   });
 }
 
+void audibleBuffer() {
+  const auto output = std::make_shared<browser::AudioOutput>();
+  Fixture fixture(Fixture::Mode::Normal, output);
+  output->header[3] = 1;
+  fixture.Run([&](X86Context& context, uint8_t* base) {
+    Guest guest{context, base, *fixture.image.memory};
+    guest.WriteDesc(kBufferDesc, {0, 0, 0, kWavePcm, 0});
+    check(guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateBuffer), {kBufferDesc, kOut}, 2) == 0, "audible buffer creation failed");
+    const uint32_t buffer = guest.Read(kOut);
+    guest.Write(kPayload, 0xc0004000);
+    check(guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_SetBufferData), {buffer, kPayload, 4}, 3) == 0, "audible payload rejected");
+    check(guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_SetHeadroom), {buffer, 0}, 2) == 0, "audible headroom rejected");
+    check(guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_Play), {buffer, 0, 0, 1}, 4) == 0, "audible buffer playback failed");
+    check(output->header[0] > 0 && output->samples[0] == 0.5f && output->samples[1] == -0.5f,
+      "real PCM playback must reach the browser output with independent stereo channels");
+    check(output->samples[2] == 0 && output->samples[3] == 0 && output->samples[4] == 0 && output->samples[5] == 0,
+      "stereo playback wrote unrelated native speaker channels");
+    guest.WriteDesc(kMixBins, {2, kPayload + 16});
+    guest.WriteDesc(kPayload + 16, {0, 6000, 1, 6000});
+    guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_SetMixBinVolumes), {buffer, kMixBins}, 2);
+    guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_SetVolume), {buffer, uint32_t(-10000)}, 2);
+    const uint32_t before = output->header[0];
+    output->header[1] = before;
+    fixture.source = 10000000;
+    fixture.queue->Drive(context, base);
+    check(output->header[0] > before && output->samples[(before % browser::AudioOutput::kFrames) * 6] == 0,
+      "a muted voice must stay silent even with positive mix-bin gain");
+  });
+}
+
+void audibleStreamAfterPriming() {
+  const auto output = std::make_shared<browser::AudioOutput>();
+  Fixture fixture(Fixture::Mode::Normal, output);
+  output->header[3] = 1;
+  fixture.Run([&](X86Context& context, uint8_t* base) {
+    Guest guest{context, base, *fixture.image.memory};
+    guest.WriteDesc(kBufferDesc, {0, 0, 0, kWavePcm, 0});
+    check(guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateBuffer), {kBufferDesc, kOut}, 2) == 0, "priming buffer creation failed");
+    const uint32_t buffer = guest.Read(kOut);
+    guest.Write(kPayload, 0);
+    guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_SetBufferData), {buffer, kPayload, 4}, 3);
+    guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_Play), {buffer, 0, 0, 1}, 4);
+    check(fixture.sink->Snapshot().queuedFrames == 8192, "audio lookahead was not primed");
+    guest.WriteDesc(kStreamDesc, {0, 4, kWavePcm, 0, 0, 0});
+    check(guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateStream), {kStreamDesc, kOut + 4}, 2) == 0, "audible stream creation failed");
+    const uint32_t stream = guest.Read(kOut + 4);
+    guest.Call(BROWSER_AUDIO_GUEST(CDirectSoundStream_SetHeadroom), {stream, 0}, 2);
+    for (uint32_t n = 0; n < 2; ++n) {
+      guest.Write(kPayload + 64, n ? 0x30001000 : 0x20002000);
+      guest.WriteDesc(kPacketDesc, {kPayload + 64, 4, kOut + 24, kOut + 28, 0});
+      check(guest.Call(BROWSER_AUDIO_GUEST(CDirectSoundStream_Process), {stream, kPacketDesc, 0}, 3) == 0, "short speech packet rejected");
+      const uint32_t before = output->header[0];
+      output->header[1] = before;
+      fixture.source = (n + 1) * 100000;
+      fixture.queue->Drive(context, base);
+      const uint32_t offset = before % browser::AudioOutput::kFrames * 6;
+      check(output->header[0] > before && output->samples[offset] == (n ? 0.125f : 0.25f) &&
+        output->samples[offset + 1] == (n ? 0.375f : 0.25f),
+        "short speech/music packets disappeared behind previously queued audio");
+      guest.Call(BROWSER_AUDIO_GUEST(CDirectSoundStream_GetStatus), {stream, kOut + 20}, 2);
+      check(guest.Read(kOut + 24) == 4 && guest.Read(kOut + 28) == 0, "mixed stream packet did not complete exactly");
+    }
+  });
+}
+
+void idleStreamReservations() {
+  const auto output = std::make_shared<browser::AudioOutput>();
+  Fixture fixture(Fixture::Mode::Normal, output);
+  output->header[3] = 1;
+  fixture.Run([&](X86Context& context, uint8_t* base) {
+    Guest guest{context, base, *fixture.image.memory};
+    guest.WriteDesc(kStreamDesc, {0, 4, kWaveAdpcm, 0, 0, 0});
+    uint32_t stream = 0;
+    for (uint32_t n = 0; n < 96; ++n) {
+      check(guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateStream), {kStreamDesc, kOut}, 2) == 0,
+        "idle reserved stream objects prevented later music/dialogue allocation");
+      stream = guest.Read(kOut);
+    }
+    guest.Call(BROWSER_AUDIO_GUEST(CDirectSoundStream_SetHeadroom), {stream, 0}, 2);
+    const std::array<uint8_t, 36> block{0xe8, 3};
+    fixture.image.memory->Write(context, kPayload, block.data(), block.size());
+    guest.WriteDesc(kPacketDesc, {kPayload, 36, kOut + 24, kOut + 28, 0});
+    guest.Call(BROWSER_AUDIO_GUEST(CDirectSoundStream_Process), {stream, kPacketDesc, 0}, 3);
+    check(output->header[0] && output->samples[0] == 1000 / 32768.0f,
+      "a late allocated ADPCM dialogue stream did not reach the mixer");
+    check(fixture.audio->Snapshot().voiceLimitRejections == 0, "idle stream reservation recorded a playback failure");
+  });
+}
+
 int main() {
+  idleStreamReservations();
+  audibleStreamAfterPriming();
+  audibleBuffer();
   advancingRefillClock();
   installOwnership();
   createIdentity();

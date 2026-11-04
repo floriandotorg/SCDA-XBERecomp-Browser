@@ -51,9 +51,46 @@ Fault::Fault(const X86Context& ctx, uint32_t address, size_t size, const char* r
 #endif
 }
 
-thread_local size_t Memory::threadBorrows_ = 0;
-thread_local Memory* Memory::borrowedMemory_ = nullptr;
-thread_local Memory* Memory::mutatedMemory_ = nullptr;
+constinit thread_local size_t Memory::threadBorrows_ = 0;
+constinit thread_local Memory* Memory::borrowedMemory_ = nullptr;
+constinit thread_local Memory* Memory::mutatedMemory_ = nullptr;
+constinit thread_local Memory::Execution* Memory::Execution::current_ = nullptr;
+
+Memory::Execution::Execution(Memory* memory) {
+  if (!memory || (current_ && current_->lease_ && current_->memory_ == memory)) { return; }
+  if (HasBorrow()) { throw Fault({}, 0, 0, "guest execution entered during a backing lease"); }
+  memory_ = memory;
+  previous_ = current_;
+  lease_.emplace(*memory_);
+  memory_->InitializePages();
+  current_ = this;
+}
+
+Memory::Execution::~Execution() {
+  if (memory_) { current_ = previous_; lease_.reset(); }
+}
+
+Memory::PauseExecution::PauseExecution() {
+  auto* execution = Execution::current_;
+  if (!execution || !execution->lease_) { return; }
+  if (threadBorrows_ != 1 || borrowedMemory_ != execution->memory_ || mutatedMemory_) {
+    throw Fault({}, 0, 0, "host boundary during a nested backing lease");
+  }
+  execution_ = execution;
+  execution_->lease_.reset();
+}
+
+Memory::PauseExecution::~PauseExecution() {
+  if (execution_) { execution_->lease_.emplace(*execution_->memory_); }
+}
+
+void Memory::YieldExecution() {
+  auto* execution = Execution::current_;
+  if (!execution || !execution->lease_ || threadBorrows_ != 1 || ++execution->checkpoints_ < 256) { return; }
+  execution->checkpoints_ = 0;
+  PauseExecution pause;
+  std::this_thread::yield();
+}
 
 Memory::Storage::Storage(uint32_t size) : bytes(size), committed(size / pageSize) {}
 
@@ -66,7 +103,15 @@ Memory::Memory() {
 }
 
 void Memory::BeginBlock() {
-  if (HasBorrow()) { throw Fault({}, 0, 0, "nested generated memory block"); }
+  if (HasBorrow()) {
+    const auto* execution = Execution::current_;
+    if (!execution || !execution->lease_ || execution->memory_ != this || threadBorrows_ != 1 || mutatedMemory_) {
+      throw Fault({}, 0, 0, "nested generated memory block");
+    }
+    ++leases_;
+    ++threadBorrows_;
+    return;
+  }
   std::unique_lock lock(memoryLock_);
   InitializePages();
   ++leases_;
@@ -76,6 +121,12 @@ void Memory::BeginBlock() {
 }
 
 void Memory::EndBlock() noexcept {
+  const auto* execution = Execution::current_;
+  if (execution && execution->lease_ && execution->memory_ == this && threadBorrows_ == 2) {
+    --threadBorrows_;
+    --leases_;
+    return;
+  }
   borrowedMemory_ = nullptr;
   --threadBorrows_;
   --leases_;
@@ -272,6 +323,10 @@ void Memory::Validate(const X86Context& ctx, uint32_t address, size_t size) {
   }
 }
 
+void Memory::WriteVersionExhausted(const X86Context& ctx, uint32_t address, size_t size) {
+  throw Fault(ctx, address, size, "physical write version exhausted");
+}
+
 void Memory::MarkPhysicalWrite(const X86Context& ctx, const Region& region, size_t offset, size_t size) {
   if (region.storage != physicalStorage_ || !size) { return; }
   if (physicalEpoch_ == UINT64_MAX) { throw Fault(ctx, region.address + uint32_t(offset), size, "physical write version exhausted"); }
@@ -391,6 +446,65 @@ void Memory::Copy(const X86Context& ctx, uint32_t destination, uint32_t source, 
   Write(ctx, destination, snapshot.data(), size);
 }
 
+void Memory::MoveRepeated(X86Context& ctx, uint32_t width) { Repeat(ctx, width, false); }
+void Memory::StoreRepeated(X86Context& ctx, uint32_t width) { Repeat(ctx, width, true); }
+
+void Memory::Repeat(X86Context& ctx, uint32_t width, bool fill) {
+  if (width != 1 && width != 2 && width != 4) { throw Fault(ctx, fill ? ctx.edi : ctx.esi, width, "unsupported repeated memory width"); }
+  PauseExecution pause;
+  if (HasBorrow()) { throw Fault(ctx, ctx.edi, width, "repeated memory requires no outer backing lease"); }
+  const uint32_t step = ctx.df ? 0u - width : width;
+  while (ctx.ecx) {
+    if (ctx.host) { Runtime::From(ctx).Checkpoint(ctx); }
+    auto lease = Borrow();
+    InitializePages();
+    const auto capacity = [&](uint32_t address) {
+      return ctx.df ? (address & 4095) / width + 1 : (4096 - (address & 4095)) / width;
+    };
+    const uint32_t count = std::max(1u, std::min({ctx.ecx, 64u, capacity(ctx.edi), fill ? 64u : capacity(ctx.esi)}));
+    const uint32_t bytes = count * width, offset = ctx.df ? (count - 1) * width : 0;
+    const uint32_t destination = ctx.edi - offset, source = ctx.esi - offset;
+    auto* output = bytes <= 4096 - (destination & 4095) ? PageAt(destination, width) : nullptr;
+    auto* input = !fill && bytes <= 4096 - (source & 4095) ? PageAt(source, width) : nullptr;
+    if (output && (fill || input) && (!output->version || physicalEpoch_ <= UINT64_MAX - count)) {
+      auto* to = output->bytes + (destination & 4095);
+      if (output->version) { *output->version = physicalEpoch_ += count; }
+      if (fill) {
+        if (width == 1) { std::memset(to, uint8_t(ctx.eax), bytes); }
+        else {
+          for (uint32_t n = 0; n < count; ++n) {
+            if (width == 2) { std::memcpy(to + n * 2, &ctx.eax, 2); }
+            else { std::memcpy(to + n * 4, &ctx.eax, 4); }
+          }
+        }
+      } else {
+        const auto* from = input->bytes + (source & 4095);
+        const auto first = reinterpret_cast<uintptr_t>(from), second = reinterpret_cast<uintptr_t>(to);
+        if (first + bytes <= second || second + bytes <= first || (ctx.df ? second >= first : second <= first)) {
+          std::memmove(to, from, bytes);
+        } else {
+          for (uint32_t n = 0; n < count; ++n) {
+            const uint32_t at = ctx.df ? (count - 1 - n) * width : n * width;
+            uint32_t value = 0;
+            std::memcpy(&value, from + at, width);
+            std::memcpy(to + at, &value, width);
+          }
+        }
+        ctx.esi += step * count;
+      }
+      ctx.edi += step * count;
+      ctx.ecx -= count;
+    } else {
+      uint32_t value = ctx.eax;
+      if (!fill) { Read(ctx, ctx.esi, &value, width); }
+      Write(ctx, ctx.edi, &value, width);
+      if (!fill) { ctx.esi += step; }
+      ctx.edi += step;
+      --ctx.ecx;
+    }
+  }
+}
+
 void Memory::Pages(uint32_t address, uint32_t size, bool committed) {
   std::lock_guard lock(memoryLock_);
   RequireMutable(address, size);
@@ -428,13 +542,13 @@ size_t Memory::BackingBytes() const {
   return bytes;
 }
 
-thread_local Runtime* Runtime::worker_ = nullptr;
-thread_local X86Context* Runtime::workerContext_ = nullptr;
-thread_local uint32_t Runtime::workerKpcr_ = 0;
-thread_local uint64_t Runtime::workerId_ = 0;
-thread_local Runtime* Runtime::clock_ = nullptr;
-thread_local bool Runtime::polling_ = false;
-thread_local uint32_t Runtime::loopPollBudget_ = 0;
+constinit thread_local Runtime* Runtime::worker_ = nullptr;
+constinit thread_local X86Context* Runtime::workerContext_ = nullptr;
+constinit thread_local uint32_t Runtime::workerKpcr_ = 0;
+constinit thread_local uint64_t Runtime::workerId_ = 0;
+constinit thread_local Runtime* Runtime::clock_ = nullptr;
+constinit thread_local bool Runtime::polling_ = false;
+constinit thread_local uint32_t Runtime::loopPollBudget_ = 0;
 
 Runtime::Runtime(std::span<const X86FuncMapping> mappings, std::span<const uint32_t> continuations,
     std::function<uint64_t()> timerSource, size_t workerCapacity)
@@ -574,6 +688,7 @@ void Runtime::Launch(X86Context ctx, uint8_t* base, std::function<void(X86Contex
 }
 
 std::exception_ptr Runtime::Join() {
+  Memory::PauseExecution pause;
   if (Memory::HasBorrow()) { throw Fault({}, 0, 0, "joining guest workers during host backing lease"); }
   if (worker_ == this) { throw Fault({}, 0, 0, "guest worker cannot join its own runtime"); }
   std::lock_guard joining(joiningLock_);
@@ -611,6 +726,7 @@ void Runtime::Checkpoint(const X86Context& ctx) const {
   while (capacity < budget && !stackBudget_.compare_exchange_weak(budget, capacity)) {}
 #endif
   if (cancelled_.load()) { throw Cancelled(ctx); }
+  Memory::YieldExecution();
 }
 
 void Runtime::Cancel() {
@@ -635,6 +751,7 @@ void Runtime::Wake() {
 }
 
 Runtime::WaitResult Runtime::Wait(const X86Context& ctx, uint64_t sequence, std::chrono::milliseconds timeout) {
+  Memory::PauseExecution pause;
   if (Memory::HasBorrow()) { throw Fault(ctx, ctx.last_icall, 0, "guest wait during host backing lease"); }
   if (timeout < std::chrono::milliseconds::zero() || timeout > std::chrono::seconds(30)) {
     throw Fault(ctx, ctx.last_icall, 0, "invalid guest wait budget");
@@ -663,6 +780,18 @@ void Runtime::RequireImageSession(const X86Context& ctx, uint8_t* base) const {
   }
 }
 
+namespace {
+[[gnu::noinline]] void InvokeGenerated(Memory& memory, X86Func* function, X86Context& ctx, uint8_t* base) {
+  Memory::Execution execution(&memory);
+  function(ctx, base);
+}
+
+[[gnu::noinline]] void InvokeHost(X86Func* function, X86Context& ctx, uint8_t* base) {
+  Memory::PauseExecution pause;
+  function(ctx, base);
+}
+}
+
 void Runtime::Invoke(X86Context& ctx, uint8_t* base, uint32_t target) {
 #if defined(__EMSCRIPTEN__) && defined(BROWSER_MENU_TRACE_ABORTS) && BROWSER_MENU_TRACE_ABORTS
   browser_abort_record_context(uint32_t(workerId_), target, ctx.esp, ctx.ecx, ctx.ebx, ctx.esi, ctx.edi);
@@ -673,7 +802,15 @@ void Runtime::Invoke(X86Context& ctx, uint8_t* base, uint32_t target) {
   else if (target < 0xFE000000) { Poll(ctx, base); }
   ctx.last_icall = target;
   if (std::find(continuations_.begin(), continuations_.end(), target) != continuations_.end()) { throw X86Resume{target, ctx.esp}; }
-  if (auto* function = Find(target)) { ObserveInvocation(ctx, base, target); function(ctx, base); return; }
+  if (auto* function = Find(target)) {
+    ObserveInvocation(ctx, base, target);
+    if (auto* memory = imageMemory_.load(); memory && !Memory::HasBorrow()) {
+      InvokeGenerated(*memory, function, ctx, base);
+      return;
+    }
+    function(ctx, base);
+    return;
+  }
   if (target >= 0xFE000000 && target < 0xFE000640 && !(target & 3)) { Kernel(ctx, base, (target - 0xFE000000) / 4); return; }
   X86Func* function = nullptr;
   if (target >= 0xFD000000 && target < 0xFE000000 && !(target & 3)) {
@@ -683,7 +820,7 @@ void Runtime::Invoke(X86Context& ctx, uint8_t* base, uint32_t target) {
   }
   if (!function) { throw Fault(ctx, target, 0, "unknown indirect target"); }
   ObserveInvocation(ctx, base, target);
-  function(ctx, base);
+  InvokeHost(function, ctx, base);
 }
 
 void Runtime::Resume(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t esp) {
@@ -695,6 +832,10 @@ void Runtime::Resume(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t e
   }
   ctx.esp = esp;
   PollLoop(ctx, base);
+  if (auto* memory = imageMemory_.load(); memory && !Memory::HasBorrow()) {
+    InvokeGenerated(*memory, function, ctx, base);
+    return;
+  }
   function(ctx, base);
 }
 
@@ -754,6 +895,7 @@ uint32_t Runtime::KernelTarget(uint32_t ordinal) {
 }
 
 void Runtime::Kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal) {
+  Memory::PauseExecution pause;
   Poll(ctx, base);
   const std::function<void(X86Context&, uint8_t*)>* function = nullptr;
   {
@@ -816,7 +958,8 @@ void Runtime::InstallSdkObserver(Memory& memory, std::function<bool(X86Context&,
   sdkObserver_ = std::move(observer);
 }
 
-void Runtime::InstallInvocationObserver(Memory& memory, std::function<void(const X86Context&, uint8_t*, uint32_t, uint64_t)> observer) {
+void Runtime::InstallInvocationObserver(Memory& memory, std::function<void(const X86Context&, uint8_t*, uint32_t, uint64_t)> observer,
+    std::vector<uint32_t> returnAddresses) {
   std::scoped_lock lock(workersLock_, lock_);
   Checkpoint({});
   if (!observer || invocationObserver_ || imageMemory_.load() || workerSequence_ || Memory::HasBorrow() ||
@@ -825,16 +968,27 @@ void Runtime::InstallInvocationObserver(Memory& memory, std::function<void(const
   }
   invocationMemory_ = &memory;
   invocationObserver_ = std::move(observer);
+  invocationReturns_ = std::move(returnAddresses);
 }
 
 void Runtime::ObserveInvocation(const X86Context& ctx, uint8_t* base, uint32_t target) noexcept {
-  if (!invocationObserver_ || !OwnsCurrentContext(ctx) || Memory::HasBorrow() ||
-      imageMemory_.load() != invocationMemory_ || !invocationMemory_ || base != invocationMemory_->Base()) { return; }
-  auto snapshot = ctx;
-  try { invocationObserver_(snapshot, base, target, workerId_); } catch (...) {}
+  if (!invocationObserver_) { return; }
+  try {
+    if (!invocationReturns_.empty()) {
+      if (!invocationMemory_ || base != invocationMemory_->Base()) { return; }
+      const uint32_t returnAddress = invocationMemory_->Load<uint32_t>(ctx, ctx.esp);
+      if (std::find(invocationReturns_.begin(), invocationReturns_.end(), returnAddress) == invocationReturns_.end()) { return; }
+    }
+    Memory::PauseExecution pause;
+    if (!OwnsCurrentContext(ctx) || Memory::HasBorrow() || imageMemory_.load() != invocationMemory_ ||
+        !invocationMemory_ || base != invocationMemory_->Base()) { return; }
+    auto snapshot = ctx;
+    invocationObserver_(snapshot, base, target, workerId_);
+  } catch (...) {}
 }
 
 bool Runtime::ObserveSdkEntry(X86Context& ctx, uint8_t* base, uint32_t id) {
+  Memory::PauseExecution pause;
   auto* runtime = worker_;
   if (!runtime || workerContext_ != &ctx || !runtime->OwnsCurrentContext(ctx) || Memory::HasBorrow() || !runtime->sdkObserver_ ||
       !runtime->sdkMemory_ || runtime->imageMemory_.load() != runtime->sdkMemory_ || base != runtime->sdkMemory_->Base()) {
@@ -849,6 +1003,7 @@ void Runtime::RecordProgress(const X86Context& ctx) {
 }
 
 void Runtime::Poll(X86Context& ctx, uint8_t* base) {
+  Memory::PauseExecution pause;
   loopPollBudget_ = 0;
   Checkpoint(ctx);
   RequireImageSession(ctx, base);
@@ -889,17 +1044,44 @@ uint64_t Runtime::SystemTime() {
 
 void Runtime::StartTimer() {
   std::lock_guard lock(timerLock_);
-  if (!timerEpoch_) { timerEpoch_ = timerSample_ = timerSource_(); }
+  if (!timerEpoch_) {
+    timerEpoch_ = timerSample_ = timerSource_();
+    static std::atomic<uint64_t> generations = 0;
+    timerElapsed_.store(0, std::memory_order_release);
+    timerGeneration_.store(generations.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_release);
+  }
+}
+
+void Runtime::ReuseTimerSamples(double milliseconds) {
+  std::scoped_lock lock(workersLock_, timerLock_);
+  if (!(milliseconds >= 0 && milliseconds <= 16) || activeWorkers_.load()) {
+    throw Fault({}, 149, 0, "timer sample reuse requires a stopped runtime and at most 16 milliseconds");
+  }
+  timerReuseMilliseconds_ = milliseconds;
 }
 
 uint64_t Runtime::TimerTime(const X86Context& ctx) {
   if (ctx.host != this || !OwnsCurrentWorker()) { throw Fault(ctx, 149, 0, "timer clock requires its owned runtime worker"); }
   Checkpoint(ctx);
+#ifdef __EMSCRIPTEN__
+  struct Reuse { const Runtime* runtime = nullptr; uint64_t generation = 0; double local = 0; };
+  static constinit thread_local Reuse reuse{};
+  const double local = timerReuseMilliseconds_ ? emscripten_get_now() : 0;
+  if (timerReuseMilliseconds_ && reuse.runtime == this && reuse.generation == timerGeneration_.load(std::memory_order_acquire) &&
+      local >= reuse.local && local - reuse.local < timerReuseMilliseconds_) {
+    return timerElapsed_.load(std::memory_order_acquire);
+  }
+#endif
   std::lock_guard lock(timerLock_);
   const uint64_t sample = timerSource_();
   if (!timerEpoch_ || sample < timerSample_) { throw Fault(ctx, 149, 0, "timer clock source moved backwards or has no epoch"); }
   timerSample_ = sample;
-  return sample - *timerEpoch_;
+  const uint64_t elapsed = sample - *timerEpoch_;
+  timerElapsed_.store(elapsed, std::memory_order_release);
+#ifdef __EMSCRIPTEN__
+  if (timerReuseMilliseconds_) { reuse = {this, timerGeneration_.load(std::memory_order_relaxed), local}; }
+#endif
+  return elapsed;
 }
 
 uint64_t Runtime::RelativeTimerDeadline(const X86Context& ctx, int64_t dueTime) {

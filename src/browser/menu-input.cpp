@@ -2,6 +2,7 @@
 #include "cpu/x86_ops.h"
 #include "image_symbols.h"
 #include <algorithm>
+#include <bit>
 
 #define MI_CAT_(left, right) left##right
 #define MI_CAT(left, right) MI_CAT_(left, right)
@@ -24,13 +25,14 @@ namespace browser {
 namespace {
 constexpr uint32_t gamepadType = MI_ADDRESS(XPP_GamepadType);
 constexpr uint32_t memoryUnitType = MI_ADDRESS(XPP_MemoryUnitType);
-constexpr uint32_t validButtons = 131071;
+constexpr uint32_t validButtons = 1048575;
 static_assert(sizeof(std::atomic<uint32_t>) == 4 && std::atomic<uint32_t>::is_always_lock_free);
 }
 
-MenuInput::MenuInput(Runtime& runtime, PreparedImage& image, std::shared_ptr<SharedStorage> storage)
+MenuInput::MenuInput(Runtime& runtime, PreparedImage& image, std::shared_ptr<SharedStorage> storage, std::shared_ptr<GamepadStorage> gamepad)
   : runtime_(runtime), image_(image), memory_(image.memory.get()),
-    storage_(storage ? std::move(storage) : std::make_shared<SharedStorage>()), shared_(*storage_) {
+    storage_(storage ? std::move(storage) : std::make_shared<SharedStorage>()), shared_(*storage_),
+    gamepad_(gamepad ? std::move(gamepad) : std::make_shared<GamepadStorage>()) {
   runtime.Checkpoint({});
   if (!memory_ || image.importsBound || image.boundRuntime || runtime.HasPublishedImage() || runtime.ActiveWorkers() ||
       Memory::HasBorrow() || (image.diagnosticRuntime && image.diagnosticRuntime != &runtime) ||
@@ -67,6 +69,26 @@ void MenuInput::CheckOutput(const X86Context& ctx, uint32_t address, size_t byte
     throw Fault(ctx, address, bytes, "menu input output aliases a call frame or device record");
   }
 }
+std::array<uint32_t, 7> MenuInput::SampleGamepad(const X86Context& ctx) const {
+  for (uint32_t n = 0; n < 3; ++n) {
+    const uint32_t sequence = (*gamepad_)[0].load();
+    if (sequence & 1) { continue; }
+    std::array<uint32_t, 7> sample;
+    for (uint32_t n = 0; n < sample.size(); ++n) { sample[n] = (*gamepad_)[n + 1].load(); }
+    if ((*gamepad_)[0].load() != sequence) { continue; }
+    if (!sample[0]) { return {}; }
+    if (sample[0] != 1 || (sample[1] & ~(validButtons & ~0xf0u)) || sample[6]) {
+      throw Fault(ctx, ctx.esp, 0, "gamepad shared controller record is invalid");
+    }
+    for (uint32_t n = 2; n < 6; ++n) {
+      const int32_t value = std::bit_cast<int32_t>(sample[n]);
+      if (value < -32767 || value > 32767) { throw Fault(ctx, ctx.esp, 0, "gamepad shared controller axis is invalid"); }
+    }
+    return sample;
+  }
+  return {};
+}
+
 bool MenuInput::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
   Require(ctx, base);
   if (id < 40 || id > 44) { return true; }
@@ -128,7 +150,9 @@ bool MenuInput::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
     return finish(997);
   }
   CheckOutput(ctx, frame[2], 22, frameBytes);
-  const uint32_t mask = shared_[0].load(std::memory_order_acquire);
+  const uint32_t keyboard = shared_[0].load(std::memory_order_acquire);
+  const auto gamepad = SampleGamepad(ctx);
+  const uint32_t mask = keyboard | gamepad[1];
   if (mask & ~validButtons) { throw Fault(ctx, frame[2], 22, "menu input shared controller mask is invalid"); }
   std::array<uint8_t, 18> sample{};
   const auto put16 = [&](size_t offset, int32_t value) {
@@ -136,13 +160,18 @@ bool MenuInput::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
     sample[offset] = uint8_t(bits);
     sample[offset + 1] = uint8_t(bits >> 8);
   };
-  put16(0, (mask & 15) | ((mask & Start) ? 0x10 : 0));
+  put16(0, (mask & 15) | ((mask & Start) ? 0x10 : 0) | ((mask & Select) ? 0x20 : 0) |
+    ((mask & LeftThumb) ? 0x40 : 0) | ((mask & RightThumb) ? 0x80 : 0));
   sample[2] = (mask & Confirm) ? 255 : 0;
   sample[3] = (mask & Back) ? 255 : 0;
   const std::array<uint32_t, 6> analogMasks{X, Y, Black, White, LeftTrigger, RightTrigger};
   for (uint32_t n = 0; n < analogMasks.size(); ++n) { sample[4 + n] = (mask & analogMasks[n]) ? 255 : 0; }
-  put16(10, (int32_t(bool(mask & StrafeRight)) - int32_t(bool(mask & StrafeLeft))) * 32767);
-  put16(12, (int32_t(bool(mask & Forward)) - int32_t(bool(mask & Backward))) * 32767);
+  put16(10, keyboard & (StrafeRight | StrafeLeft) ?
+    (int32_t(bool(keyboard & StrafeRight)) - int32_t(bool(keyboard & StrafeLeft))) * 32767 : std::bit_cast<int32_t>(gamepad[2]));
+  put16(12, keyboard & (Forward | Backward) ?
+    (int32_t(bool(keyboard & Forward)) - int32_t(bool(keyboard & Backward))) * 32767 : std::bit_cast<int32_t>(gamepad[3]));
+  put16(14, std::bit_cast<int32_t>(gamepad[4]));
+  put16(16, std::bit_cast<int32_t>(gamepad[5]));
   const uint32_t packet = handle->packet + uint32_t(!handle->sampled || sample != handle->last);
   std::array<uint8_t, 22> output{};
   for (uint32_t n = 0; n < 4; ++n) { output[n] = uint8_t(packet >> (n * 8)); }

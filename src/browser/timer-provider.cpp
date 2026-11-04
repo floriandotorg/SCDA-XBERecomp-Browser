@@ -191,11 +191,15 @@ void TimerQueue::Drive(X86Context& context, uint8_t* base) {
     if (!tickInstalled_ && !clockObserver_ && !pending) { return; }
     const uint64_t now = runtime_.TimerTime(context);
     runtime_.Checkpoint(context);
-    if (tickInstalled_) {
+    if (tickInstalled_ && tickWritten_ != uint32_t(now / 10000)) {
       const uint32_t milliseconds = uint32_t(now / 10000);
       memory_->Write(context, 0xc0002000, &milliseconds, sizeof(milliseconds));
+      tickWritten_ = milliseconds;
     }
-    if (clockObserver_) { clockObserver_(context, now); }
+    if (clockObserver_ && observed_ != now) {
+      clockObserver_(context, now);
+      observed_ = now;
+    }
     const bool expired = std::any_of(schedules_.begin(), schedules_.end(), [now](const auto& schedule) {
       return schedule && schedule->expiration.deadline <= now;
     });
