@@ -196,7 +196,7 @@ ImageThreadRetirement::~ImageThreadRetirement() {
   if (image.threadRetirement) { image.threadRetirement(context.fs_base); }
 }
 
-void ExecuteImageEntry(PreparedImage& prepared, Runtime& runtime, ImageExecution& execution) {
+void ExecuteImageEntry(PreparedImage& prepared, Runtime& runtime, ImageExecution& execution, std::function<void(X86Context&)> initialize) {
   if (execution.entered || !prepared.threads.empty()) { throw Fault({}, 0, 0, "initial image thread already prepared"); }
   if (!prepared.tlsCallbacks.empty()) {
     throw Fault({}, prepared.tlsCallbacks.front(), 0, "Xbox TLS callback invocation contract is not integrated");
@@ -207,6 +207,7 @@ void ExecuteImageEntry(PreparedImage& prepared, Runtime& runtime, ImageExecution
     ImageThreadRetirement retirement{prepared, context};
     execution.entered = true;
     try {
+      if (initialize) { initialize(context); }
       const uint32_t status = runtime.Call(context, base, prepared.image.entry, {0});
       runtime.Checkpoint(context);
       CompleteImageThread(prepared, runtime, context, status);

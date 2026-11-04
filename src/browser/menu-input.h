@@ -11,7 +11,8 @@ public:
     Start = 256, Confirm = 512, Back = 1024,
     X = 2048, Y = 4096, Black = 8192, White = 16384, LeftTrigger = 32768, RightTrigger = 65536
   };
-  MenuInput(Runtime& runtime, PreparedImage& image);
+  using SharedStorage = std::array<std::atomic<uint32_t>, 2>;
+  MenuInput(Runtime& runtime, PreparedImage& image, std::shared_ptr<SharedStorage> storage = {});
   bool BelongsTo(Runtime& runtime, PreparedImage& image) const override;
   bool Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) override;
   std::atomic<uint32_t>* SharedAddress() { return shared_.data(); }
@@ -27,7 +28,8 @@ private:
   Runtime& runtime_;
   PreparedImage& image_;
   Memory* memory_;
-  std::array<std::atomic<uint32_t>, 2> shared_{};
+  std::shared_ptr<SharedStorage> storage_;
+  SharedStorage& shared_;
   std::mutex lock_;
   std::array<Handle, 32> handles_{};
   uint32_t nextToken_ = 0xbc000000;

@@ -6,7 +6,7 @@ This is a browser compatibility policy under the approval recorded in [M3](03-ga
 
 The compiled providers own the policy. Their sources participate in the build manifest fingerprint and compiled build identity. A selected ISO or worker message cannot replace it.
 
-Each runtime owns its raw metadata and cache storage. Fresh runtimes start independently. Stop invalidates the generation and retires every owned worker before storage is discarded. There is no durable storage, host disk access or firmware restore contract. The selected ISO remains read only.
+The default boot and menu modes give each runtime independent raw metadata and cache storage. The experimental `BROWSER_MISSION` mode retains this storage and the temporary profile volume in the outer host session across replacement guest runtimes. It also retains virtual device identity and copied launch-page and display bytes. Guest handles, allocations and pointers remain local to each runtime. Stop invalidates the generation and retires every owned worker before storage is discarded. Starting a new host session or refreshing starts fresh storage. There is no durable storage or host disk access. The selected ISO remains read only.
 
 ## Partition0 metadata window
 
@@ -16,7 +16,7 @@ The raw `\Device\Harddisk0\Partition0` handle exposes only the title cache metad
 * Accessible byte interval: `[0x800, 0xa00)`.
 * Supported transfer: exactly 512 bytes at explicit byte offset `0x800`.
 * Initial contents: every byte zero. This is deliberately fresh virtual state, not a fabricated valid cache table.
-* Initialization: the genuine guest validates the sector and writes its own table. Successful writes retain exactly those bytes for subsequent reads in that runtime.
+* Initialization: the genuine guest validates the sector and writes its own table. Successful writes retain exactly those bytes for subsequent reads in that host session.
 * Other offsets, lengths and unsupported completion modes return explicit errors. No larger physical disk or valid partition table is implied.
 
 The observed synchronous alert open admits generic read, generic write and synchronize, with read and write sharing. Read and write adapters require the owned live handle, checked guest spans and null event, APC and APC context. Outputs and register cleanup are published only after actual completion. Unsupported modes do not return invented byte counts.
@@ -77,3 +77,7 @@ Meaningful native sanitizer and threaded Wasm contracts must cover exact transfe
 Focused native ASan/UBSan and threaded Wasm contracts mirror the retained formatter's FAT16 sizing formula, reject obsolete smaller FAT placements, track raw allocation release and injected namespace allocation failure, and copy generated nonproprietary files above the former per-volume budget. The tests verify every copied byte, true sizes, exact quota exhaustion, unchanged data after overfull failure, and fresh-session isolation. These focused contracts do not themselves execute the retained guest formatter; authenticated integrated continuation must still validate that path with the rebuilt fingerprint.
 
 The current raw cache implementation is not acceptance of all M3 tasks, guest asset streaming, firmware reboot or graphics initialization.
+
+## M5 streaming staging
+
+Mission mode accepts logical disc reads up to 4 MiB while retaining the 1 MiB ISO bridge transfer bound. One lazily allocated 4 MiB staging buffer is reused and all chunks complete before publishing guest bytes. Cancellation and failed reads preserve the destination and file cursor. Default M3/M4 providers retain a 1 MiB logical-read and staging limit. This buffer is included in measured Wasm memory; the mission Wasm heap ceiling remains 384 MiB and translated backing remains capped at 192 MiB.

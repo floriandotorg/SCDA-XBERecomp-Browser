@@ -161,6 +161,7 @@ public:
   Voice* Find(uint32_t id);
   const Voice* Find(uint32_t id) const;
   uint32_t Count() const;
+  bool Sounding(uint64_t now) const;
   std::vector<uint32_t> Ids() const;
   void AdvanceAll(uint64_t now, std::vector<Completion>& out);
 

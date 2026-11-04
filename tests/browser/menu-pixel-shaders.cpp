@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
   key.tex[0].rect = 1;
   key.alphakill = 3;
   const auto textured = Body(key);
-  Contains(textured, "textureSample(tex0, smp0, (i.t0.xy / i.t0.w) / u.texsize[0].xy + u.texsize[0].zw)");
+  Contains(textured, "textureSampleBias(tex0, smp0, (i.t0.xy / i.t0.w) / u.texsize[0].xy + u.texsize[0].zw, u.lod_bias[0])");
   Contains(textured, "var t1 = i.t1;");
   Contains(textured, "if (t0.a == 0.0) { discard; }");
   assert(textured.find("if (t1.a") == std::string::npos);
@@ -185,17 +185,23 @@ int main(int argc, char** argv) {
   Contains(native_final, "outc.rgb = max(r0.rgb, 0) + lerp(max(pc[17].rgb, 0), max(pc[16].rgb, 0), max(v0.rgb, 0));");
   Contains(native_final, "outc.a = max(r0.a, 0);");
   key.final_efg |= 0x80;
+  assert(Body(key) == final);
+  key.final_efg |= 1;
   Reject(key, "final combiner flags");
   key = Key();
   key.final_abcd = Inputs(14, 0x20);
-  Reject(key, "final combiner register 14");
+  Contains(Body(key), "v1.rgb + r0.rgb");
+  key.final_efg = 0xe0;
+  Contains(Body(key), "vec3<f32>(1.0) - v1.rgb");
+  Contains(Body(key), "vec3<f32>(1.0) - r0.rgb");
+  Contains(Body(key), "clamp(");
   key.final_abcd = Inputs(15, 0x20);
-  Reject(key, "final combiner register 15");
+  Contains(Body(key), "vec4<f32>(");
   key.final_abcd = Inputs(4, 0x20);
   key.final_efg = Inputs(15, 0);
   Reject(key, "final combiner register 15");
   for (int n = 0; n < 32; ++n) {
-    if (n == 0 || n == 1 || n == 4) {
+    if (n <= 4 || n == 9 || n == 12 || n == 17) {
       continue;
     }
     key = Key();
@@ -216,7 +222,9 @@ int main(int argc, char** argv) {
   for (const auto flag : {1u, 2u}) {
     key = Key();
     key.rgb_out[0] |= flag << 12;
-    Reject(key, "dot product");
+    Contains(Body(key), "vec3<f32>(dot(");
+    key.a_out[0] |= flag << 12;
+    Reject(key, "alpha output flags");
   }
   key = Key();
   key.a_out[0] |= 0x80u << 12;
@@ -226,20 +234,40 @@ int main(int argc, char** argv) {
   key.tex[0].shadow = 1;
   Reject(key, "shadow");
   key = Key();
+  key.tex_modes = 1 | (17u << 5) | (17u << 10) | (12u << 15);
+  key.tex[0].kind = gpu::kTex2D;
+  key.tex[3].kind = gpu::kTexCube;
+  key.dot_mapping = 0x111;
+  const auto reflected = Body(key);
+  Contains(reflected, "let dot1 = dot(i.t1.xyz");
+  Contains(reflected, "(t0.rgb * 255.0 - vec3<f32>(128.0)) / 127.0");
+  Contains(reflected, "let eye3 = vec3<f32>(i.t1.w, i.t2.w, i.t3.w)");
+  Contains(reflected, "textureSampleBias(tex3, smp3, reflected3, u.lod_bias[3])");
+  key = Key();
+  key.tex_modes = 1 | (17u << 10) | (9u << 15);
+  key.tex[0].kind = key.tex[3].kind = gpu::kTex2D;
+  Contains(Body(key), "vec2<f32>(dot2, dot3)");
+  key.tex_modes = 1 | (9u << 15);
+  Reject(key, "preceding dot stage");
+  key = Key();
   key.compare_mode = 1;
   Reject(key, "compare mode");
   key = Key();
-  key.dot_mapping = 1;
+  key.dot_mapping = 8;
   Reject(key, "dot mapping");
   key = Key();
   key.input_texture = 1;
-  Reject(key, "dependent input texture");
+  Reject(key, "input texture bits");
   key = Key();
   key.tex_modes = 1;
   Reject(key, "missing 2D texture");
   key.tex[0].kind = gpu::kTexCube;
-  Reject(key, "texture dimensionality");
+  key.tex_modes = 3;
+  Contains(Body(key), "textureSampleBias(tex0, smp0, i.t0.xyz, u.lod_bias[0])");
+  key.tex_modes = 2;
+  Contains(Body(key), "i.t0.xyz / i.t0.w");
   key.tex[0].kind = gpu::kTex2D;
+  key.tex_modes = 1;
   key.tex[0].flags = gpu::kTexHdr;
   Reject(key, "texture flags");
   key = Key();

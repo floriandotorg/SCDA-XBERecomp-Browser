@@ -224,13 +224,12 @@ const auto contracts = [] {
   check(readWord(memory, ctx, output) == sentinel, "handle exhaustion preserves create output");
   for (const auto handle : capacity) { handles.Close(handle); }
   handles.Close(alias);
-  const auto retained = handles.CreateMutant(4);
-  handles.Close(retained);
+  const auto retained = dispatcher.CreateMutant(4);
   for (auto& handle : capacity) { handle = handles.CreateTimer(false); }
   reject(194, {output, 0, 1});
   check(readWord(memory, ctx, output) == sentinel, "object exhaustion preserves create output");
   for (const auto handle : capacity) { handles.Close(handle); }
-  handles.AbandonOwner(4);
+  dispatcher.Destroy(retained);
   handles.Close(timer);
   reject(185, {timer, output});
   reject(229, {timer, dueAddress, 0, 0, 0, 0, 0, output});

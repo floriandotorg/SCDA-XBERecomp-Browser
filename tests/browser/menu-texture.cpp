@@ -162,5 +162,24 @@ int main() {
       assert(!DecodeTexture(d, {}).supported);
     }
   }
+  {
+    gpu::TextureDesc surface;
+    surface.width = surface.height = 4;
+    surface.format = 6;
+    const std::array<uint32_t, 16> order{0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15};
+    std::vector<uint8_t> rgba(64), original(64, 99), expected(64);
+    for (uint32_t n = 0; n < 16; ++n) {
+      rgba[n * 4] = uint8_t(n); rgba[n * 4 + 1] = uint8_t(n + 1); rgba[n * 4 + 2] = uint8_t(n + 2); rgba[n * 4 + 3] = 200;
+      expected[order[n] * 4] = uint8_t(n + 2); expected[order[n] * 4 + 1] = uint8_t(n + 1);
+      expected[order[n] * 4 + 2] = uint8_t(n); expected[order[n] * 4 + 3] = 200;
+    }
+    const auto encoded = browser::menu::EncodeSurface(surface, original, rgba);
+    assert(encoded.supported && encoded.bytes == expected);
+    assert(!browser::menu::EncodeSurface(surface, original, std::span(rgba).first(60)).supported);
+    surface.linear = true; surface.format = 0x1e; surface.pitch = 20;
+    original.assign(80, 99);
+    const auto linear = browser::menu::EncodeSurface(surface, original, rgba);
+    assert(linear.supported && linear.bytes[3] == 255 && linear.bytes[16] == 99 && linear.bytes[36] == 99);
+  }
   std::cout << "menu-texture-ok\n";
 }

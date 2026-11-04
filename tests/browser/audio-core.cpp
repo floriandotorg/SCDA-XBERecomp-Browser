@@ -80,6 +80,31 @@ static void BankLimits() {
   CHECK(out.empty());
 }
 
+const auto BankSounding = [] {
+  VoiceBank bank;
+  CHECK(!bank.Sounding(0));
+  CHECK(bank.CreateBuffer(1, kPcmStereo, 400) == AudioError::kNone);
+  CHECK(!bank.Sounding(0));
+  CHECK(bank.Find(1)->Play(0, 0) == AudioError::kNone);
+  CHECK(bank.Sounding(0));
+  CHECK(!bank.Sounding(100));
+  CHECK(bank.Find(1)->Play(100, kPlayLooping) == AudioError::kNone);
+  CHECK(bank.Sounding(100000));
+  bank.Find(1)->Stop(100001);
+  CHECK(!bank.Sounding(100001));
+  CHECK(bank.CreateStream(2, kPcmStereo, 2) == AudioError::kNone);
+  CHECK(!bank.Sounding(100001));
+  CHECK(bank.Find(2)->ProcessPacket(100001, 1, 400) == AudioError::kNone);
+  CHECK(bank.Sounding(100001));
+  CHECK(bank.Find(2)->Pause(100001, true) == AudioError::kNone);
+  CHECK(!bank.Sounding(100001));
+  CHECK(bank.Find(2)->Pause(100001, false) == AudioError::kNone);
+  CHECK(bank.Sounding(100001));
+  std::vector<Completion> completions;
+  bank.AdvanceAll(100101, completions);
+  CHECK(!bank.Sounding(100101));
+};
+
 static void BufferControl() {
   Voice v = Voice::Buffer(kPcmStereo, 4000);
   CHECK(!v.IsStream());
@@ -537,6 +562,7 @@ int main() {
   Formats();
   FrameMath();
   BankLimits();
+  BankSounding();
   BufferControl();
   BufferPositions();
   BufferLock();

@@ -118,3 +118,67 @@ Machine-readable local outputs are in `out/browser-webgpu-tests/draw-result.json
 * The 4 MiB packet limit means large textures require an additional chunked upload operation before they can be supported; the current API rejects rather than truncates them.
 * Successful Draw replies mean validated queue acceptance. Call Flush for GPU completion, or use Readback/Present, which perform their required asynchronous completion waits.
 * Full device-loss recovery is a fresh worker/device/mailbox session, not recovery in the lost session.
+
+## M5 CPU depth/stencil import follow-up
+
+The extended public fixture passes 59 commands in agent-browser on Chromium 151 with the Apple `metal-3` adapter. It imports pitched guest D24S8 pixels through a bounded packed packet and a render pass for each stencil value present in the source. The pass writes the original normalized depth and replaces stencil only at matching pixels. This preserves nonuniform contents without substituting an arbitrary initial depth clear.
+
+Numerical checks at 4 by 4 and 8 by 4 pixels read back row-varying stencil bytes and verify a less-or-equal depth comparison against a 0.5-depth triangle over a 0.25/0.75 checkerboard. Existing orientation, channel, alpha, copies, gamma and presentation checks still pass. Shutdown retires all tracked resources, including the cached import pipeline, to zero. The same three intentional malformed gamma, WGSL and resource diagnostics remain expected; the valid import emits no validation error.
+
+Stencil readback is a test-only probe. Production readback of depth/stencil remains explicitly unavailable. Initial CPU import currently covers linear D24S8 and D16, plus uniform contents in their supported swizzled forms; other depth encodings and nonuniform swizzled imports still fail by name. A CPU edit to an already GPU-owned depth image remains unsupported rather than overwriting unmodified pixels from stale CPU backing.
+
+Local numeric evidence is retained under ignored `out/m5-prerequisites/depth-service-orientation.json`; source-pitch and packet checks have native sanitizer and Wasm coverage in `menu-backend.test.mjs`. This fixture is not evidence of a rendered mission.
+
+## M5 stencil draw follow-up
+
+The extended real WebGPU fixture passes 79 commands on Apple metal-3 in Chromium 151. It imports row-varying stencil and checkerboard depth, replaces only stencil bit 16 with color and depth writes disabled, and verifies every stencil byte. Equal comparisons with read mask 16 reject reference zero and accept reference 16 without recreating the pipeline. The existing depth comparisons, orientation, gamma and resize checks pass. The three deliberate negative commands are the only validation diagnostics. Shutdown reports zero resources.
+
+The backend maps Xbox comparisons and all eight stencil operations explicitly and uses identical front/back state, matching the native backend. Stencil-only draws retain their depth/stencil attachment. The dynamic reference is excluded from pipeline identity and set on every draw. Native and Wasm transport tests pass after reproducing the missing fields in the red run. Production gameplay acceptance remains pending.
+
+## M5 mip levels and LOD follow-up
+
+The fixture now passes 107 commands on the same Chromium 151 / Apple metal-3 adapter. A two-level texture uses independently checked red and blue levels. Explicit level selection, minimum LOD clamp, positive bias and disabled mip filtering select the expected colors. Existing stencil, depth, orientation, presentation and shutdown checks pass. Only the three intentional negative commands report errors, and shutdown reports zero resources.
+
+All 68 generated shader fixtures also pass actual GPU compilation and numeric checks with the extended constants block and bias sampling. Native and Wasm shader, combiner and renderer tests pass. The real title's first mission uses a three-level DXT3 texture and bias -0.5; production continuation passes those prior guards.
+
+## M5 cube textures follow-up
+
+The public fixture passes 159 commands with six separately colored cube faces. Axis direction samples verify the console face order, channels and cube binding layouts at both configured output sizes. The existing depth, stencil, mip, LOD, gamma and presentation checks still pass. The only diagnostics are the three deliberate malformed gamma, WGSL and resource commands, and shutdown reports zero resources.
+
+All 70 generated WGSL fixtures compile, including fixed function and programmable cube sampling. Backend native/Wasm checks verify padded guest faces are packed in face-major, mip-minor order without padding in the GPU payload. Storage budgets include all faces, and destruction releases their complete budget. This extends the earlier one-level and stencil limitations above; partial copies, multisampling, depth readback in production and packets larger than 4 MiB remain unsupported. Actual mission acceptance remains pending.
+
+## M5 reflection and normalization follow-up
+
+All 72 generated fixtures pass actual GPU compilation and numeric checks. Signed dot mapping and specular reflection select the independently predicted negative X cube face, producing exact green RGBA. Reciprocal square root matches 1/sqrt(abs(x)) for positive and negative inputs across 1e-30 to 1e30, and returns positive infinity for both signed zeros. The infinity probe uses flat test transport to inspect the arithmetic without perspective interpolation of infinity; production varying interpolation is unchanged. Native and Wasm shader translation checks pass. These probes establish arithmetic behavior, not mission visual acceptance.
+
+## M5 border sampler follow-up
+
+All 74 generated shader fixtures compile and pass numeric GPU checks. Border sampling uses explicit texture loads with the requested ARGB border color and per-axis wrap, mirror, clamp or border indexing. Bilinear edge and corner checks independently mix a blue border with the source color. Separate red and green mip levels verify level selection and a trilinear midpoint using measured UV derivatives and biases within the supported range. Actual mission continuation reaches this state on two linearly filtered 2D textures. These tests do not establish a completed mission frame.
+
+## M5 combiner and cube budget follow-up
+
+All 77 generated shader fixtures pass numeric GPU checks. AB and CD RGB dot products broadcast the native scalar result, and their sum applies output mapping and saturation before independent alpha writes. The selected synthetic vectors produce exact RGB 208 for each dot and RGB 255 for their saturated sum.
+
+The current GPU service fixture passes 579 commands, including 210 create/destroy cycles of a six-face 256 by 256 texture. Only the three intentional negative commands report errors; shutdown reports zero resources. The stress cycle covers release of all six faces from the persistent service storage budget between guest runtime replacements. It is separate from the required actual-game restart stress and traversal evidence.
+
+## M5 final combiner and reciprocal follow-up
+
+All 87 generated shader fixtures pass actual GPU compilation and numeric checks. Final combiners support the sum register, independent inversion of its operands, optional sum clamping and the E/F product register. Eight flag combinations and a product probe match independently calculated pixel values. Ordinary reciprocal retains signed infinity for signed zero; clamped reciprocal and reciprocal square root remain independently tested.
+
+The expanded native and Wasm shader contracts pass with overflow checks enabled. Three large test-only state copies now live on the heap so the fixture stays within its original 1 MiB stack budget. Production stack and memory budgets are unchanged.
+
+## M5 rectangular clear follow-up
+
+The current public fixture passes 677 commands. It tests all seven color/depth/stencil clear combinations at both output sizes, using two rectangles that cross target bounds. Color and stencil readbacks verify changed regions and untouched neighbors; a separate depth comparison verifies retained depth outside each clear. Stencil-only and depth-only passes preserve the other aspect. The same three deliberate diagnostics are the only errors, and shutdown releases all seven cached clear pipelines and other resources to zero.
+
+The backend preserves the native viewport semantics when the caller supplies no rectangle list. It imports CPU depth/stencil before a clear that must retain any aspect or region, clips explicit rectangles per attachment, and splits differently sized color/depth attachments into independent clears. Native and Wasm rectangle transport tests pass.
+
+## M5 depth-only target follow-up
+
+The service fixture passes 695 commands with only its three deliberate errors and zero-resource shutdown. A draw with no color attachment updates depth while preserving color and stencil. All 88 generated shaders compile and pass numeric checks; an alpha-tested depth-only pass preserves depth for transparent pixels and writes it for opaque pixels.
+
+Backend native/Wasm tests cover color and depth targets whose guest byte ranges overlap, exact-base readback selection, rejection of ambiguous partial readback addresses, and unchanged GPU authority when a color readback updates overlapping CPU bookkeeping. This matches the native renderer's independent color/depth storage keys and its shadow surface with no color storage.
+
+## M5 shadow depth bias follow-up
+
+All 90 generated shader fixtures pass actual GPU compilation and numeric checks. The backend maps guest depth offset units through the native D24 integer convention and emits a normalized fragment-depth adjustment with the original slope term. Positive and negative constant/slope terms, depth clamping and alpha discard are verified in both color and depth-only passes. Derivatives are evaluated before any discard. Native and Wasm tests verify the encountered D16 offset of four maps to 1,024 D24 units with slope two.

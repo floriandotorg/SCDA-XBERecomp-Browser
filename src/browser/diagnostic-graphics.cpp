@@ -1191,6 +1191,35 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
       ctx.esp += 28;
       return false;
     }
+    if (id == 21) {
+      if (ctx.esp > UINT32_MAX - 24) { throw Fault(ctx, ctx.esp, 24, "graphics CopyRects cleanup overflow"); }
+      std::array<uint32_t, 6> frame;
+      memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+      if (frame[3] > 4096 || (frame[3] && !frame[2]) || (!frame[3] && (frame[2] || frame[5]))) {
+        throw Fault(ctx, frame[2], frame[3], "graphics CopyRects invalid rectangle list");
+      }
+      if (frame[3]) {
+        memory_->CheckRange(ctx, frame[2], size_t(frame[3]) * 16);
+        if (frame[5]) { memory_->CheckRange(ctx, frame[5], size_t(frame[3]) * 8); }
+      }
+      const auto surface = [&](uint32_t address) {
+        if (!address) { throw Fault(ctx, address, 20, "graphics CopyRects requires non-null surface headers"); }
+        std::array<uint32_t, 5> header;
+        memory_->Read(ctx, address, header.data(), sizeof(header));
+        const uint32_t type = header[0] & 0x70000;
+        if (type != 0x50000 && type != 0x40000) { throw Fault(ctx, address, 20, "graphics CopyRects requires a surface or texture header"); }
+        return gpu::Surface{address, header[1], header[3], header[4]};
+      };
+      const auto source = surface(frame[1]), destination = surface(frame[4]);
+      renderer_->Copy(source, destination, frame[3], frame[2], frame[5]);
+      const uint32_t data = 0x80000000 | (destination.data & 0x3ffffff);
+      if (renderer_->HasGpuContents(destination.data)) { gpuWritten_.insert(data); }
+      else { gpuWritten_.erase(data); }
+      Record(Request::Copy, {source.header, destination.header, frame[3], frame[2], frame[5]});
+      ctx.eax = 0;
+      ctx.esp += 24;
+      return false;
+    }
     if (id == 19 || id == 20) {
       if (ctx.esp > UINT32_MAX - 16) { throw Fault(ctx, ctx.esp, 16, "graphics draw cleanup overflow"); }
       std::array<uint32_t, 4> frame;
@@ -1351,6 +1380,8 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
   }
   Unavailable(Request::Unsupported, id, id == 4 || id == 5 ? "diagnostic graphics bounded command capture is full" :
     "diagnostic graphics SDK operation is not implemented");
+} catch (const Cancelled&) {
+  throw;
 } catch (const Fault& error) {
   if (error.context->host) { throw; }
   throw Fault(ctx, error.address, error.size, error.what());

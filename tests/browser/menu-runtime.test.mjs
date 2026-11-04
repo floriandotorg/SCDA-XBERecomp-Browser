@@ -64,6 +64,22 @@ test('guest render diagnostics reach the host without becoming validation errors
   await services.dispose();
 });
 
+test('recoverable file diagnostics stay bounded and cannot outlive the session', async () => {
+  const harness = fixture();
+  const services = await harness.start();
+  for (let n = 0; n < 40; ++n) {
+    assert.equal(services.handle({ phase: 'file-operation', fileOperation: { ordinal: 226, informationClass: n, path: 'SAVE.TMP' } }), true);
+  }
+  const records = harness.events.filter(event => event[0] === 'diagnostic');
+  assert.equal(records.at(-1)[1].guest.fileOperations.length, 32);
+  assert.equal(records.at(-1)[1].guest.fileOperations[0].informationClass, 8);
+  assert.equal(records[0][1].guest.fileOperations.length, 1);
+  harness.retire();
+  services.handle({ phase: 'file-operation', fileOperation: { ordinal: 226 } });
+  assert.equal(harness.events.filter(event => event[0] === 'diagnostic').length, 40);
+  await services.dispose();
+});
+
 test('owned Wasm abort diagnostics survive without graphics or a successful Present', async () => {
   const harness = fixture();
   const services = await harness.start();
@@ -95,5 +111,18 @@ test('validation errors identify commands and cannot report running', async () =
   assert.equal(report.code, 'WEBGPU_VALIDATION');
   assert.match(report.message, /17.*9.*invalid binding/);
   assert.equal(harness.events.some((event) => event[0] === 'presented'), false);
+  await services.dispose();
+});
+
+
+test('runtime replacement disposes the old input producer before republishing session input', async () => {
+  const harness = fixture();
+  const services = await harness.start();
+  const descriptor = { generation: 3, phase: 'input', buffer: new SharedArrayBuffer(32), byteOffset: 8, words: 2 };
+  services.handle(descriptor);
+  assert.equal(services.handle({ generation: 3, phase: 'restarting' }), true);
+  services.handle(descriptor);
+  assert.deepEqual(harness.events.filter(event => event === 'input-dispose' || event[0] === 'input')
+    .map(event => typeof event === 'string' ? event : event[0]), ['input', 'input-dispose', 'input']);
   await services.dispose();
 });

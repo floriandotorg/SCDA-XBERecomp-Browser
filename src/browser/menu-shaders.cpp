@@ -2,6 +2,7 @@
 #include "browser/menu-pixel-shaders.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <sstream>
@@ -9,7 +10,7 @@
 
 namespace browser::menu {
 
-static_assert(sizeof(ShaderConstants) == 3792);
+static_assert(sizeof(ShaderConstants) == 3824);
 static_assert(offsetof(ShaderConstants, pc) == 3504);
 static_assert(offsetof(ShaderConstants, surf) == 3072);
 static_assert(offsetof(ShaderConstants, misc) == 3088);
@@ -45,6 +46,8 @@ const char* kUniform = R"(struct Constants {
   wvp: array<vec4<f32>, 4>,
   tm: array<array<vec4<f32>, 4>, 4>,
   pc: array<vec4<f32>, 18>,
+  lod_bias: vec4<f32>,
+  depth_bias: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Constants;
 fn rowmul(p: vec4<f32>, m: array<vec4<f32>, 4>) -> vec4<f32> {
@@ -56,7 +59,123 @@ const char* kVertexHelpers = R"(fn xrcc(v: f32) -> f32 {
   let magnitude = clamp(1.0 / max(abs(v), 1.0 / 1.84467e19), 5.42101e-20, 1.84467e19);
   return select(magnitude, -magnitude, (bitcast<u32>(v) & 0x80000000u) != 0u);
 }
+fn xrcp(v: f32) -> f32 {
+  if (v == 0.0) { return bitcast<f32>(bitcast<u32>(v) | 0x7f800000u); }
+  return 1.0 / v;
+}
+fn xrsq(v: f32) -> f32 {
+  if (v == 0.0) { return bitcast<f32>((bitcast<u32>(v) & 0x7fffffffu) | 0x7f800000u); }
+  return inverseSqrt(abs(v));
+}
 )";
+
+void ReplaceAll(std::string& value, const std::string& source, const std::string& replacement) {
+  size_t offset = 0;
+  while ((offset = value.find(source, offset)) != std::string::npos) {
+    value.replace(offset, source.size(), replacement);
+    offset += replacement.size();
+  }
+}
+
+std::string ShadowSampling(const gpu::State& state, uint32_t stage, uint32_t kind) {
+  const auto& sampling = state.tss[stage];
+  const uint32_t compare = state.rs[gpu::kRsShadowFunc];
+  if (compare < 0x200 || compare > 0x207 || kind < 1 || kind > 2) {
+    throw std::invalid_argument("shadow comparison or format");
+  }
+  const std::array<std::string, 8> comparisons{"false", "depth < reference", "depth == reference", "depth <= reference",
+    "depth > reference", "depth != reference", "depth >= reference", "true"};
+  std::string code = R"(fn shadow_index@(p: i32, size: i32, mode: u32) -> i32 {
+  if (mode == 1u) { return ((p % size) + size) % size; }
+  if (mode == 2u) {
+    let value = ((p % (size * 2)) + size * 2) % (size * 2);
+    return min(value, size * 2 - 1 - value);
+  }
+  return clamp(p, 0, size - 1);
+}
+fn shadow_tap@(p: vec2<i32>, reference: f32) -> f32 {
+  let size = vec2<i32>(textureDimensions(tex@));
+  var depth = #BORDER;
+  if (!((#U == 4u && (p.x < 0 || p.x >= size.x)) || (#V == 4u && (p.y < 0 || p.y >= size.y)))) {
+    depth = textureLoad(tex@, vec2<i32>(shadow_index@(p.x, size.x, #U), shadow_index@(p.y, size.y, #V)), 0);
+  }
+  return select(0.0, 1.0, #COMPARE);
+}
+fn shadow_sample@(uv: vec2<f32>, z: f32) -> vec4<f32> {
+  let reference = clamp(z, 0.0, #MAX) / #MAX;
+  let position = uv * vec2<f32>(textureDimensions(tex@));
+  if (!#LINEAR) { return vec4<f32>(shadow_tap@(vec2<i32>(floor(position)), reference)); }
+  let center = position - vec2<f32>(0.5);
+  let origin = vec2<i32>(floor(center));
+  let weight = fract(center);
+  return vec4<f32>(mix(mix(shadow_tap@(origin, reference), shadow_tap@(origin + vec2<i32>(1, 0), reference), weight.x),
+    mix(shadow_tap@(origin + vec2<i32>(0, 1), reference), shadow_tap@(origin + vec2<i32>(1, 1), reference), weight.x), weight.y));
+}
+)";
+  ReplaceAll(code, "@", std::to_string(stage));
+  ReplaceAll(code, "#U", std::to_string(sampling[gpu::kTssAddressU]) + "u");
+  ReplaceAll(code, "#V", std::to_string(sampling[gpu::kTssAddressV]) + "u");
+  ReplaceAll(code, "#BORDER", std::to_string(float((sampling[gpu::kTssBorderColor] >> 16) & 255) / 255));
+  ReplaceAll(code, "#COMPARE", comparisons[compare - 0x200]);
+  ReplaceAll(code, "#MAX", kind == 2 ? "65535.0" : "16777215.0");
+  ReplaceAll(code, "#LINEAR", sampling[gpu::kTssMinFilter] == 2 || sampling[gpu::kTssMagFilter] == 2 ? "true" : "false");
+  return code;
+}
+
+std::string BorderSampling(const gpu::State& state, uint32_t stage) {
+  const auto& sampling = state.tss[stage];
+  const auto u = sampling[gpu::kTssAddressU], v = sampling[gpu::kTssAddressV];
+  const auto mag = sampling[gpu::kTssMagFilter], min = sampling[gpu::kTssMinFilter], mip = sampling[gpu::kTssMipFilter];
+  if (u < 1 || u > 4 || v < 1 || v > 4 || mag < 1 || mag > 2 || min < 1 || min > 2 || mip > 2) {
+    throw std::invalid_argument("border sampler state");
+  }
+  const uint32_t color = sampling[gpu::kTssBorderColor];
+  std::string code = R"(fn border_index@(p: i32, size: i32, mode: u32) -> i32 {
+  if (mode == 1u) { return ((p % size) + size) % size; }
+  if (mode == 2u) {
+    let period = size * 2;
+    let value = ((p % period) + period) % period;
+    return min(value, period - 1 - value);
+  }
+  return clamp(p, 0, size - 1);
+}
+fn border_tap@(p: vec2<i32>, level: i32) -> vec4<f32> {
+  let size = vec2<i32>(textureDimensions(tex@, level));
+  if ((#U == 4u && (p.x < 0 || p.x >= size.x)) || (#V == 4u && (p.y < 0 || p.y >= size.y))) {
+    return unpack4x8unorm(#COLOR);
+  }
+  return textureLoad(tex@, vec2<i32>(border_index@(p.x, size.x, #U), border_index@(p.y, size.y, #V)), level);
+}
+fn border_level@(uv: vec2<f32>, level: i32, linear: bool) -> vec4<f32> {
+  let position = uv * vec2<f32>(textureDimensions(tex@, level));
+  if (!linear) { return border_tap@(vec2<i32>(floor(position)), level); }
+  let center = position - vec2<f32>(0.5);
+  let origin = vec2<i32>(floor(center));
+  let weight = fract(center);
+  return mix(mix(border_tap@(origin, level), border_tap@(origin + vec2<i32>(1, 0), level), weight.x),
+    mix(border_tap@(origin + vec2<i32>(0, 1), level), border_tap@(origin + vec2<i32>(1, 1), level), weight.x), weight.y);
+}
+fn border_sample@(uv: vec2<f32>, bias: f32) -> vec4<f32> {
+  let position = uv * vec2<f32>(textureDimensions(tex@, 0));
+  let dx = dpdx(position);
+  let dy = dpdy(position);
+  let lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-30)) + bias;
+  let last = f32(textureNumLevels(tex@) - 1u);
+  let first = min(f32(#FIRST), last);
+  let level = clamp(lod, first, select(first, last, #MIP != 0u));
+  let linear = select(#MIN == 2u, #MAG == 2u, lod <= 0.0);
+  if (#MIP != 2u) { return border_level@(uv, i32(floor(level + 0.5)), linear); }
+  return mix(border_level@(uv, i32(floor(level)), linear), border_level@(uv, i32(min(floor(level) + 1.0, last)), linear), fract(level));
+}
+)";
+  ReplaceAll(code, "@", std::to_string(stage));
+  for (const auto& [name, value] : std::array<std::pair<const char*, uint32_t>, 7>{{
+      {"#U", u}, {"#V", v}, {"#MIN", min}, {"#MAG", mag}, {"#MIP", mip},
+      {"#FIRST", sampling[gpu::kTssMaxMipLevel]}, {"#COLOR", ((color >> 16) & 255) | (color & 0xff00) | ((color & 255) << 16) | (color & 0xff000000)}}}) {
+    ReplaceAll(code, name, std::to_string(value) + "u");
+  }
+  return code;
+}
 
 std::string Varyings(bool flat) {
   const std::string interpolation = flat ? " @interpolate(flat)" : "";
@@ -287,7 +406,7 @@ VertexTranslation TranslateVertex(const gpu::VertexShader& shader, uint16_t regs
       if (mac > 13) {
         throw std::invalid_argument("MAC operation " + std::to_string(mac));
       }
-      if (ilu != 0 && ilu != 1 && ilu != 3) {
+      if (ilu > 4) {
         throw std::invalid_argument("ILU operation " + std::to_string(ilu));
       }
       const auto source = [&](int which) { return ProgramSource(k, which, regs); };
@@ -300,7 +419,7 @@ VertexTranslation TranslateVertex(const gpu::VertexShader& shader, uint16_t regs
       }
       if (ilu) {
         const auto c = source(2);
-        out.body += "    let ir = " + (ilu == 3 ? "vec4<f32>(xrcc(" + c + ".x))" : c) + ";\n";
+        out.body += "    let ir = " + (ilu >= 2 ? "vec4<f32>(" + std::string(ilu == 2 ? "xrcp(" : ilu == 3 ? "xrcc(" : "xrsq(") + c + ".x))" : c) + ";\n";
       }
       const auto reg = k.Field(3, 20, 4);
       if (mac == 13) {
@@ -381,6 +500,7 @@ ShaderConstants BuildConstants(const gpu::State& s, uint32_t width, uint32_t hei
       c.texsize[n][1] = 1;
     }
     c.tm[n] = s.transforms[16 + n];
+    c.lod_bias[n] = std::bit_cast<float>(s.tss[n][gpu::kTssMipLodBias]);
   }
   const auto& v = s.viewport;
   const Matrix viewport{float(v.w) / width, 0, 0, 0, 0, float(v.h) / height, 0, 0, 0, 0, v.max_z - v.min_z, 0,
@@ -390,7 +510,7 @@ ShaderConstants BuildConstants(const gpu::State& s, uint32_t width, uint32_t hei
 }
 
 ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransformed,
-  const gpu::TexInfo (&textures)[4], uint64_t decode) {
+  const gpu::TexInfo (&textures)[4], uint64_t decode, bool colorTarget, bool depthBias) {
   const gpu::PixelKey key = gpu::MakePixelKey(s, textures);
   const gpu::FixedKey fixed = gpu::MakeFixedKey(s);
   ShaderResult result;
@@ -462,10 +582,10 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     if (f[8] != 1 && f[8] != 5 && f[8] != 0) {
       return reject("stage " + std::to_string(n) + " result argument " + std::to_string(f[8]));
     }
-    if (textures[n].kind != gpu::kTexNone && textures[n].kind != gpu::kTex2D) {
+    if (textures[n].kind != gpu::kTexNone && textures[n].kind != gpu::kTex2D && textures[n].kind != gpu::kTexCube) {
       return reject("stage " + std::to_string(n) + " texture dimensionality");
     }
-    if (textures[n].shadow || textures[n].flags) {
+    if (textures[n].shadow > 2 || textures[n].flags) {
       return reject("stage " + std::to_string(n) + " shadow or HDR texture flags");
     }
     if (s.tss[n][gpu::kTssColorKeyOp] || s.tss[n][gpu::kTssColorSign]) {
@@ -536,10 +656,23 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
   fragment += Varyings(key.flat);
   for (int n = 0; n < 4; ++n) {
     const auto name = std::to_string(n);
-    fragment += "@group(0) @binding(" + std::to_string(1 + n * 2) + ") var tex" + name + ": texture_2d<f32>;\n";
+    fragment += "@group(0) @binding(" + std::to_string(1 + n * 2) + ") var tex" + name + (textures[n].shadow ? ": texture_depth_2d;\n" : textures[n].kind == gpu::kTexCube ? ": texture_cube<f32>;\n" : ": texture_2d<f32>;\n");
     fragment += "@group(0) @binding(" + std::to_string(2 + n * 2) + ") var smp" + name + ": sampler;\n";
   }
-  fragment += "@fragment fn fs_main(i: VOut) -> @location(0) vec4<f32> {\n";
+  for (uint32_t n = 0; n < 4; ++n) {
+    if (textures[n].shadow) { fragment += ShadowSampling(s, n, textures[n].shadow); }
+    else if (textures[n].kind == gpu::kTex2D && (s.tss[n][gpu::kTssAddressU] == 4 || s.tss[n][gpu::kTssAddressV] == 4)) {
+      fragment += BorderSampling(s, n);
+    }
+  }
+  if (depthBias) {
+    fragment += "struct FragmentOutput {\n";
+    if (colorTarget) { fragment += "  @location(0) color: vec4<f32>,\n"; }
+    fragment += "  @builtin(frag_depth) depth: f32,\n}\n@fragment fn fs_main(i: VOut) -> FragmentOutput {\n";
+    fragment += "  let biased_depth = clamp(i.pos.z + u.depth_bias.x + max(abs(dpdx(i.pos.z)), abs(dpdy(i.pos.z))) * u.depth_bias.y, 0.0, 1.0);\n";
+  } else {
+    fragment += colorTarget ? "@fragment fn fs_main(i: VOut) -> @location(0) vec4<f32> {\n" : "@fragment fn fs_main(i: VOut) {\n";
+  }
   if (key.programmable) {
     fragment += pixel.body;
   } else {
@@ -551,15 +684,21 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
       break;
     }
     const auto name = std::to_string(n);
-    std::string uv = "i.t" + name + ".xy";
+    std::string uv = "i.t" + name + (textures[n].kind == gpu::kTexCube ? ".xyz" : ".xy");
     if (key.proj & (1u << n)) {
       uv = "(" + uv + " / i.t" + name + ".w)";
     }
     if (textures[n].rect) {
       uv += " / u.texsize[" + name + "].xy";
     }
-    uv += " + u.texsize[" + name + "].zw";
-    fragment += "  let t" + name + " = " + (textures[n].kind == gpu::kTex2D ? "textureSample(tex" + name + ", smp" + name + ", " + uv + ")" : "vec4<f32>(1.0)") + ";\n";
+    if (textures[n].kind != gpu::kTexCube) { uv += " + u.texsize[" + name + "].zw"; }
+    if (textures[n].shadow) {
+      auto coordinate = "(i.t" + name + ".xy / i.t" + name + ".w)";
+      if (textures[n].rect) { coordinate += " / u.texsize[" + name + "].xy"; }
+      fragment += "  let t" + name + " = shadow_sample" + name + "(" + coordinate + " + u.texsize[" + name + "].zw, i.t" + name + ".z / i.t" + name + ".w);\n";
+    } else {
+      fragment += "  let t" + name + " = " + (textures[n].kind != gpu::kTexNone ? "textureSampleBias(tex" + name + ", smp" + name + ", " + uv + ", u.lod_bias[" + name + "])" : "vec4<f32>(1.0)") + ";\n";
+    }
     if (key.alphakill & (1u << n)) {
       fragment += "  if (t" + name + ".a == 0.0) { discard; }\n";
     }
@@ -575,7 +714,18 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     fragment += "  let v = floor(outc.a * 255.0 + 0.5);\n  let r = u.misc.x;\n  let f = u32(u.misc.y);\n";
     fragment += "  let ok = (f == 1u && v < r) || (f == 2u && v == r) || (f == 3u && v <= r) || (f == 4u && v > r) || (f == 5u && v != r) || (f == 6u && v >= r) || f == 7u;\n  if (!ok) { discard; }\n";
   }
-  fragment += "  return outc;\n}\n";
+  if (depthBias) {
+    fragment += "  var result: FragmentOutput;\n";
+    if (colorTarget) { fragment += "  result.color = outc;\n"; }
+    fragment += "  result.depth = biased_depth;\n  return result;\n";
+  } else if (colorTarget) { fragment += "  return outc;\n"; }
+  fragment += "}\n";
+  for (uint32_t n = 0; n < 4; ++n) {
+    if (textures[n].kind == gpu::kTex2D && (s.tss[n][gpu::kTssAddressU] == 4 || s.tss[n][gpu::kTssAddressV] == 4)) {
+      const auto name = std::to_string(n);
+      ReplaceAll(fragment, "textureSampleBias(tex" + name + ", smp" + name + ",", "border_sample" + name + "(");
+    }
+  }
   result.vertex = std::move(vertex);
   result.fragment = std::move(fragment);
   result.supported = true;

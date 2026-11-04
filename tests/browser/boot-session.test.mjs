@@ -65,6 +65,24 @@ const executedFixture = () => {
   return result;
 };
 
+test('recoverable file operation diagnostics retain generation ownership', async () => {
+  const { options, data, module } = executedFixture();
+  const progress = [];
+  options.onProgress = message => progress.push(message);
+  let report;
+  const operation = { ordinal: 226, informationClass: 20, length: 8, status: 0xc00000bb, path: 'CACHE\\SAVE.TMP' };
+  options.create = async ({ onFileOperation }) => {
+    report = onFileOperation;
+    module._image_execute = () => { report(operation); return 1; };
+    return module;
+  };
+  await createBootSession(options)({ data });
+  assert.deepEqual(progress.find(message => message.phase === 'file-operation'), { generation: 1, phase: 'file-operation', fileOperation: operation });
+  const count = progress.length;
+  report(operation);
+  assert.equal(progress.length, count);
+});
+
 test('caught guest faults preserve bounded stderr without changing the guest error', async () => {
   const { options, data, module, messages } = executedFixture();
   options.create = async ({ printErr }) => {
@@ -695,4 +713,64 @@ test('retirement during thread session snapshot suppresses guest results', async
   assert.equal(messages[0].code, 'CANCELLED');
   assert.equal(messages[0].threadSession, undefined);
   assert.equal(reads, 1);
+});
+
+
+test('story reboots replace runtime state before publishing fresh input and progress descriptors', async () => {
+  const { options, data, module, messages, calls } = executedFixture();
+  let executions = 0;
+  module._image_execute = () => { ++executions; calls.push('execute'); return executions === 3 ? 1 : 0; };
+  module._image_can_restart = () => executions < 3 ? 1 : 0;
+  module._image_restart = () => { calls.push('restart'); return 1; };
+  options.onProgress = message => calls.push(message.phase);
+  await createBootSession(options)({ data });
+  assert.equal(executions, 3);
+  assert.deepEqual(calls.filter(value => ['execute', 'restart', 'progress'].includes(value)),
+    ['progress', 'execute', 'restart', 'progress', 'execute', 'restart', 'progress', 'execute']);
+  assert.equal(messages[0].code, 'ENTRY_RETURNED');
+});
+
+test('failed story reboot leaves a named recoverable failure and does not execute a second guest', async () => {
+  const { options, data, module, messages, calls } = executedFixture();
+  module._image_execute = () => { calls.push('execute'); return 0; };
+  module._image_can_restart = () => 1;
+  module._image_restart = () => 0;
+  await createBootSession(options)({ data });
+  assert.equal(messages[0].code, 'STORY_RESTART');
+  assert.equal(calls.filter(value => value === 'execute').length, 1);
+});
+
+test('mission telemetry publishes its complete nonoverlapping shared span', async () => {
+  for (const [offset, words, valid] of [[128, 42, true], [128, 37, false], [116, 42, false], [360, 42, false], [380, 42, false]]) {
+    const { options, data, module, messages } = executedFixture();
+    const heap = new Uint8Array(new SharedArrayBuffer(512));
+    heap.set(module.HEAPU8);
+    module.HEAPU8 = heap;
+    module._image_input_address = () => 112;
+    module._image_input_words = () => 2;
+    module._image_motion_address = () => 400;
+    module._image_metrics_address = () => offset;
+    module._image_metrics_words = () => words;
+    let executions = 0;
+    module._image_execute = () => { ++executions; return 1; };
+    const progress = [];
+    options.onProgress = message => progress.push(message);
+    await createBootSession(options)({ data });
+    assert.equal(executions, valid ? 1 : 0);
+    if (valid) {
+      assert.equal(progress.find(message => message.phase === 'input').metricsOffset, offset);
+    } else { assert.equal(messages[0].code, 'INPUT_PROTOCOL'); }
+  }
+});
+
+test('mission graphics diagnostics retain their bounded renderer residency without changing menu limits', async () => {
+  for (const mission of [false, true]) {
+    const { options, data, module, messages } = executedFixture();
+    module._image_graphics_rendering = () => 1;
+    module._image_metrics_words = () => mission ? 42 : 0;
+    module._image_renderer_info = field => [2, 3, 128 * 1024 * 1024, 0, 12, 0, 11, 0, 7, 0][field];
+    await createBootSession(options)({ data });
+    assert.equal(messages[0].code === 'GRAPHICS_PROTOCOL', !mission);
+    if (mission) { assert.equal(messages[0].graphics.residentBytes, String(128 * 1024 * 1024)); }
+  }
 });

@@ -49,10 +49,10 @@ const fixture = () => {
 test('real inventory binds mode, flags, actual binary and helper sources without output hash cycles', () => {
   const files = fixture();
   const config = 'Release;story=OFF;full-cpu=OFF;boot=ON;menu-capture=OFF;menu=ON';
-  const inventory = (mode, name, { trusted = true, tool = files.tool } = {}) => {
+  const inventory = (mode, name, { trusted = true, tool = files.tool, features = '' } = {}) => {
     const output = join(files.root, name);
     mkdirSync(output, { recursive: true });
-    const result = spawnSync(process.execPath, ['tools/browser/inventory.mjs', files.root, output, 'emcc 6.0.13-git', `${config};actual-tail-calls=${mode}`, trusted ? join(files.root, 'record.json') : '', tool], { encoding: 'utf8' });
+    const result = spawnSync(process.execPath, ['tools/browser/inventory.mjs', files.root, output, 'emcc 6.0.13-git', `${config};actual-tail-calls=${mode}${features}`, trusted ? join(files.root, 'record.json') : '', tool], { encoding: 'utf8' });
     return { result, output, manifest: result.status === 0 ? JSON.parse(readFileSync(join(output, 'input-manifest.json'), 'utf8')) : undefined };
   };
   const off = inventory('OFF', 'off', { tool: '/missing/ignored-optimizer' });
@@ -73,6 +73,15 @@ test('real inventory binds mode, flags, actual binary and helper sources without
     assert.ok(on.manifest.inputs[path]);
   }
   assert.equal(Object.keys(on.manifest.inputs).some((path) => /story_boot\.wasm|boot-manifest|wasm-postlink/.test(path)), false);
+  const simd = inventory('ON', 'simd', { features: ';mission=ON;wasm-simd=ON' });
+  assert.equal(simd.result.status, 0, simd.result.stderr);
+  assert.deepEqual(simd.manifest.wasmRequirements, ['tail-call', 'simd128']);
+  assert.deepEqual(simd.manifest.wasmOptimization.flags, [...tailCallFlags, '--enable-simd']);
+  assert.equal(simd.manifest.wasmOptimization.simd, true);
+  assert.notEqual(simd.manifest.identity, on.manifest.identity);
+  const simdOnly = inventory('OFF', 'simd-only', { features: ';mission=ON;wasm-simd=ON' });
+  assert.deepEqual(simdOnly.manifest.wasmRequirements, ['simd128']);
+  assert.notEqual(inventory('ON', 'simd-without-mission', { features: ';wasm-simd=ON' }).result.status, 0);
   const privateConfig = JSON.parse(readFileSync(join(on.output, 'wasm-postlink.json'), 'utf8'));
   assert.equal(privateConfig.tool, files.tool);
   const deployed = awaitManifest(join(on.output, 'boot-manifest.mjs'));

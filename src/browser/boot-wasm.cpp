@@ -11,18 +11,26 @@
 #include "browser/string-provider.h"
 #include "browser/section-provider.h"
 #include "browser/file-provider.h"
+#include "browser/raw-cache.h"
+#include <algorithm>
 #include "browser/sdk-provider.h"
 #include "browser/diagnostic-graphics.h"
 #include "browser/silent-audio.h"
 #include "browser/audio-provider.h"
 #include "build_identity.h"
 #include <emscripten.h>
+#include <emscripten/heap.h>
 #include <array>
 #include <bit>
 #include <mutex>
 #include <optional>
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
 #include "browser/menu-input.h"
+#ifdef BROWSER_MISSION
+#include "browser/mission-input.h"
+#include "browser/mission-clock.h"
+#include <thread>
+#endif
 #include "browser/av-provider.h"
 #include "browser/delay-provider.h"
 #include "browser/menu-launch.h"
@@ -43,7 +51,32 @@ constexpr size_t worker_capacity = 2;
 constexpr auto graphics_mode = browser::GraphicsMode::Checkpoint;
 constexpr size_t worker_capacity = 2;
 #endif
+struct StoryState {
+#ifdef BROWSER_MISSION
+  std::array<std::atomic<uint32_t>, 42> metrics{};
+  std::shared_ptr<browser::MissionInput::SharedStorage> motion = std::make_shared<browser::MissionInput::SharedStorage>();
+#endif
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+  std::shared_ptr<browser::MenuInput::SharedStorage> input = std::make_shared<browser::MenuInput::SharedStorage>();
+#endif
+  std::shared_ptr<browser::TemporaryFilesystem> profile = std::make_shared<browser::TemporaryFilesystem>(32u << 20);
+  std::shared_ptr<browser::RawCache> cache = std::make_shared<browser::RawCache>();
+  std::optional<std::array<uint8_t, 4096>> launchPage;
+  std::optional<browser::DiagnosticGraphics::PersistedDisplay> display;
+  std::array<uint8_t, 16> driveKey{};
+  std::array<uint8_t, 21> serial{};
+  bool initialized = false;
+  uint32_t restarts = 0;
+};
 struct Session {
+#ifdef BROWSER_MISSION
+  std::mutex simulationMutex;
+  std::array<uint32_t, 4> simulation{};
+  uint32_t simulationLevel = 0;
+#endif
+  std::shared_ptr<StoryState> story;
+  browser::ContiguousMemoryAccess restoredAllocations;
+  uint32_t savedDisplay = 0;
   browser::Runtime runtime;
   std::unique_ptr<browser::PreparedImage> image;
   std::vector<browser::KernelDataExport> dataExports;
@@ -77,8 +110,37 @@ struct Session {
   bool graphicsCheckpoint = false;
   std::string faultMessage;
   uint32_t faultAddress = 0;
-  Session(std::vector<uint8_t> bytes, std::span<const X86FuncMapping> mappings, std::span<const uint32_t> continuations)
-    : runtime(mappings, continuations, {}, worker_capacity), image(browser::PrepareImage(std::move(bytes), {X86ImageBase, X86ImageEnd, X86EntryPoint})) {
+#ifdef BROWSER_MISSION
+  std::shared_ptr<browser::MissionInput> missionControls;
+#endif
+  Session(std::vector<uint8_t> bytes, std::span<const X86FuncMapping> mappings, std::span<const uint32_t> continuations, std::shared_ptr<StoryState> state = {})
+      : story(std::move(state)), runtime(mappings, continuations,
+#ifdef BROWSER_MISSION
+      [this, origin = browser::MissionClock::HostOrigin(), clock = browser::MissionClock{}, sample = std::optional<uint64_t>{}]() mutable {
+        for (;;) {
+          while ((*story->motion)[2].load(std::memory_order_acquire)) {
+            runtime.Checkpoint({});
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+          thread_local double queried = -1;
+          const double local = emscripten_get_now();
+          if (sample && local >= queried && local - queried < 1) { return *sample; }
+          const uint32_t inactive = (*story->motion)[4].load(std::memory_order_acquire);
+          const double milliseconds = browser::MissionClock::HostMilliseconds(origin);
+          if (!(milliseconds >= 0 && milliseconds < double(UINT32_MAX))) { throw std::runtime_error("mission host timer is out of range"); }
+          const bool paused = (*story->motion)[2].load(std::memory_order_acquire);
+          const uint32_t inactiveAfter = (*story->motion)[4].load(std::memory_order_acquire);
+          const auto observed = clock.Observe(uint64_t(milliseconds), inactive, paused, inactiveAfter);
+          if (!observed) { continue; }
+          queried = local;
+          sample = *observed;
+          return *sample;
+        }
+      },
+#else
+      {},
+#endif
+      worker_capacity), image(browser::PrepareImage(std::move(bytes), {X86ImageBase, X86ImageEnd, X86EntryPoint})) {
     if (!runtime.Find(X86EntryPoint)) { throw std::runtime_error("generated entry body is absent"); }
     browser::InstallSectionProvider(runtime, *image);
     browser::InstallKernelProvider(runtime, *image->memory);
@@ -86,7 +148,17 @@ struct Session {
     browser::ContiguousMemoryAccess contiguousAccess;
     browser::InstallContiguousMemory(runtime, *image->memory, &contiguousUsage, &contiguousAccess);
 #ifdef BROWSER_MENU
-    auto backend = std::make_unique<browser::MenuBackend>(runtime, *image, std::make_shared<browser::webgpu::Transport>());
+    restoredAllocations = contiguousAccess;
+    browser::MenuBackendLimits rendererLimits;
+#ifdef BROWSER_MISSION
+    rendererLimits.maxResidentBytes = 128u << 20;
+    rendererLimits.batchDraws = true;
+    rendererLimits.compactVertices = true;
+    rendererLimits.indexedVertices = true;
+    rendererLimits.maxVertices = 65536;
+    rendererLimits.maxExpandedVertices = 196608;
+#endif
+    auto backend = std::make_unique<browser::MenuBackend>(runtime, *image, std::make_shared<browser::webgpu::Transport>(), rendererLimits);
     renderer = backend.get();
     graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), graphics_mode, std::move(backend));
     graphics->ConfigurePresentCheckpoint(BROWSER_MENU_TRACE_FRAMES);
@@ -96,6 +168,13 @@ struct Session {
     browser::InstallVirtualMemory(runtime, *image, std::move(contiguousUsage));
     browser::InstallStringProvider(runtime, *image);
     std::function<void(browser::FileOpenDiagnostic)> reportFileOpen;
+    std::function<void(browser::FileOperationDiagnostic)> reportFileOperation;
+#ifdef BROWSER_MISSION
+    reportFileOperation = [](browser::FileOperationDiagnostic operation) {
+      MAIN_THREAD_EM_ASM({ Module.onFileOperation?.({ ordinal: $0 >>> 0, informationClass: $1 >>> 0, status: $2 >>> 0, length: $3 >>> 0, path: UTF8ToString($4) }); },
+        operation.ordinal, operation.informationClass, operation.status, operation.length, operation.path.c_str());
+    };
+#endif
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
     reportFileOpen = [this](browser::FileOpenDiagnostic diagnostic) {
       std::lock_guard lock(fileOpensMutex);
@@ -107,10 +186,42 @@ struct Session {
     const auto mountedDisc = browser::MountedIsoDisc();
     std::shared_ptr<browser::TemporaryFilesystem> profileStorage;
 #ifdef BROWSER_MENU
-    profileStorage = std::make_shared<browser::TemporaryFilesystem>(32u << 20);
+    profileStorage = story ? story->profile : std::make_shared<browser::TemporaryFilesystem>(32u << 20);
 #endif
     auto fileCloser = browser::InstallFileProvider(runtime, *image, mountedDisc, std::move(profileStorage), &dataExports, &snapshotDiscReads,
-      std::move(reportFileOpen), &synchronizationRoutes->ownsFile);
+      std::move(reportFileOpen), &synchronizationRoutes->ownsFile, story ? story->cache : nullptr, std::move(reportFileOperation),
+#ifdef BROWSER_MISSION
+      4u << 20
+#else
+      1u << 20
+#endif
+    );
+#ifdef BROWSER_MISSION
+    renderer->SetMetricsSink([this](const auto& frame) {
+      const auto reads = snapshotDiscReads();
+      const auto bounded = [](uint64_t value) { return uint32_t(std::min<uint64_t>(value, UINT32_MAX)); };
+      std::array<uint32_t, 4> sampledSimulation;
+      { std::lock_guard lock(simulationMutex); sampledSimulation = simulation; }
+      auto& metrics = story->metrics;
+      metrics[0].fetch_add(1, std::memory_order_acq_rel);
+      const auto threads = browser::SnapshotThreadSession(*image);
+      const auto audio = audioProvider->Snapshot();
+      const auto stepping = missionControls ? missionControls->SnapshotSteps() : browser::MissionInput::StepSnapshot{};
+      const auto& inventory = frame.inventory;
+      const std::array<uint32_t, 41> values{bounded(emscripten_get_heap_size()), bounded(image->memory->BackingBytes()),
+        bounded(runtime.ActiveWorkers()), frame.residentBytes, frame.resources, frame.pipelines, bounded(frame.frames),
+        bounded(frame.commandWaitMicroseconds), bounded(frame.readbackWaitMicroseconds), bounded(frame.uploadWaitMicroseconds),
+        bounded(frame.drawWaitMicroseconds), bounded(reads.assetBytes), bounded(reads.assetOperations), bounded(reads.waitMicroseconds),
+        (*story->motion)[4].load(), story->restarts, threads.childrenCreated - std::min(threads.childrenCreated, threads.handlesClosed),
+        threads.objectReferences, inventory.macMask, inventory.iluMask, inventory.textureModes, inventory.paths,
+        inventory.formats[0], inventory.formats[1], inventory.formats[2], inventory.formats[3],
+        inventory.formats[4], inventory.formats[5], inventory.formats[6], inventory.formats[7],
+        sampledSimulation[0], sampledSimulation[1], sampledSimulation[2], sampledSimulation[3], audio.voices, audio.voiceLimitRejections,
+        bounded(stepping.steps), bounded(stepping.skippedDraws), bounded(stepping.updateMicroseconds), bounded(stepping.renderMicroseconds), bounded(stepping.backlogTicks / 10)};
+      for (uint32_t n = 0; n < values.size(); ++n) { metrics[n + 1].store(values[n], std::memory_order_relaxed); }
+      metrics[0].fetch_add(1, std::memory_order_release);
+    });
+#endif
     auto synchronizationCloser = browser::InstallSynchronizationProvider(runtime, *image, synchronizationRoutes);
     dataExports.push_back(browser::InstallThreadProvider(runtime, *image, [fileCloser, synchronizationCloser](uint32_t handle) {
       return fileCloser(handle) || synchronizationCloser(handle);
@@ -124,6 +235,16 @@ struct Session {
     const auto platform = browser::InstallPlatformProfile(runtime, *image);
     dataExports.insert(dataExports.end(), platform.begin(), platform.end());
     dataExports.push_back(browser::InstallSignatureKey(runtime, *image));
+    if (story) {
+      if (story->initialized) {
+        image->memory->Write({}, 0xc0003000, story->driveKey.data(), story->driveKey.size());
+        image->memory->Write({}, 0xc000003c, story->serial.data(), story->serial.size());
+      } else {
+        image->memory->Read({}, 0xc0003000, story->driveKey.data(), story->driveKey.size());
+        image->memory->Read({}, 0xc000003c, story->serial.data(), story->serial.size());
+        story->initialized = true;
+      }
+    }
     audioProvider = browser::InstallAudioProvider(runtime, *image, silentAudio, mountedDisc);
     browser::InstallTimerClockObserver(runtime, *image, timers,
       [sink = silentAudio, provider = audioProvider](const X86Context& context, uint64_t now) {
@@ -131,19 +252,56 @@ struct Session {
         provider->Tick(context, now);
       });
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
-    browser::InstallAvProvider(runtime, *image->memory);
+    browser::InstallAvProvider(runtime, *image->memory, [this] { return savedDisplay; });
     browser::InstallDelayProvider(runtime);
-    input = std::make_shared<browser::MenuInput>(runtime, *image);
-    launcher = std::make_shared<browser::MenuLaunch>(runtime, *image);
+    input = std::make_shared<browser::MenuInput>(runtime, *image, story ? story->input : nullptr);
+    launcher = std::make_shared<browser::MenuLaunch>(runtime, *image, bool(story));
+    if (story) {
+      const auto cell = std::find_if(dataExports.begin(), dataExports.end(), [](const auto& item) { return item.ordinal == 164; });
+      if (cell == dataExports.end()) { throw std::runtime_error("story restart requires LaunchDataPage"); }
+      launcher->InstallFirmware(cell->address);
+    }
     route = std::make_shared<browser::MenuRoute>(runtime, *image);
     missionObserver = std::make_shared<browser::MenuMissionObservation>(runtime, *image);
     runtime.InstallInvocationObserver(*image->memory, [observer = missionObserver](const X86Context& ctx, uint8_t* base, uint32_t target, uint64_t workerId) {
       observer->Observe(ctx, base, target, workerId);
     });
-    sdkObserver = browser::InstallSdkProvider(runtime, *image, browser::SdkPolicy::UnavailableXNet, graphics, input, launcher, route, audioProvider);
+    std::shared_ptr<browser::SdkGraphics> controls = input;
+#ifdef BROWSER_MISSION
+    missionControls = std::make_shared<browser::MissionInput>(runtime, *image, input, story->motion, [this](const auto& sample) {
+      std::lock_guard lock(simulationMutex);
+      if (simulationLevel != sample.level || (simulation[0] && sample.seconds < std::bit_cast<float>(simulation[1]))) {
+        simulationLevel = sample.level;
+        if (simulation[3] != UINT32_MAX) { ++simulation[3]; }
+      }
+      if (simulation[0] != UINT32_MAX) { ++simulation[0]; }
+      simulation[1] = std::bit_cast<uint32_t>(sample.seconds);
+      simulation[2] = std::bit_cast<uint32_t>(sample.deltaSeconds);
+    });
+    controls = missionControls;
+#endif
+    sdkObserver = browser::InstallSdkProvider(runtime, *image, browser::SdkPolicy::UnavailableXNet, graphics, controls, launcher, route, audioProvider);
 #else
     sdkObserver = browser::InstallSdkProvider(runtime, *image, browser::SdkPolicy::UnavailableXNet, graphics, {}, {}, {}, audioProvider);
 #endif
+  }
+  void Restore(X86Context& context) {
+    if (!story || !story->launchPage) { return; }
+    const auto allocate = [&](uint32_t bytes) {
+      const uint32_t address = restoredAllocations.allocate(context, bytes, 4096);
+      if (!address) { throw browser::Fault(context, 0, bytes, "story restart exhausted contiguous storage"); }
+      return address;
+    };
+    const auto page = allocate(4096);
+    image->memory->Write(context, page, story->launchPage->data(), 4096);
+    image->memory->Write(context, 0xc0000010, &page, 4);
+    if (story->display) {
+      const auto& display = *story->display;
+      savedDisplay = allocate(uint32_t(display.pixels.size()) + 64);
+      const std::array<uint32_t, 5> header = {(display.common & 0xffff0000) | 1u, (savedDisplay + 64) & 0x1fffffffu, 0, display.format, display.size};
+      image->memory->Write(context, savedDisplay, header.data(), sizeof(header));
+      image->memory->Write(context, savedDisplay + 64, display.pixels.data(), display.pixels.size());
+    }
   }
   ~Session() {
     runtime.Stop();
@@ -186,7 +344,11 @@ EMSCRIPTEN_KEEPALIVE int image_prepare(uint32_t base, uint32_t end, uint32_t ent
     size_t continuationCount = 0;
     while (X86Continuations[continuationCount]) { ++continuationCount; }
     session = std::make_unique<Session>(std::move(input),
-      std::span(X86FuncMappings, mappingCount), std::span(X86Continuations, continuationCount));
+      std::span(X86FuncMappings, mappingCount), std::span(X86Continuations, continuationCount)
+#ifdef BROWSER_MISSION
+      , std::make_shared<StoryState>()
+#endif
+      );
     return 1;
   } catch (const std::runtime_error&) {
     return 0;
@@ -210,7 +372,7 @@ EMSCRIPTEN_KEEPALIVE int image_execute() {
   faultOrdinal = 0;
   session->graphicsCheckpoint = false;
   try {
-    browser::ExecuteImageEntry(*session->image, session->runtime, session->execution);
+    browser::ExecuteImageEntry(*session->image, session->runtime, session->execution, [](X86Context& context) { session->Restore(context); });
     session->threadSession = browser::SnapshotThreadSession(*session->image);
     session->kernelTrace = session->runtime.SnapshotKernelTrace();
     session->sdkTrace = session->sdkObserver->Snapshot();
@@ -245,6 +407,11 @@ EMSCRIPTEN_KEEPALIVE int image_execute() {
   session->kernelTrace = session->runtime.SnapshotKernelTrace();
   session->sdkTrace = session->sdkObserver->Snapshot();
   session->discReads = session->snapshotDiscReads();
+#ifdef BROWSER_MISSION
+  if (!session->launchRequest && !session->graphicsCheckpoint && !session->discReads.lastPath.empty()) {
+    session->faultMessage += " Last ISO read: " + session->discReads.lastPath + " offset=" + std::to_string(session->discReads.lastOffset) + " bytes=" + std::to_string(session->discReads.lastBytes) + ".";
+  }
+#endif
   session->graphicsTrace = session->graphics->Snapshot();
   session->audioTrace = session->silentAudio->Snapshot();
   session->audioProviderTrace = session->audioProvider->Snapshot();
@@ -252,6 +419,53 @@ EMSCRIPTEN_KEEPALIVE int image_execute() {
   session->missionTrace = session->missionObserver->Snapshot();
 #endif
   return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t image_restart_count() {
+  return session && session->story ? session->story->restarts : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int image_can_restart() {
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+  return session && session->story && session->launchRequest && session->launchRequest->page ? 1 : 0;
+#else
+  return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE int image_restart() {
+#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
+  if (!image_can_restart() || session->runtime.ActiveWorkers()) { return 0; }
+  auto state = session->story;
+  if (state->restarts == UINT32_MAX) { return 0; }
+  state->launchPage = session->launchRequest->page;
+  state->display = session->graphics->PersistedDisplaySnapshot();
+  auto bytes = session->image->image.file;
+  const auto declarations = session->image->diagnosticImports;
+  size_t mappingCount = 0, continuationCount = 0;
+  while (X86FuncMappings[mappingCount].host) { ++mappingCount; }
+  while (X86Continuations[continuationCount]) { ++continuationCount; }
+  try {
+#ifdef BROWSER_MENU
+    session->renderer->Retire();
+#endif
+    session.reset();
+    session = std::make_unique<Session>(std::move(bytes), std::span(X86FuncMappings, mappingCount),
+      std::span(X86Continuations, continuationCount), state);
+    for (const auto& item : declarations) {
+      browser::DeclareDiagnosticImport(*session->image, session->runtime, item.ordinal, item.kind == browser::ImportKind::DataGuard);
+    }
+    session->coverage = browser::InspectImageImports(*session->image, session->runtime, session->dataExports);
+    browser::BindImageImports(*session->image, session->runtime, session->dataExports);
+    ++state->restarts;
+    return 1;
+  } catch (...) {
+    session.reset();
+    return 0;
+  }
+#else
+  return 0;
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE const std::atomic<uint32_t>* image_progress_address() {
@@ -322,9 +536,31 @@ EMSCRIPTEN_KEEPALIVE uint32_t image_audio_info(uint32_t field) {
 }
 EMSCRIPTEN_KEEPALIVE uintptr_t image_input_address() {
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
-  if (!session || !session->input || (publishedInputStorage && publishedInputStorage != session->input)) { return 0; }
+  if (!session || !session->input || (publishedInputStorage && publishedInputStorage != session->input &&
+      publishedInputStorage->SharedAddress() != session->input->SharedAddress())) { return 0; }
   publishedInputStorage = session->input;
   return reinterpret_cast<uintptr_t>(publishedInputStorage->SharedAddress());
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_metrics_words() {
+#ifdef BROWSER_MISSION
+  return session && session->story ? uint32_t(session->story->metrics.size()) : 0;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uintptr_t image_metrics_address() {
+#ifdef BROWSER_MISSION
+  return session && session->story ? reinterpret_cast<uintptr_t>(session->story->metrics.data()) : 0;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uintptr_t image_motion_address() {
+#ifdef BROWSER_MISSION
+  return session && session->story ? reinterpret_cast<uintptr_t>(session->story->motion->data()) : 0;
 #else
   return 0;
 #endif

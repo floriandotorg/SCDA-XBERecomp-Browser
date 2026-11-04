@@ -167,13 +167,12 @@ const auto contracts = [] {
   check(readWord(memory, ctx, output) == sentinel, "handle capacity rejects before creating a semaphore");
   for (const auto handle : capacity) { handles.Close(handle); }
   handles.Close(alias);
-  const auto retained = handles.CreateMutant(4);
-  handles.Close(retained);
+  const auto retained = dispatcher.CreateMutant(4);
   for (auto& handle : capacity) { handle = handles.CreateEvent(false, false); }
   reject(193, {output, 0, 1, 2});
   check(readWord(memory, ctx, output) == sentinel, "object capacity failure preserves output with an available handle slot");
   for (const auto handle : capacity) { handles.Close(handle); }
-  check(handles.AbandonOwner(4) == 1, "explicit cleanup retires the closed capacity fixture owner");
+  dispatcher.Destroy(retained);
   handles.Close(semaphore);
   reject(222, {alias, 1, output});
   check(handles.ActiveHandles() == 0 && dispatcher.ActiveObjects() == 0, "semaphore contracts retire all state");

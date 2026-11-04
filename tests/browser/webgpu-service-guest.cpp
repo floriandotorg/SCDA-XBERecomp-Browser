@@ -1,4 +1,5 @@
 #include "browser/webgpu-transport.h"
+#include "browser/mission-clock.h"
 #include <emscripten.h>
 #include <pthread.h>
 
@@ -8,6 +9,19 @@ browser::webgpu::Result result;
 uint32_t unbound = 0;
 }
 extern "C" {
+EMSCRIPTEN_KEEPALIVE uint32_t gpu_clock_probe() {
+  struct Probe { double origin, time; } probe{browser::MissionClock::HostOrigin(), 0};
+  const double before = browser::MissionClock::HostMilliseconds(probe.origin);
+  pthread_t thread;
+  const auto created = pthread_create(&thread, nullptr, [](void* data) -> void* {
+    auto& probe = *static_cast<Probe*>(data);
+    probe.time = browser::MissionClock::HostMilliseconds(probe.origin);
+    return nullptr;
+  }, &probe);
+  if (created || pthread_join(thread, nullptr)) { return 0; }
+  const double after = browser::MissionClock::HostMilliseconds(probe.origin);
+  return before >= 0 && probe.time >= before - 1 && probe.time <= after + 1;
+}
 EMSCRIPTEN_KEEPALIVE uint32_t gpu_execute(uint32_t operation, uint32_t resource, const uint8_t* bytes, uint32_t size) {
   struct Request { uint32_t operation, resource; const uint8_t* bytes; uint32_t size; } request{operation, resource, bytes, size};
   pthread_t thread;

@@ -146,8 +146,7 @@ const auto contracts = [] {
   fault([&] { handles.SetEvent(overlappingSource); }, "overlapping output cannot change captured close source");
   check(poll(overlappingTarget) == 0, "overlapping transfer retains source signal");
   handles.Close(overlappingTarget);
-  const auto owned = handles.CreateMutant(4);
-  handles.Close(owned);
+  const auto owned = dispatcher.CreateMutant(4);
   for (auto& handle : capacity) { handle = handles.CreateEvent(false, true); }
   check(dispatcher.ActiveObjects() == browser::kDispatcherCapacity && handles.ActiveHandles() == browser::kDispatcherCapacity - 1, "object capacity can be full with a free handle");
   const auto atObjectCapacity = duplicate(capacity[0]);
@@ -155,7 +154,7 @@ const auto contracts = [] {
     "duplication needs a handle slot but never allocates another object");
   handles.Close(atObjectCapacity);
   for (const auto handle : capacity) { handles.Close(handle); }
-  handles.AbandonOwner(4);
+  dispatcher.Destroy(owned);
   for (size_t n = 0; n < 100; ++n) {
     const auto racing = handles.CreateEvent(false, true);
     frame(memory, ctx, racing, output, 1);

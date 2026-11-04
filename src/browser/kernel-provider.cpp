@@ -535,7 +535,7 @@ void InvokeCriticalSection(Runtime& runtime, Memory& memory, X86Context& ctx, ui
         }
         memory.Write(ctx, address, section.data(), sizeof(section));
         if (!reserved) {
-          if (ordinal == 294) { runtime.Wake(); }
+          if (ordinal == 294 && !section[5] && section[1]) { runtime.Wake(); }
           ctx.eax = 0;
           ctx.esp = uint32_t(stackEnd);
           return;

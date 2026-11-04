@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Completed GPU frame capture</title>
+<canvas id="canvas" width="4" height="4"></canvas>
+<pre id="result">Running</pre>
+<script type="module">
+import { createMailbox, MailboxClient, Opcode, Status } from '../../src/browser/webgpu-transport.mjs';
+import { startGPUWorker } from '../../src/browser/webgpu-service.mjs';
+const diagnostics = [];
+const mailbox = createMailbox();
+const gpu = startGPUWorker({ canvas: document.querySelector('canvas').transferControlToOffscreen(), mailbox,
+  moduleURL: '../../out/browser-webgpu-tests/webgpu-service.mjs', onDiagnostic: value => diagnostics.push(value) });
+const client = new MailboxClient(mailbox);
+const execute = async (opcode, resource, bytes) => {
+  const result = await client.execute(opcode, resource, bytes);
+  if (result.status !== Status.Ok) { throw new Error(`GPU command ${opcode} failed.`); }
+};
+const capture = id => new Promise((resolve, reject) => {
+  let timer;
+  const receive = event => {
+    if (event.data.id !== id) { return; }
+    clearTimeout(timer);
+    gpu.worker.removeEventListener('message', receive);
+    if (event.data.type === 'captured') { resolve(event.data); }
+    else { reject(new Error(event.data.message)); }
+  };
+  gpu.worker.addEventListener('message', receive);
+  timer = setTimeout(() => { gpu.worker.removeEventListener('message', receive); reject(new Error('Frame capture timeout.')); }, 5000);
+  gpu.worker.postMessage({ type: 'capture', id });
+});
+try {
+  await gpu.ready;
+  await execute(Opcode.Configure, 0, new Uint8Array(new Uint32Array([4, 4]).buffer));
+  const pixels = new Uint8Array(16);
+  for (let n = 0; n < 4; ++n) { pixels.set([73, 125, 201, 255], n * 4); }
+  const texture = new Uint8Array(32);
+  texture.set(new Uint8Array(new Uint32Array([2, 2, 0, 1]).buffer));
+  texture.set(pixels, 16);
+  await execute(Opcode.CreateTexture, 1, texture);
+  await execute(Opcode.Present, 1, new Uint8Array(4));
+  const first = await capture(1);
+  await execute(Opcode.Destroy, 1);
+  const second = await capture(2);
+  for (const frame of [first, second]) {
+    if (frame.width !== 4 || frame.height !== 4 || frame.pixels.length !== 64) { throw new Error('Frame capture dimensions differ.'); }
+    for (let n = 0; n < frame.pixels.length; ++n) {
+      if (frame.pixels[n] !== [73, 125, 201, 255][n % 4]) { throw new Error(`Captured pixel ${n} differs.`); }
+    }
+  }
+  const retirement = await gpu.shutdown();
+  globalThis.frameCaptureEvidence = { ok: true, captures: 2, dimensions: [4, 4], sourceRetirementPreservedPixels: true, diagnostics, retirement };
+} catch (error) {
+  globalThis.frameCaptureEvidence = { ok: false, error: String(error), diagnostics };
+  await gpu.shutdown().catch(() => {});
+}
+document.querySelector('#result').textContent = JSON.stringify(frameCaptureEvidence, null, 2);
+</script>

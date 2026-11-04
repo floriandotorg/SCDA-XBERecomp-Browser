@@ -302,3 +302,49 @@ parentPort.postMessage(Atomics.load(new Uint32Array(workerData.buffer, 8, 2), 0)
     await worker.terminate();
   }
 });
+test('canvas focus refreshes a stale initial document focus sample', async () => {
+  const { createMenuInput } = await import('../../src/browser/menu-input.mjs');
+  const buffer = new SharedArrayBuffer(8);
+  const target = new EventTarget();
+  let focused = false;
+  target.hasFocus = () => focused;
+  const input = createMenuInput({ buffer, byteOffset: 0, target, focusTarget: target, visibilityTarget: target });
+  focused = true;
+  target.dispatchEvent(new Event('focusin'));
+  const event = new Event('keydown', { cancelable: true });
+  Object.assign(event, { code: 'KeyW', repeat: false });
+  target.dispatchEvent(event);
+  assert.equal(new Uint32Array(buffer)[0], 16);
+  input.dispose();
+});
+test('a fresh physical key uses current document focus when the browser omits a window focus event', async () => {
+  const { createMenuInput } = await import('../../src/browser/menu-input.mjs');
+  const buffer = new SharedArrayBuffer(8);
+  const target = new EventTarget();
+  let focused = false;
+  target.hasFocus = () => focused;
+  const input = createMenuInput({ buffer, byteOffset: 0, target, focusTarget: target, visibilityTarget: target });
+  const key = () => {
+    const event = new Event('keydown', { cancelable: true });
+    Object.assign(event, { code: 'KeyW', repeat: false });
+    target.dispatchEvent(event);
+  };
+  focused = true;
+  key();
+  assert.equal(new Uint32Array(buffer)[0], 16);
+  focused = false;
+  target.dispatchEvent(new Event('blur'));
+  key();
+  assert.equal(new Uint32Array(buffer)[0], 0);
+  input.dispose();
+});
+test('Escape unlocks capture without also pressing the game Back button', async () => {
+  const { input, words, key, visibilityTarget } = await fixture();
+  visibilityTarget.pointerLockElement = {};
+  key('keydown', 'Escape');
+  assert.equal(words[0], 0);
+  visibilityTarget.pointerLockElement = null;
+  key('keydown', 'Escape');
+  assert.equal(words[0], 1024);
+  input.dispose();
+});

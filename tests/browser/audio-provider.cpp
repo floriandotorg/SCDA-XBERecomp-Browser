@@ -783,12 +783,35 @@ void packetBudget() {
     refuse([&] { guest.Call(BROWSER_AUDIO_GUEST(CDirectSoundStream_Process), {stream, kPacketDesc, 0}, 3); });
     check(fixture.audio->Snapshot().voices == 1, "packet budget rejection lost the stream");
     check(guest.Call(BROWSER_AUDIO_GUEST(CDirectSoundStream_Release), {stream}, 1) == 0, "release after budget failure failed");
-    for (uint32_t n = 0; n < 64; ++n) {
+    const auto freeBefore = fixture.audio->Snapshot().arenaFreeBytes;
+    std::array<uint32_t, browser::audio::kMaxVoices> buffers{};
+    for (uint32_t n = 0; n < buffers.size(); ++n) {
       guest.WriteDesc(kBufferDesc, {0, 0, 0, kWavePcm, 0});
       check(guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateBuffer), {kBufferDesc, kOut + 4}, 2) == 0, "voice budget create failed");
+      buffers[n] = guest.Read(kOut + 4);
     }
-    refuseStage = "refuse #32";
-    refuse([&] { guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateBuffer), {kBufferDesc, kOut + 4}, 2); });
+    const auto full = fixture.audio->Snapshot();
+    guest.Write(kOut + 4, 0xdeadbeef);
+    check(guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateBuffer), {kBufferDesc, kOut + 4}, 2) == browser::audio::kGuestErrorFail,
+      "voice budget must return a recoverable SDK failure");
+    check(guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateStream), {kStreamDesc, kOut + 4}, 2) == browser::audio::kGuestErrorFail,
+      "stream voice budget must return a recoverable SDK failure");
+    const auto rejected = fixture.audio->Snapshot();
+    check(guest.Read(kOut + 4) == 0xdeadbeef && rejected.voices == full.voices && rejected.arenaFreeBytes == full.arenaFreeBytes,
+      "voice budget failure published output or consumed storage");
+    check(rejected.voiceLimitRejections == full.voiceLimitRejections + 2, "voice budget rejections are not observable");
+    check(guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_Release), {buffers[0]}, 1) == 0, "budget recovery release failed");
+    check(guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateStream), {kStreamDesc, kOut + 4}, 2) == 0, "stream could not reuse a released voice");
+    check(guest.Call(BROWSER_AUDIO_GUEST(CDirectSoundStream_Release), {guest.Read(kOut + 4)}, 1) == 0, "recovered stream release failed");
+    check(guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateBuffer), {kBufferDesc, kOut + 4}, 2) == 0, "buffer could not reuse a released voice");
+    buffers[0] = guest.Read(kOut + 4);
+    for (const auto buffer : buffers) { check(guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_Release), {buffer}, 1) == 0, "budget fixture release failed"); }
+    for (uint32_t n = 0; n < 256; ++n) {
+      check(guest.Call(BROWSER_AUDIO_GUEST(DirectSoundCreateBuffer), {kBufferDesc, kOut + 4}, 2) == 0, "audio lifetime stress create failed");
+      check(guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_Release), {guest.Read(kOut + 4)}, 1) == 0, "audio lifetime stress release failed");
+    }
+    check(fixture.audio->Snapshot().voices == 0 && fixture.audio->Snapshot().arenaFreeBytes == freeBefore,
+      "audio lifetime stress leaked voices or storage");
   });
 }
 

@@ -276,6 +276,28 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   check(openLink("\\??\\D:") == 0xc000009a, "file and link handles bypassed shared bounded quota");
   for (const auto handle : quotaLinks) { check(close(handle), "bounded link handle did not retire"); }
   check(close(quotaFile), "shared handle quota file did not retire");
+  const auto deleteAlias = [&](std::string name) {
+    memory.Write(ctx, 0x10300, name.data(), name.size());
+    put(0x10200, uint32_t(name.size()) | (uint32_t(name.size()) << 16));
+    put(0x10204, 0x10300);
+    const auto stack = ctx.esp;
+    const auto result = runtime.Call(ctx, base, runtime.KernelTarget(69), {0x10200});
+    check(ctx.esp == stack, "symbolic link deletion corrupted stdcall cleanup");
+    return result;
+  };
+  check(deleteAlias("\\??\\Q:") == 0xc0000034, "missing alias deletion fabricated success");
+  check(createAlias("\\??\\Q:", "\\Device\\CdRom0") == 0, "deletion fixture alias creation failed");
+  check(openLink("\\??\\Q:") == 0, "deletion fixture alias open failed");
+  const auto retainedLink = get(0x10100);
+  for (const std::string invalid : {"", "Q:", "\\??\\QQ:", "\\??\\1:", "\\Device\\CdRom0"}) {
+    check(deleteAlias(invalid) == 0xc0000033, "malformed alias deletion was admitted");
+  }
+  check(deleteAlias("\\??\\q:") == 0 && deleteAlias("\\??\\Q:") == 0xc0000034,
+    "alias deletion did not remove exactly its case-insensitive namespace entry");
+  check(openLink("\\??\\Q:") == 0xc0000034, "deleted alias remained openable");
+  check(queryLink(retainedLink) == 0 && close(retainedLink), "alias deletion invalidated an existing link object snapshot");
+  check(createAlias("\\??\\Q:", "\\Device\\CdRom0") == 0 && deleteAlias("\\??\\Q:") == 0,
+    "alias namespace could not be reused after deletion");
   check(createAlias("\\??\\D:", "\\Device\\CdRom0") == 0xc0000035, "observed existing disc alias did not collide truthfully");
   check(createAlias("\\??\\D:", "\\Device\\CdRom0") == 0xc0000035, "duplicate alias did not collide");
   check(createAlias("\\??\\X:", "\\Device\\Harddisk0\\Partition2") == 0xc00000bb, "alias mounted unknown device");
@@ -452,6 +474,8 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   check(createFile(titleFile, 5) == 0xc00000bb, "unobserved overwrite disposition accepted");
   for (const uint32_t options : {0x60u, 0x64u}) {
     const std::string profile = "\\Device\\Harddisk0\\Partition1\\UDATA\\1234ABCD\\PROFILE.SAV";
+    check(createFile(profile, 3, 0x10100, 0, 0x80, 0xc0100080, 0x60) == 0 && close(get(0x10100)),
+      "read-write OPEN_IF refused a writable temporary file");
     check(createFile(profile, 5, 0x10100, 0, 0x80, 0x40100080, options) == 0,
       "observed profile CREATE_ALWAYS mode refused");
     const auto handle = get(0x10100);
@@ -460,10 +484,21 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
     check(createFile(profile, 3, 0x10100, 0, 0x80, 0x40100080, 0x60) == 0 && get(0x1010c) == 1 &&
       queryFile(get(0x10100)) == 0 && get(0x10828) == 3 && close(get(0x10100)),
       "observed profile write OPEN_IF refused or truncated existing bytes");
+    check(createFile(profile, 3, 0x10100, 0, 0x80, 0xc0100080, 0x60) == 0 && get(0x1010c) == 1,
+      "read-write OPEN_IF failed to preserve an existing file");
+    const auto update = get(0x10100);
+    check(runtime.Call(ctx, base, runtime.KernelTarget(219), {update, 0, 0, 0, 0x10840, 0x10a00, 3, 0}) == 0 &&
+      (get(0x10a00) & 0xffffff) == (get(0x10900) & 0xffffff), "read-write OPEN_IF lost readable content");
+    check(createFile(profile, 3, 0x10100, 0, 0x80, 0xc0100080, 0x60) == 0xc0000043,
+      "read-write OPEN_IF ignored sharing restrictions");
+    check(writeFile(update) == 0 && queryFile(update) == 0 && get(0x10828) == 6 && close(update),
+      "read-write OPEN_IF did not preserve the cursor or write access");
     check(createFile(profile, 5, 0x10100, 0, 0x80, 0x40100080, options) == 0 &&
       get(0x1010c) == 3 && queryFile(get(0x10100)) == 0 && get(0x10828) == 0 && close(get(0x10100)),
       "profile overwrite did not atomically reset EOF");
   }
+  check(createFile("D:\\default.xbe", 3, 0x10100, 0, 0x80, 0xc0100080, 0x60) == 0xc0000022,
+    "read-write OPEN_IF admitted writes to the selected disc");
   check(createFile(titleFile, 3, 0x10100, 0, 0x10) == 0xc000000d, "byte-file create accepted directory attribute");
   bool invalidFileRefused = false;
   try { createFile("\\Device\\Harddisk0\\partition1\\UDATA\\ATOMIC.XBX", 3, 0x20000); }
@@ -634,7 +669,7 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   };
   check(seek(truncated, 4) == 0 && queryFile(truncated) == 0 && get(0x10828) == 1 && writeFile(truncated, 0x10900, 1) == 0 &&
     queryFile(truncated) == 0 && get(0x10828) == 5, "actual cache position did not move cursor independently of EOF");
-  check(seek(truncated, UINT64_MAX) == 0xc000000d && seek(truncated, 1, 7) == 0xc0000004 && seek(truncated, 1, 8, 20) == 0xc00000bb,
+  check(seek(truncated, UINT64_MAX) == 0xc000000d && seek(truncated, 1, 7) == 0xc0000004 && seek(truncated, 1, 8, 21) == 0xc00000bb,
     "cache position admitted negative, short or unrelated set operation");
   for (uint32_t n = 0; n < 3; ++n) {
     bool refused = false;
@@ -642,8 +677,29 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
     catch (const browser::Fault&) { refused = true; }
     check(refused && get(0x10840) == 0xabcdef, "bad cache position span partially published outputs");
   }
+  check(seek(truncated, 2, 8, 20) == 0 && queryFile(truncated) == 0 && get(0x10828) == 2 &&
+    seek(truncated, 12, 8, 20) == 0 && queryFile(truncated) == 0 && get(0x10828) == 12 &&
+    seek(truncated, UINT64_MAX, 8, 20) == 0xc000000d && seek(truncated, 1, 7, 20) == 0xc0000004 &&
+    seek(truncated, 5, 8, 20) == 0, "EOF updates failed or changed the current cursor");
+  check(seek(truncated, 32768, 8, 19) == 0 && queryFile(truncated) == 0 &&
+    get(0x10828) == 5 && get(0x10820) == 32768 && seek(truncated, 5, 8, 19) == 0 &&
+    queryFile(truncated) == 0 && get(0x10828) == 5 && get(0x10820) == 16384,
+    "allocation updates changed EOF or lost quota accounting");
+  std::array<uint64_t, 5> basic{111, 222, 333, 444, 0x80};
+  memory.Write(ctx, 0x10b00, basic.data(), sizeof(basic));
+  const auto setBasic = [&](uint32_t handle, uint32_t length = 40) {
+    return runtime.Call(ctx, base, runtime.KernelTarget(226), {handle, 0x10840, 0x10b00, length, 4});
+  };
+  check(setBasic(truncated) == 0 && setBasic(truncated, 39) == 0xc0000004 &&
+    queryFile(truncated) == 0 && get(0x10800) == 111 && get(0x10808) == 222 && get(0x10810) == 333,
+    "generic write did not grant basic metadata updates");
   check(writeFile(truncated, 0x10900, 1) == 0 && queryFile(truncated) == 0 && get(0x10828) == 6 && close(truncated),
     "failed cache position changed write cursor");
+  check(open("Z:\\DEFAULT\\DYNAMICXBOX.UMD", 0xfffffffdu, 0x100100, 0x4040, 0x10100, 0x10108, 7) == 0,
+    "original metadata-only asynchronous open refused");
+  const auto attributesHandle = get(0x10100);
+  check(setBasic(attributesHandle) == 0 && seek(attributesHandle, 1, 8, 20) == 0xc0000022 && close(attributesHandle),
+    "metadata-only access changed data permissions");
   check(overwrite("\\Device\\Harddisk0\\Partition1\\CACHE\\OVERWRITE.BIN", 0) == 0 && get(0x1010c) == 2,
     "actual overwrite mode unavailable in owned temporary namespace");
   const auto temporaryDestination = get(0x10100);
@@ -669,6 +725,9 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   check(openExisting("Z:\\DEFAULT\\READBACK.UMD", 0x60, 1, 0xfffffffdu, 0x80100080) == 0,
     "actual cache read190 mode refused retained backing");
   const auto headerReader = get(0x10100);
+  check(seek(headerReader, 1, 8, 20) == 0xc0000022 && setBasic(headerReader) == 0xc0000022,
+    "read-only handle acquired data or metadata write permission");
+
   check(overwrite("Z:\\DEFAULT\\READBACK.UMD") == 0xc0000043, "real cache reader allowed destructive overwrite");
   const auto readFile = [&](uint32_t handle, uint32_t length = 20, uint32_t buffer = 0x10a00, uint32_t event = 0, uint32_t offset = 0,
       uint32_t status = 0x10840, uint32_t apc = 0, uint32_t context = 0) {
@@ -713,6 +772,36 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   const auto readonlyReader = get(0x10100);
   check(readFile(readonlyReader, 1) == 0xc0000011 && writeFile(readonlyReader) == 0xc0000022 && close(readonlyReader),
     "readonly read either fabricated empty bytes or gained write access");
+  {
+    const std::string disposable = "\\Device\\Harddisk0\\Partition1\\CACHE\\DISPOSABLE.TMP";
+    check(createFile(disposable) == 0 && close(get(0x10100)), "delete fixture creation failed");
+    check(open(disposable, 0, 0x10000, 0x4040, 0x10100, 0x10108, 7) == 0, "observed temporary DELETE-only access was rejected");
+    const auto deletion = get(0x10100);
+    check(open(disposable, 0, 0x80100080, 0x60, 0x10100, 0x10108, 7) == 0, "shared deletion reader failed");
+    const auto retained = get(0x10100);
+    put(0x10b00, 1);
+    check(runtime.Call(ctx, base, runtime.KernelTarget(226), {deletion, 0x10108, 0x10b00, 1, 13}) == 0,
+      "temporary delete disposition rejected");
+    check(open(disposable) == 0xc0000056 && close(deletion) && readFile(retained, 1) == 0xc0000011,
+      "delete-pending file reopened or disappeared with a live handle");
+    check(close(retained) && open(disposable) == 0xc0000034, "final close did not delete temporary file");
+    check(open("D:\\default.xbe", 0, 0x110080, 0x60) == 0xc0000022, "DELETE access reached the ISO");
+    check(createFile(disposable, 3, 0x10100, 0, 4, 0x40110000) == 0, "rename fixture creation failed");
+    const auto renaming = get(0x10100);
+    const std::string destination = "CACHE\\RENAMED.TMP";
+    memory.Write(ctx, 0x10c00, destination.data(), destination.size());
+    put(0x10b00, 0); put(0x10b04, temporaryRoot);
+    put(0x10b08, uint32_t(destination.size()) | (uint32_t(destination.size()) << 16)); put(0x10b0c, 0x10c00);
+    check(runtime.Call(ctx, base, runtime.KernelTarget(226), {renaming, 0x10108, 0x10b00, 16, 10}) == 0 &&
+      writeFile(renaming) == 0 && close(renaming) && open(disposable) == 0xc0000034 &&
+      open("\\Device\\Harddisk0\\Partition1\\CACHE\\RENAMED.TMP", 0, 0x80100080, 0x60) == 0,
+      "rename failed to transfer namespace and live handle ownership");
+    const auto renamed = get(0x10100);
+    check(readFile(renamed, 3) == 0 && get(0x10844) == 3, "renamed handle writes lost their destination");
+    put(0x10b00, 1);
+    check(runtime.Call(ctx, base, runtime.KernelTarget(226), {renamed, 0x10108, 0x10b00, 1, 13}) == 0xc0000022 && close(renamed),
+      "read-only handle acquired deletion rights");
+  }
   check(close(cacheRoot), "cache root did not close after overwrite tests");
   check(close(temporaryRoot) && !close(temporaryRoot), "temporary root handle lifetime broken");
   check(open("missing", temporaryRoot) == 0xc0000008, "closed temporary root remained valid");
@@ -1667,6 +1756,127 @@ const auto testPositionQueryReadRace = [](std::shared_ptr<const std::vector<uint
   std::puts("file-position-query-races-ok");
 };
 
+const auto testNamedDiscFailure = [](std::shared_ptr<const std::vector<uint8_t>> bytes) {
+  browser::Runtime runtime({}, {});
+  browser::PreparedImage image;
+  image.memory = std::make_unique<browser::Memory>();
+  image.memory->Ensure(0x10000, 8192);
+  image.image.kernel_thunk = 0x10000;
+  auto disc = std::make_shared<kernel::DiscIndex>();
+  std::string error;
+  check(disc->Open(bytes->size(), [bytes](uint64_t at, void* output, uint32_t size) {
+    if (at == 102400) { return 0u; }
+    std::memcpy(output, bytes->data() + at, size);
+    return size;
+  }, error), "failed-read fixture metadata invalid");
+  browser::InstallFileProvider(runtime, image, disc);
+  browser::BindImageImports(image, runtime, {});
+  X86Context context{}; context.host = &runtime; context.esp = 0x11f00;
+  runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+    auto& memory = *image.memory;
+    const std::string path = "D:\\default.xbe";
+    const std::array<uint32_t, 5> attributes{uint32_t(path.size()) | (uint32_t(path.size()) << 16), 0x11200, 0, 0x11000, 0x40};
+    memory.Write(ctx, 0x11000, attributes.data(), sizeof(attributes));
+    memory.Write(ctx, 0x11200, path.data(), path.size());
+    check(runtime.Call(ctx, base, runtime.KernelTarget(202), {0x11300, 0x100001, 0x11008, 0x11308, 3, 0x20}) == 0,
+      "failed-read fixture open failed");
+    uint32_t handle = 0;
+    memory.Read(ctx, 0x11300, &handle, 4);
+    const uint32_t sentinel = 0xabcdef;
+    memory.Write(ctx, 0x11400, &sentinel, 4);
+    bool named = false;
+    try { runtime.Call(ctx, base, runtime.KernelTarget(219), {handle, 0, 0, 0, 0x11308, 0x11400, 3, 0}); }
+    catch (const browser::Fault& failure) {
+      const std::string message = failure.what();
+      named = message.find("DEFAULT.XBE") != std::string::npos && message.find("offset=0") != std::string::npos && message.find("bytes=3") != std::string::npos;
+    }
+    uint32_t output = 0;
+    memory.Read(ctx, 0x11400, &output, 4);
+    check(named && output == sentinel, "failed streaming read lost its logical path or published partial bytes");
+  });
+  if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
+};
+
+const auto testLargeDiscReads = [](std::shared_ptr<const std::vector<uint8_t>> original) {
+  constexpr uint32_t chunk = 1u << 20, length = 2 * chunk + 19, destination = 0x80020000;
+  auto bytes = std::make_shared<std::vector<uint8_t>>(102400 + length);
+  std::copy(original->begin(), original->end(), bytes->begin());
+  std::memcpy(bytes->data() + 81920 + 8, &length, 4);
+  (*bytes)[81920 + 13] = 9;
+  std::memcpy(bytes->data() + 81920 + 14, "LARGE.SM2", 9);
+  const auto pattern = [](uint32_t offset) { return uint8_t(offset * 37 + (offset >> 13)); };
+  for (uint32_t n = 0; n < length; ++n) { (*bytes)[102400 + n] = pattern(n); }
+  for (uint32_t n = 0; n < 3; ++n) {
+    const uint32_t mode = n;
+    browser::Runtime runtime({}, {});
+    browser::PreparedImage image;
+    image.memory = std::make_unique<browser::Memory>();
+    image.memory->Ensure(0x10000, 8192);
+    image.image.kernel_thunk = 0x10000;
+    uint32_t reads = 0, maximum = 0, handle = 0;
+    bool named = false, cancelled = false;
+    auto disc = std::make_shared<kernel::DiscIndex>();
+    std::string error;
+    check(disc->Open(bytes->size(), [&](uint64_t at, void* output, uint32_t size) {
+      if (at >= 102400) {
+        check(!browser::Memory::HasBorrow() && size <= chunk, "large read borrowed memory or exceeded bridge staging");
+        ++reads; maximum = std::max(maximum, size);
+        if (reads == 2 && mode == 1) { return 0u; }
+        if (reads == 2 && mode == 2) { runtime.Cancel(); }
+      }
+      std::memcpy(output, bytes->data() + at, size);
+      return size;
+    }, error), "large read disc fixture failed");
+    std::function<browser::DiscReadSnapshot()> snapshot;
+    auto close = browser::InstallFileProvider(runtime, image, disc, {}, nullptr, &snapshot, {}, nullptr, {}, {}, 4 * chunk);
+    browser::BindImageImports(image, runtime, {});
+    X86Context context{}; context.host = &runtime; context.esp = 0x11800;
+    runtime.Launch(context, image.memory->Base(), [&](X86Context& ctx, uint8_t* base) {
+      auto& memory = *image.memory;
+      const std::string path = "D:\\large.sm2";
+      const std::array<uint32_t, 5> attributes{uint32_t(path.size()) | uint32_t(path.size()) << 16, 0x11200, 0, 0x11000, 0x40};
+      memory.Write(ctx, 0x11000, attributes.data(), sizeof(attributes));
+      memory.Write(ctx, 0x11200, path.data(), path.size());
+      check(runtime.Call(ctx, base, runtime.KernelTarget(202), {0x11300, 0x100001, 0x11008, 0x11308, 3, 0x20}) == 0,
+        "large read open failed");
+      memory.Read(ctx, 0x11300, &handle, 4);
+      std::vector<uint8_t> sentinel(length, 0xa5);
+      memory.Write(ctx, destination, sentinel.data(), sentinel.size());
+      const std::array<uint32_t, 2> status{0xabcdef, 0xabcdef};
+      memory.Write(ctx, 0x11308, status.data(), sizeof(status));
+      try {
+        check(runtime.Call(ctx, base, runtime.KernelTarget(219), {handle, 0, 0, 0, 0x11308, destination, length, 0}) == 0 && !mode,
+          "bounded large disc read failed");
+      } catch (const browser::Cancelled&) { cancelled = true; throw; }
+      catch (const browser::Fault& failure) {
+        const std::string detail = failure.what();
+        named = detail.find("LARGE.SM2") != std::string::npos && detail.find("offset=1048576") != std::string::npos;
+      }
+      std::array<uint32_t, 2> delivered{};
+      memory.Read(ctx, 0x11308, delivered.data(), sizeof(delivered));
+      check(mode == 1 ? named && delivered == status : delivered == std::array<uint32_t, 2>{0, length},
+        "large read published a partial result or lost its failing slice");
+      check(runtime.Call(ctx, base, runtime.KernelTarget(211), {handle, 0x11308, 0x11400, 8, 14}) == 0,
+        "large read cursor query failed");
+      uint64_t position = 0;
+      memory.Read(ctx, 0x11400, &position, 8);
+      check(position == (mode ? 0 : length), "large read cursor advanced on failure");
+    });
+    if (const auto failure = runtime.Join()) {
+      try { std::rethrow_exception(failure); }
+      catch (const browser::Cancelled&) { check(mode == 2 && cancelled, "large read changed cancellation type"); }
+    }
+    std::vector<uint8_t> delivered(length);
+    image.memory->Read({}, destination, delivered.data(), delivered.size());
+    for (uint32_t n = 0; n < length; ++n) {
+      check(delivered[n] == (mode ? 0xa5 : pattern(n)), "large read leaked partial or stale destination data");
+    }
+    check(reads == (mode ? 2u : 3u) && maximum == chunk && !runtime.ActiveWorkers() && close(handle),
+      "large read did not bound chunks or retire its worker and file");
+    check(snapshot().assetBytes == (mode ? 0 : length), "large read published fake asset progress");
+  }
+};
+
 int main() {
   testOpenDiagnostics();
   testDataExportPreflight();
@@ -1692,6 +1902,8 @@ int main() {
   auto disc = std::make_shared<kernel::DiscIndex>();
   std::string error;
   check(disc->Open(bytes->size(), [bytes](uint64_t at, void* out, uint32_t size) { std::memcpy(out, bytes->data() + at, size); return size; }, error), "disc fixture invalid");
+  testNamedDiscFailure(bytes);
+  testLargeDiscReads(bytes);
   testPositionQueries(disc);
   testPositionQueryReadRace(bytes);
   testConcurrentProvider(disc);
@@ -1710,7 +1922,9 @@ int main() {
     check(temporary->WriteFile("CACHE\\SAVE.BIN", std::array<uint8_t, 3>{1, 2, 3}) == 0, "fixture file failed");
     check(temporary->CreateFile("CACHE\\READONLY.BIN", 1) == 0, "readonly fixture file failed");
     std::vector<browser::KernelDataExport> exports;
-    closeFile = browser::InstallFileProvider(runtime, image, disc, temporary, &exports);
+    std::vector<browser::FileOperationDiagnostic> operationDiagnostics;
+    closeFile = browser::InstallFileProvider(runtime, image, disc, temporary, &exports, nullptr, {}, nullptr, {},
+      [&](browser::FileOperationDiagnostic diagnostic) { operationDiagnostics.push_back(std::move(diagnostic)); });
     check(exports.size() == 2 && exports[0].ordinal == 40 && exports[0].address == 0xc0001000 && exports[0].size == 4 && exports[1].ordinal == 326 && exports[1].size == 8, "file data exports incorrect");
     uint32_t count = 0;
     image.memory->Read({}, exports[0].address, &count, 4);
@@ -1731,6 +1945,14 @@ int main() {
     browser::ImageExecution execution;
     browser::ExecuteImageEntry(image, runtime, execution);
     check(execution.returned && runtime.ActiveWorkers() == 0, "file session leaked guest workers");
+    check(operationDiagnostics.size() <= 64 && std::any_of(operationDiagnostics.begin(), operationDiagnostics.end(), [](const auto& diagnostic) {
+      return diagnostic.ordinal == 226 && diagnostic.informationClass == 13 && diagnostic.status == 0xc0000022 &&
+        diagnostic.path == "CACHE\\RENAMED.TMP" && diagnostic.length == 1;
+    }), "recoverable metadata failure lost its bounded named operation diagnostic");
+    check(std::any_of(operationDiagnostics.begin(), operationDiagnostics.end(), [](const auto& diagnostic) {
+      return (diagnostic.ordinal == 219 || diagnostic.ordinal == 236) && !diagnostic.path.empty() &&
+        diagnostic.status && diagnostic.status != 0xc0000011;
+    }), "recoverable transfer failure lost its named operation diagnostic");
     std::array<uint8_t, 5> metadataBytes{};
     check(temporary->Read("UDATA\\1234ABCD\\TITLEMETA.XBX", 0, metadataBytes) == 5 && metadataBytes == std::array<uint8_t, 5>{4, 8, 12, 4, 8}, "successful guest writes were not retained exactly");
     check(temporary->Read("CACHE\\OVERWRITE.BIN", 0, metadataBytes) == 5 && metadataBytes == std::array<uint8_t, 5>{4, 8, 12, 4, 8},

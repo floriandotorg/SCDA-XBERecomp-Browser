@@ -11,7 +11,7 @@ for (const platform of ['native', 'wasm']) {
     const wasm = platform === 'wasm';
     const output = `${directory}/${wasm ? 'test.mjs' : 'native'}`;
     const flags = wasm
-      ? ['-fwasm-exceptions', '-sSTACK_SIZE=1048576', '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=node', '-sEXIT_RUNTIME=1']
+      ? ['-fwasm-exceptions', '-sSTACK_SIZE=1048576', '-sSTACK_OVERFLOW_CHECK=2', '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=node', '-sEXIT_RUNTIME=1']
       : ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'];
     const env = { ...process.env, TMPDIR: directory };
     const build = spawnSync(wasm ? 'em++' : 'clang++', ['-std=c++20', '-O1', '-g', '-Isrc', 'tests/browser/menu-shaders.cpp', 'src/browser/menu-shaders.cpp', 'src/browser/menu-pixel-shaders.cpp', 'src/gpu/shaders.cpp', ...flags, '-o', output], { encoding: 'utf8', timeout: 120000, env });

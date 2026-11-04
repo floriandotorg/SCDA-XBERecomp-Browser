@@ -1,6 +1,6 @@
 # M5: A controllable 3D mission runs
 
-Status: not started.
+Status: accepted for P5.1 through P5.4 on the recorded first-area route. Normal New Game reaches the original mission with movement, camera, baseline graphics and HUD. The ten minute traversal, repeated lifecycle transitions and cancellation recovery pass. Performance is approximately 6.17 FPS on the tested host; full gameplay remains M6. See [M5 evidence](m5-evidence.md).
 
 Previous: [M4: Menu](04-menu-works.md). Next: [M6: Playable mission](06-playable-mission.md).
 
@@ -99,13 +99,15 @@ Acceptance:
 
 ## Exit checklist
 
-* [ ] P5.1 through P5.4 accepted.
-* [ ] New Game from the menu reaches the selected mission.
-* [ ] Mission restart is a real runtime lifecycle operation.
-* [ ] Real geometry, textures, player and HUD render.
-* [ ] Keyboard movement and mouse look work.
-* [ ] A repeatable traversal produces performance and resource evidence.
-* [ ] Remaining gameplay and visual blockers are listed for M6.
+* [x] P5.1 through P5.4 accepted.
+* [x] New Game from the menu reaches the selected mission.
+* [x] Mission restart is a real runtime lifecycle operation.
+* [x] Real geometry, textures, player and HUD render.
+* [x] Keyboard movement and mouse look work.
+* [x] A repeatable traversal produces performance and resource evidence.
+* [x] Remaining gameplay and visual blockers are listed for M6.
+
+Firmware mission starts and return-to-menu transitions replace the guest runtime. The original pause-menu Restart Mission restores a serialized world in process; it is verified as that native lifecycle operation rather than forcing a firmware reboot. Both contracts are covered by the [lifecycle evidence](m5-evidence.md#completed-lifecycle-checks).
 
 ## Evidence
 

@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
   assert(c.wvp[0] == 0.5f && c.wvp[5] == 0.5f && c.wvp[10] == 0.5f);
   assert(std::abs(c.wvp[12] - 1.55f) < 0.00001f);
   assert(std::abs(c.tfactor[0] - 64 / 255.0f) < 0.00001f);
-  static_assert(sizeof(browser::menu::ShaderConstants) == 3792);
+  static_assert(sizeof(browser::menu::ShaderConstants) == 3824);
   static_assert(offsetof(browser::menu::ShaderConstants, pc) == 3504);
   for (int n = 0; n < 8; ++n) {
     assert(c.pc[n * 2][0] == float(n + 1) / 255 && c.pc[n * 2][3] == 128 / 255.0f);
@@ -80,7 +80,17 @@ int main(int argc, char** argv) {
   assert(textured.supported);
   assert(textured.fragment.find("i.t0.xy / i.t0.w") != std::string::npos);
   assert(textured.fragment.find("/ u.texsize[0].xy") != std::string::npos);
-  assert(textured.fragment.find("textureSample(tex0, smp0") != std::string::npos);
+  assert(textured.fragment.find("textureSampleBias(tex0, smp0") != std::string::npos);
+  auto borderStorage = std::make_unique<gpu::State>(s);
+  auto& borderState = *borderStorage;
+  borderState.tss[0][gpu::kTssAddressU] = 4;
+  borderState.tss[0][gpu::kTssAddressV] = 4;
+  borderState.tss[0][gpu::kTssBorderColor] = 0xff0000ff;
+  borderState.tss[0][gpu::kTssMinFilter] = borderState.tss[0][gpu::kTssMagFilter] = 2;
+  borderState.tss[0][gpu::kTssMipFilter] = 1;
+  borderState.simple[gpu::kMAlphaTestEnable / 4] = 0;
+  const auto bordered = browser::menu::GenerateShaders(borderState, 1 | 8 | 512, true, tex);
+  assert(bordered.supported && bordered.fragment.find("fn border_sample0") != std::string::npos);
   auto flat = s;
   flat.simple[gpu::kMShadeMode / 4] = 0x1d00;
   const auto flat_shader = browser::menu::GenerateShaders(flat, 1 | 8 | 512, true, tex);
@@ -173,6 +183,25 @@ int main(int argc, char** argv) {
   assert(reciprocal_shader.vertex.find("let ir = vec4<f32>(xrcc(((i.v3).yyyy).x))") != std::string::npos);
   assert(reciprocal_shader.vertex.find("bitcast<u32>(v) & 0x80000000u") != std::string::npos);
   assert(reciprocal_shader.vertex.find("1.0 / max(abs(v), 1.0 / 1.84467e19)") != std::string::npos);
+  auto reciprocalStorage = std::make_unique<gpu::State>(reciprocal);
+  auto& plainReciprocal = *reciprocalStorage;
+  plainReciprocal.vs = std::make_shared<gpu::VertexShader>(*reciprocal.vs);
+  for (size_t n = 0; n < plainReciprocal.vs->program.size(); n += 4) {
+    auto& token = plainReciprocal.vs->program[n + 1];
+    if (((token >> 25) & 7) == 3) { token = (token & ~(7u << 25)) | (2u << 25); }
+  }
+  const auto plainReciprocalShader = browser::menu::GenerateShaders(plainReciprocal, 1 | 8 | 512, false, tex);
+  assert(plainReciprocalShader.supported && plainReciprocalShader.vertex.find("let ir = vec4<f32>(xrcp(") != std::string::npos);
+  auto normalizedStorage = std::make_unique<gpu::State>(reciprocal);
+  auto& normalized = *normalizedStorage;
+  normalized.vs = std::make_shared<gpu::VertexShader>(*reciprocal.vs);
+  for (size_t n = 0; n < normalized.vs->program.size(); n += 4) {
+    auto& token = normalized.vs->program[n + 1];
+    if (((token >> 25) & 7) == 3) { token = (token & ~(7u << 25)) | (4u << 25); }
+  }
+  normalized.simple[gpu::kMShadeMode / 4] = 0x1d00;
+  const auto normalization_shader = browser::menu::GenerateShaders(normalized, 1 | 8 | 512, false, tex);
+  assert(normalization_shader.supported && normalization_shader.vertex.find("xrsq(") != std::string::npos);
   auto paired_rcc = programmable;
   paired_rcc.vs = std::make_shared<gpu::VertexShader>();
   paired_rcc.vs->program_type = 0x2078;
@@ -187,9 +216,9 @@ int main(int argc, char** argv) {
   assert(paired_rcc_shader.vertex.find("R1.x = ir.x") != std::string::npos);
   assert(paired_rcc_shader.vertex.find("R0.x = mr.x") != std::string::npos);
   assert(paired_rcc_shader.vertex.find("let ir =") < paired_rcc_shader.vertex.find("R0.x = mr.x"));
-  invalid.vs->program = {0, 2u << 25, 0, 1};
+  invalid.vs->program = {0, 5u << 25, 0, 1};
   invalid_program = browser::menu::GenerateShaders(invalid, 1, false, tex);
-  assert(!invalid_program.supported && invalid_program.diagnostic.find("ILU operation 2") != std::string::npos);
+  assert(!invalid_program.supported && invalid_program.diagnostic.find("ILU operation 5") != std::string::npos);
   invalid.vs->program = programmable.vs->program;
   invalid.vs->program.back() &= ~1u;
   invalid_program = browser::menu::GenerateShaders(invalid, 1, false, tex);
@@ -237,8 +266,82 @@ int main(int argc, char** argv) {
     };
     save("plain", shader);
     save("textured", textured);
+    const auto depthOnly = browser::menu::GenerateShaders(s, 1 | 8 | 512, true, tex, 0, false);
+    assert(depthOnly.supported && depthOnly.fragment.find("return outc") == std::string::npos);
+    save("depth-only", depthOnly);
+    gpu::TexInfo shadowTextures[4]{};
+    shadowTextures[0].kind = gpu::kTex2D;
+    shadowTextures[0].rect = 1;
+    auto shadowState = std::make_unique<gpu::State>(s);
+    shadowState->simple[gpu::kMAlphaTestEnable / 4] = 0;
+    shadowState->tss[0][gpu::kTssColorOp] = shadowState->tss[0][gpu::kTssAlphaOp] = 2;
+    shadowState->tss[0][gpu::kTssColorArg1] = shadowState->tss[0][gpu::kTssAlphaArg1] = 2;
+    shadowState->tss[0][gpu::kTssAddressU] = shadowState->tss[0][gpu::kTssAddressV] = 3;
+    shadowState->tss[0][gpu::kTssMagFilter] = shadowState->tss[0][gpu::kTssMinFilter] = 2;
+    for (uint32_t n = 0; n < 16; ++n) {
+      shadowTextures[0].shadow = n < 8 ? 1 : 2;
+      shadowState->rs[gpu::kRsShadowFunc] = 0x200 + n % 8;
+      const auto shadow = browser::menu::GenerateShaders(*shadowState, 1 | 8 | 512, true, shadowTextures);
+      assert(shadow.supported && shadow.fragment.find("texture_depth_2d") != std::string::npos);
+      save("shadow" + std::to_string(n), shadow);
+      shadowState->ps = pixel_state.ps;
+      shadowState->rs[gpu::kRsPsTextureModes] = 2;
+      save("psshadow" + std::to_string(n), browser::menu::GenerateShaders(*shadowState, 1 | 8 | 512, true, shadowTextures));
+      shadowState->ps.reset();
+    }
+
+    save("depth-bias", browser::menu::GenerateShaders(s, 1 | 8 | 512, true, tex, 0, false, true));
+    save("depth-bias-color", browser::menu::GenerateShaders(s, 1 | 8 | 512, true, tex, 0, true, true));
+    save("border", bordered);
+    borderState.tss[0][gpu::kTssMipFilter] = 2;
+    save("border-mip", browser::menu::GenerateShaders(borderState, 1 | 8 | 512, true, tex));
+    gpu::TexInfo cubeTextures[4]{};
+    cubeTextures[0].kind = gpu::kTexCube;
+    const auto cube = browser::menu::GenerateShaders(s, 1 | 8 | 512, true, cubeTextures);
+    assert(cube.supported && cube.fragment.find("texture_cube<f32>") != std::string::npos);
+    save("cube", cube);
+    auto cubeState = pixel_state;
+    cubeState.rs[gpu::kRsPsTextureModes] = 3;
+    save("pscube", browser::menu::GenerateShaders(cubeState, 1 | 8 | 512, true, cubeTextures));
+    auto reflected = pixel_state;
+    reflected.ps = std::make_shared<gpu::PixelShader>(*pixel_state.ps);
+    reflected.ps->def[34] = (11u << 24) | (0x20u << 16);
+    reflected.ps->def[0] = (0x1bu << 24) | (0x20u << 16);
+    reflected.ps->def[55] = 0x111;
+    reflected.rs[gpu::kRsPsTextureModes] = 1 | (17u << 5) | (17u << 10) | (12u << 15);
+    for (uint32_t n = 0; n < 4; ++n) { reflected.tss[n][gpu::kTssTexCoordIndex] = n; }
+    gpu::TexInfo reflectionTextures[4]{};
+    reflectionTextures[0].kind = gpu::kTex2D;
+    reflectionTextures[3].kind = gpu::kTexCube;
+    save("psreflect", browser::menu::GenerateShaders(reflected, 0xffff, true, reflectionTextures));
+    reflected.ps->def[55] = 0;
+    reflected.rs[gpu::kRsPsTextureModes] = 1 | (17u << 10) | (9u << 15);
+    reflectionTextures[3].kind = gpu::kTex2D;
+    save("psdotst", browser::menu::GenerateShaders(reflected, 0xffff, true, reflectionTextures));
+
     save("flat", flat_shader);
     save("pixel", pixel_shader);
+    for (uint32_t n = 0; n < 8; ++n) {
+      auto summed = pixel_state;
+      summed.ps = std::make_shared<gpu::PixelShader>(*pixel_state.ps);
+      summed.ps->def[34] = (4u << 24) | (8u << 16) | (4u << 8) | 0x20u;
+      summed.ps->def[45] = (12u << 4) | 5u;
+      summed.ps->def[8] = (0x8eu << 24) | (0x20u << 16);
+      summed.ps->def[9] = (0x20u << 8) | (n << 5);
+      save("pssum" + std::to_string(n), browser::menu::GenerateShaders(summed, 1 | 8 | 512, true, tex));
+    }
+    auto multiplied = pixel_state;
+    multiplied.ps = std::make_shared<gpu::PixelShader>(*pixel_state.ps);
+    multiplied.ps->def[8] = 15;
+    multiplied.ps->def[9] = (4u << 24) | (8u << 16) | (0x20u << 8);
+    save("psef", browser::menu::GenerateShaders(multiplied, 1 | 8 | 512, true, tex));
+    for (uint32_t n = 1; n <= 3; ++n) {
+      auto dotted = pixel_state;
+      dotted.ps = std::make_shared<gpu::PixelShader>(*pixel_state.ps);
+      dotted.ps->def[34] = (4u << 24) | (8u << 16) | (4u << 8) | 8u;
+      dotted.ps->def[45] = (n << 12) | (n == 1 ? 12u : n == 2 ? 12u << 4 : 12u << 8);
+      save("psdot" + std::to_string(n), browser::menu::GenerateShaders(dotted, 1 | 8 | 512, true, tex));
+    }
     auto kill = pixel_state;
     kill.tss[0][gpu::kTssAlphaKill] = 4;
     kill.simple[gpu::kMAlphaTestEnable / 4] = 0;
@@ -288,6 +391,8 @@ int main(int argc, char** argv) {
     save("paired", paired_shader);
     save("relative", relative_shader);
     save("rcc", reciprocal_shader);
+    save("rcp", plainReciprocalShader);
+    save("rsq", normalization_shader);
     for (int n = 1; n <= 13; ++n) {
       auto variant = programmable;
       variant.vs = std::make_shared<gpu::VertexShader>();

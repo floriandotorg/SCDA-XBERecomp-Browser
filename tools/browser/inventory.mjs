@@ -77,8 +77,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   if (actualTailCalls && !configuration.split(';').includes('boot=ON')) {
     throw new Error('Actual tail calls require boot mode.');
   }
-  const wasmOptimization = actualTailCalls ? optimizerIdentity(optimizerTool) : { mode: 'off', flags: [] };
-  const wasmRequirements = actualTailCalls ? ['tail-call'] : [];
+  const simd = configuration.split(';').includes('wasm-simd=ON');
+  if (simd && !configuration.split(';').includes('mission=ON')) {
+    throw new Error('WebAssembly SIMD requires mission mode.');
+  }
+  const wasmOptimization = actualTailCalls ? optimizerIdentity(optimizerTool, { simd }) : { mode: 'off', flags: [] };
+  const wasmRequirements = [...(actualTailCalls ? ['tail-call'] : []), ...(simd ? ['simd128'] : [])];
   const read = (path) => readFileSync(resolve(root, path));
   const config = read('config/scda_v2.toml').toString();
   const count = Number(config.match(/^partitions = (\d+)$/m)?.[1]);
@@ -121,10 +125,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         'src/browser/menu-route.h', 'src/browser/menu-route.cpp');
     }
     if (configuration.includes('menu=ON')) {
+      if (configuration.split(';').includes('mission=ON')) { paths.push('src/browser/webgpu-pthreads.js'); }
       if (configuration.split(';').includes('menu-trace-aborts=ON')) {
         paths.push('src/browser/abort-diagnostic.cpp', 'src/browser/abort-import.js');
       }
-      paths.push('src/browser/render-snapshot.h', 'src/browser/render-snapshot.cpp', 'src/browser/menu-backend.h', 'src/browser/menu-backend.cpp',
+      paths.push('src/browser/render-snapshot.h', 'src/browser/render-snapshot.cpp', 'src/browser/menu-backend.h', 'src/browser/menu-backend.cpp', 'src/browser/shader-inventory.h',
         'src/browser/menu-shaders.h', 'src/browser/menu-shaders.cpp', 'src/browser/menu-pixel-shaders.h', 'src/browser/menu-pixel-shaders.cpp', 'src/browser/menu-texture.h', 'src/browser/menu-texture.cpp',
         'src/browser/menu-input.mjs', 'src/browser/webgpu-transport.h', 'src/browser/webgpu-transport.cpp', 'src/browser/webgpu-transport.mjs',
         'src/browser/webgpu-service.cpp', 'src/browser/webgpu-service.mjs', 'src/browser/menu-runtime.mjs', 'src/browser/menu-shell.mjs',
@@ -147,6 +152,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     image: 'default.xbe', xbeSha256: null, xbeSize: null, requiredStoryFiles: null,
     provenance: 'Generated input hashes captured. Trusted generation XBE identity is absent; real boot is blocked. Never derive trust from the selected ISO.',
   };
+  if (configuration.split(';').includes('mission=ON')) {
+    paths.push('src/browser/loading-io.cpp', 'src/browser/mission-input.h', 'src/browser/mission-input.cpp', 'src/browser/mission-controls.mjs', 'src/browser/mission-metrics.mjs', 'src/browser/mission-clock.h', 'src/browser/mission-stepper.h');
+    if (discIdentity.requiredStoryFiles) {
+      discIdentity.requiredStoryFiles.push({ path: 'Default/DataXb/LMaps/x01_Iceland_a/x01_Iceland_a.lin', minBytes: 13681301 });
+    }
+  }
   if (generationRecord) { paths.push(...generationInputs, ...generationOutputs); }
   const inputs = Object.fromEntries([...new Set(paths)].map((path) => [path, hash(read(path))]));
   const manifest = { schema: 1, wasmOptimization, wasmRequirements, compatibility: (configuration.includes('full-cpu=ON') || configuration.includes('boot=ON')) ? 'wasm-compact-leased-v1' : 'wasm-weak-alias-v1', toolchain, configuration, partitionCount: count, functionCount, namedSymbolCount, ranges, ...discIdentity, ...(kernelExports ? { kernelExports } : {}), inputs };

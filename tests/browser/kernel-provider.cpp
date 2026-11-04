@@ -93,7 +93,7 @@ const auto performanceCounterContracts = [] {
   }
 };
 
-int main() {
+void contracts() {
   performanceCounterContracts();
   Runtime runtime({}, {});
   Memory memory;
@@ -136,7 +136,7 @@ int main() {
   timeRequest.cf = 1;
   put(memory, timeRequest.esp, 0xfffffff0);
   put(memory, timeRequest.esp + 4, 0x13004);
-  std::array<uint8_t, 0x6000> timeBefore, timeAfter;
+  std::vector<uint8_t> timeBefore(0x6000), timeAfter(0x6000);
   memory.Read({}, 0x10000, timeBefore.data(), timeBefore.size());
   const uint64_t earliest = Runtime::SystemTime();
   systemTime(timeRequest);
@@ -255,7 +255,7 @@ int main() {
       put(memory, request.esp, 0xfffffff0);
       put(memory, request.esp + 4, reset);
       put(memory, request.esp + 8, parameter);
-      std::array<uint8_t, 0x6000> before, after;
+      std::vector<uint8_t> before(0x6000), after(0x6000);
       memory.Read({}, 0x10000, before.data(), before.size());
       initializePhy(request);
       memory.Read({}, 0x10000, after.data(), after.size());
@@ -304,7 +304,7 @@ int main() {
     put(memory, second.fs_base + 0x24, 0x11223307);
     put(memory, request.esp, 0xfffffff0);
     put(memory, request.esp + 4, 0xffffffff);
-    std::array<uint8_t, 0x6000> before, after;
+    std::vector<uint8_t> before(0x6000), after(0x6000);
     memory.Read({}, 0x10000, before.data(), before.size());
     raiseDpc(request);
     memory.Read({}, 0x10000, after.data(), after.size());
@@ -399,7 +399,7 @@ int main() {
       put(memory, first.fs_base + 0x24, 0xaabbcc00 + level);
       put(memory, second.fs_base + 0x24, 0x11223307);
       put(memory, request.esp, 0xfffffff0);
-      std::array<uint8_t, 0x6000> before, after;
+      std::vector<uint8_t> before(0x6000), after(0x6000);
       memory.Read({}, 0x10000, before.data(), before.size());
       raise(request);
       memory.Read({}, 0x10000, after.data(), after.size());
@@ -492,7 +492,9 @@ int main() {
   fault([&] { invoke(second, 294); });
   fault([&] { invoke(first, 291); });
   check(word(memory, cs + 20) == 2, "rejected mutation changed recursion");
+  const auto recursiveSequence = runtime.Sequence();
   invoke(first, 294);
+  check(runtime.Sequence() == recursiveSequence, "recursive critical section release woke unrelated workers");
   std::atomic<bool> acquired = false;
   std::exception_ptr failure;
   std::thread waiter([&] {
@@ -506,11 +508,16 @@ int main() {
   while (word(memory, cs + 16) != 1 && std::chrono::steady_clock::now() < deadline) { std::this_thread::sleep_for(1ms); }
   const bool reserved = word(memory, cs + 16) == 1;
   const bool blocked = !acquired.load();
+  const auto contendedSequence = runtime.Sequence();
   invoke(first, 294);
   waiter.join();
   if (failure) { std::rethrow_exception(failure); }
   check(reserved && blocked && acquired.load(), "contended enter did not wait for release");
+  check(runtime.Sequence() == contendedSequence + 1, "critical section handoff must wake its real waiter exactly once");
   check(word(memory, cs + 16) == UINT32_MAX && !word(memory, cs + 20) && !word(memory, cs + 24), "handoff did not restore unlocked state");
+  const auto idleSequence = runtime.Sequence();
+  for (size_t n = 0; n < 100; ++n) { invoke(first, 277); invoke(first, 294); }
+  check(runtime.Sequence() == idleSequence, "uncontended critical section releases woke unrelated workers");
   fault([&] { invoke(first, 294); });
   for (const uint32_t address : {0u, 0x12001u, 0x15ff0u, 0xfffffff0u}) {
     first.esp = 0x14000;
@@ -572,4 +579,9 @@ int main() {
   retired.join();
   check(cancelled.load() && word(memory, cs + 16) == 0 && word(memory, cs + 24) == 0x10080, "cancellation failed to retire waiter reservation");
   std::puts("kernel-provider-contracts-ok");
+}
+
+int main() {
+  try { contracts(); }
+  catch (const std::exception& error) { std::fprintf(stderr, "%s\n", error.what()); return 1; }
 }

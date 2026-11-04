@@ -23,15 +23,16 @@ if (result.status !== 0) { process.exit(result.status ?? 1); }
 const guest = spawnSync(compiler, [
   '-std=c++20', '-O1', '-pthread', '-sPTHREAD_POOL_SIZE=1', '-sINITIAL_MEMORY=33554432', '-I', resolve(root, 'src'),
   resolve(root, 'tests/browser/webgpu-service-guest.cpp'), resolve(root, 'src/browser/webgpu-transport.cpp'),
+  '--pre-js', resolve(root, 'src/browser/webgpu-pthreads.js'),
   '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=web,worker', '-sALLOW_MEMORY_GROWTH=1',
-  '-sEXPORTED_FUNCTIONS=["_gpu_execute","_gpu_reply","_gpu_reply_size","_gpu_command","_gpu_pthread_unbound","_malloc","_free"]', '-sEXPORTED_RUNTIME_METHODS=["HEAPU8"]',
+  '-sEXPORTED_FUNCTIONS=["_gpu_execute","_gpu_clock_probe","_gpu_reply","_gpu_reply_size","_gpu_command","_gpu_pthread_unbound","_malloc","_free"]', '-sEXPORTED_RUNTIME_METHODS=["HEAPU8"]',
   '-o', resolve(output, 'webgpu-service-guest.mjs')
 ], { stdio: 'inherit', cwd: root, env });
 if (guest.error) { throw guest.error; }
 if (guest.status !== 0) { process.exit(guest.status ?? 1); }
 const publicRoot = resolve(output, 'public');
 const fixtures = ['src/browser/webgpu-service.mjs', 'src/browser/webgpu-transport.mjs',
-  'tests/browser/webgpu-service.html', 'tests/browser/webgpu-service-guest.mjs',
+  'tests/browser/webgpu-service.html', 'tests/browser/webgpu-service-guest.mjs', 'tests/browser/webgpu-frame-capture.html',
   'tests/browser/webgpu-service-lifecycle.html', 'tests/browser/webgpu-service-loss.mjs', 'tests/browser/webgpu-service-loss-module.mjs',
   'out/browser-webgpu-tests/webgpu-service.mjs', 'out/browser-webgpu-tests/webgpu-service.wasm',
   'out/browser-webgpu-tests/webgpu-service-guest.mjs', 'out/browser-webgpu-tests/webgpu-service-guest.wasm'];

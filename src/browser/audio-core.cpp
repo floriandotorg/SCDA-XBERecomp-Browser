@@ -435,6 +435,13 @@ const Voice* VoiceBank::Find(uint32_t id) const {
 
 uint32_t VoiceBank::Count() const { return uint32_t(voices_.size()); }
 
+bool VoiceBank::Sounding(uint64_t now) const {
+  for (const auto& [id, voice] : voices_) {
+    if (voice.IsStream() ? voice.Active() && !voice.Paused() && voice.QueuedPackets() : voice.Status(now) & kStatusPlaying) { return true; }
+  }
+  return false;
+}
+
 std::vector<uint32_t> VoiceBank::Ids() const {
   std::vector<uint32_t> ids;
   ids.reserve(voices_.size());

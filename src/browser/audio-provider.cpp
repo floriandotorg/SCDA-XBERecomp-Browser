@@ -237,9 +237,9 @@ void AudioProvider::AdvanceVoiceLocked(const X86Context& ctx, uint32_t obj, audi
 }
 
 void AudioProvider::AdvanceAllLocked(const X86Context& ctx, uint64_t now) {
-  for (const uint32_t id : bank_.Ids()) {
-    if (audio::Voice* voice = bank_.Find(id)) { AdvanceVoiceLocked(ctx, id, *voice, now); }
-  }
+  std::vector<audio::Completion> completions;
+  bank_.AdvanceAll(now, completions);
+  PublishLocked(ctx, completions, nullptr, 0);
 }
 
 void AudioProvider::PublishLocked(const X86Context& ctx, std::vector<audio::Completion>& completions,
@@ -284,18 +284,7 @@ void AudioProvider::Deliver(X86Context& ctx, uint8_t* base, const std::vector<Pe
   }
 }
 
-bool AudioProvider::SoundingLocked(uint64_t now) const {
-  for (const uint32_t id : bank_.Ids()) {
-    const audio::Voice* voice = bank_.Find(id);
-    if (!voice) { continue; }
-    if (voice->IsStream()) {
-      if (voice->Active() && !voice->Paused() && voice->QueuedPackets()) { return true; }
-    } else if (voice->Status(now) & audio::kStatusPlaying) {
-      return true;
-    }
-  }
-  return false;
-}
+bool AudioProvider::SoundingLocked(uint64_t now) const { return bank_.Sounding(now); }
 
 void AudioProvider::FeedDispatchLocked(const X86Context& ctx) {
   FeedTickLocked(ctx, runtime_.TimerTime(ctx));
@@ -304,9 +293,9 @@ void AudioProvider::FeedDispatchLocked(const X86Context& ctx) {
 void AudioProvider::FeedTickLocked(const X86Context& context, uint64_t now) {
   while (true) {
     const SilentAudioSnapshot snapshot = sink_->Snapshot();
-    if (snapshot.paused || !SoundingLocked(snapshot.consumedFrames)) { return; }
+    if (snapshot.paused) { return; }
     const uint64_t space = SilentAudioSink::kCapacityFrames - std::min<uint64_t>(snapshot.queuedFrames, SilentAudioSink::kCapacityFrames);
-    if (!space) { return; }
+    if (!space || !SoundingLocked(snapshot.consumedFrames)) { return; }
     const size_t frames = size_t(std::min<uint64_t>(space, kFeedChunkFrames));
     sink_->SubmitAtTime(context, now, std::span(silence_.data(), frames * ::audio::kChannels));
   }
@@ -326,6 +315,7 @@ AudioProvider::SnapshotData AudioProvider::Snapshot() const {
   SnapshotData snapshot;
   snapshot.device = device_;
   snapshot.voices = bank_.Count();
+  snapshot.voiceLimitRejections = voiceLimitRejections_;
   snapshot.arenaFreeBytes = ArenaFreeBytes();
   snapshot.publishedCompletions = published_.load();
   snapshot.deliveredCallbacks = delivered_.load();
@@ -348,7 +338,8 @@ uint32_t AudioProvider::CreateBuffer(const X86Context& ctx, uint32_t descriptor,
   const audio::Format format = ReadFormat(ctx, wave, "DirectSound buffer");
   auto bins = ReadMixBins(ctx, mixbins, 8);
   if (bank_.Count() >= audio::kMaxVoices) {
-    throw Fault(ctx, ctx.esp, 0, "audio voice budget exhausted");
+    if (voiceLimitRejections_ != UINT32_MAX) { ++voiceLimitRejections_; }
+    return audio::kGuestErrorFail;
   }
   const uint32_t obj = ArenaAllocate(ctx, kBufferObjectBytes);
   uint32_t owned = 0;
@@ -391,7 +382,8 @@ uint32_t AudioProvider::CreateStream(const X86Context& ctx, uint32_t descriptor,
   const audio::Format format = ReadFormat(ctx, wave, "DirectSound stream");
   auto bins = ReadMixBins(ctx, mixbins, 8);
   if (bank_.Count() >= audio::kMaxVoices) {
-    throw Fault(ctx, ctx.esp, 0, "audio voice budget exhausted");
+    if (voiceLimitRejections_ != UINT32_MAX) { ++voiceLimitRejections_; }
+    return audio::kGuestErrorFail;
   }
   const uint32_t obj = ArenaAllocate(ctx, kStreamObjectBytes);
   if (bank_.CreateStream(obj, format, maxPackets) != audio::AudioError::kNone) {

@@ -154,6 +154,112 @@ uint32_t TemporaryFilesystem::WriteFile(const std::string& path, std::span<const
   return 0;
 }
 
+uint32_t TemporaryFilesystem::Delete(const std::string& path) {
+  const auto normalized = Normalize(path);
+  if (!normalized) { return 0xc0000033; }
+  std::lock_guard lock(lock_);
+  const auto node = nodes_.find(*normalized);
+  if (node == nodes_.end()) { return 0xc0000034; }
+  if (normalized->empty() || (node->second.attributes & 1)) { return 0xc0000022; }
+  const auto next = nodes_.lower_bound(*normalized + "\\");
+  if (node->second.directory && next != nodes_.end() && next->first.starts_with(*normalized + "\\")) { return 0xc0000101; }
+  allocated_ -= node->second.directory ? AllocationUnit : std::max(Allocation(node->second.bytes.size()), node->second.reservation);
+  nodes_.erase(node);
+  return 0;
+}
+
+uint32_t TemporaryFilesystem::Rename(const std::string& source, const std::string& destination, bool replace) {
+  const auto from = Normalize(source), to = Normalize(destination);
+  if (!from || !to) { return 0xc0000033; }
+  std::lock_guard lock(lock_);
+  const auto node = nodes_.find(*from);
+  if (node == nodes_.end()) { return 0xc0000034; }
+  if (from->empty() || to->empty() || (node->second.attributes & 1)) { return 0xc0000022; }
+  if (node->second.directory) { return 0xc00000bb; }
+  if (*from == *to) { return 0; }
+  if (const auto status = ParentStatus(*to)) { return status; }
+  const auto target = nodes_.find(*to);
+  if (target != nodes_.end()) {
+    if (!replace) { return 0xc0000035; }
+    if (target->second.directory || (target->second.attributes & 1)) { return 0xc0000022; }
+  }
+  const auto now = clock_();
+  std::string replacement = *to;
+  if (target != nodes_.end()) {
+    allocated_ -= std::max(Allocation(target->second.bytes.size()), target->second.reservation);
+    nodes_.erase(target);
+  }
+  auto moved = nodes_.extract(node);
+  moved.key().swap(replacement);
+  moved.mapped().changeTime = now;
+  nodes_.insert(std::move(moved));
+  return 0;
+}
+
+uint32_t TemporaryFilesystem::Resize(const std::string& path, uint64_t size) {
+  const auto normalized = Normalize(path);
+  if (!normalized) { return 0xc0000033; }
+  std::lock_guard lock(lock_);
+  const auto node = nodes_.find(*normalized);
+  if (node == nodes_.end()) { return 0xc0000034; }
+  if (node->second.directory) { return 0xc00000ba; }
+  if (node->second.attributes & 1) { return 0xc0000022; }
+  if (size >> 63) { return 0xc000000d; }
+  if (size > capacity_) { return 0xc000007f; }
+  const auto previous = std::max(Allocation(node->second.bytes.size()), node->second.reservation);
+  const auto reservation = size < node->second.bytes.size() ? std::min(node->second.reservation, Allocation(size)) : node->second.reservation;
+  const auto allocation = std::max(Allocation(size), reservation);
+  if (allocation > capacity_ - allocated_ + previous) { return 0xc000007f; }
+  const auto now = clock_();
+  node->second.bytes.resize(size);
+  node->second.reservation = reservation;
+  node->second.lastWriteTime = now;
+  node->second.changeTime = now;
+  allocated_ = allocated_ - previous + allocation;
+  return 0;
+}
+
+uint32_t TemporaryFilesystem::Reserve(const std::string& path, uint64_t size) {
+  const auto normalized = Normalize(path);
+  if (!normalized) { return 0xc0000033; }
+  std::lock_guard lock(lock_);
+  const auto node = nodes_.find(*normalized);
+  if (node == nodes_.end()) { return 0xc0000034; }
+  if (node->second.directory) { return 0xc00000ba; }
+  if (node->second.attributes & 1) { return 0xc0000022; }
+  if (size >> 63) { return 0xc000000d; }
+  if (size > capacity_) { return 0xc000007f; }
+  const auto previous = std::max(Allocation(node->second.bytes.size()), node->second.reservation);
+  const auto allocation = Allocation(size);
+  if (allocation > capacity_ - allocated_ + previous) { return 0xc000007f; }
+  const auto now = clock_();
+  if (size < node->second.bytes.size()) { node->second.bytes.resize(size); node->second.lastWriteTime = now; }
+  node->second.reservation = allocation;
+  node->second.changeTime = now;
+  allocated_ = allocated_ - previous + allocation;
+  return 0;
+}
+
+uint32_t TemporaryFilesystem::SetBasic(const std::string& path, const std::array<uint64_t, 4>& times, uint32_t attributes) {
+  const auto normalized = Normalize(path);
+  if (!normalized) { return 0xc0000033; }
+  std::lock_guard lock(lock_);
+  const auto node = nodes_.find(*normalized);
+  if (node == nodes_.end()) { return 0xc0000034; }
+  if ((attributes & ~0xb7u) || ((attributes & 0x10) && !node->second.directory) ||
+      ((attributes & 0x80) && attributes != 0x80)) { return 0xc000000d; }
+  for (const auto time : times) {
+    if ((time >> 63) && time < UINT64_MAX - 1) { return 0xc000000d; }
+  }
+  std::array<uint64_t*, 4> fields{&node->second.creationTime, &node->second.lastAccessTime,
+    &node->second.lastWriteTime, &node->second.changeTime};
+  for (size_t n = 0; n < times.size(); ++n) {
+    if (times[n] && times[n] < UINT64_MAX - 1) { *fields[n] = times[n]; }
+  }
+  if (attributes) { node->second.attributes = (node->second.directory ? 0x10u : 0u) | (attributes & ~0x10u); }
+  return 0;
+}
+
 uint32_t TemporaryFilesystem::Write(const std::string& path, uint64_t offset, std::span<const uint8_t> bytes) {
   const auto normalized = Normalize(path);
   if (!normalized) { return 0xc0000033; }

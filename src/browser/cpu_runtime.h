@@ -19,6 +19,12 @@
 #include <type_traits>
 #include <vector>
 
+#ifdef __wasm_tail_call__
+#define BROWSER_GUEST_TAIL [[clang::musttail]] return
+#else
+#define BROWSER_GUEST_TAIL return
+#endif
+
 namespace browser {
 
 struct Fault : std::runtime_error {
@@ -45,9 +51,31 @@ class Memory {
   mutable std::recursive_mutex memoryLock_;
   size_t leases_ = 0;
   static thread_local size_t threadBorrows_;
+  static thread_local Memory* borrowedMemory_;
+  static thread_local Memory* mutatedMemory_;
+  bool HasAccess() const { return borrowedMemory_ == this || mutatedMemory_ == this; }
   std::vector<Region> regions_;
   std::array<size_t, 256> regionLookup_{};
   std::shared_ptr<Storage> physicalStorage_;
+  std::vector<uint64_t> physicalVersions_;
+  uint64_t physicalEpoch_ = 0;
+  struct Page {
+    uint8_t* bytes = nullptr;
+    uint64_t* version = nullptr;
+  };
+  std::vector<Page> pages_;
+  void InitializePages();
+  Page* PageAt(uint32_t address, size_t size) {
+    if (pages_.empty() || !size || size > 16 || size > 4096 - (address & 4095)) { return nullptr; }
+    auto& page = pages_[address >> 12];
+    return page.bytes ? &page : nullptr;
+  }
+  void MarkPageWrite(const X86Context& ctx, uint32_t address, size_t size, Page& page) {
+    if (!page.version) { return; }
+    if (physicalEpoch_ == UINT64_MAX) { throw Fault(ctx, address, size, "physical write version exhausted"); }
+    *page.version = ++physicalEpoch_;
+  }
+  void MarkPhysicalWrite(const X86Context& ctx, const Region& region, size_t offset, size_t size);
   void RequireMutable(uint32_t address, size_t size);
   Region& RegionAt(const X86Context& ctx, uint32_t address, size_t size);
   void Validate(const X86Context& ctx, uint32_t address, size_t size);
@@ -56,19 +84,29 @@ public:
   class Lease {
     Memory& memory_;
     std::unique_lock<std::recursive_mutex> lock_;
+    Memory* previous_;
   public:
-    explicit Lease(Memory& memory) : memory_(memory), lock_(memory.memoryLock_) { ++memory_.leases_; ++threadBorrows_; }
-    ~Lease() { --threadBorrows_; --memory_.leases_; }
+    explicit Lease(Memory& memory) : memory_(memory), lock_(memory.memoryLock_), previous_(borrowedMemory_) { ++memory_.leases_; ++threadBorrows_; borrowedMemory_ = &memory_; }
+    ~Lease() { borrowedMemory_ = previous_; --threadBorrows_; --memory_.leases_; }
     Lease(const Lease&) = delete;
     Lease& operator=(const Lease&) = delete;
   };
   class Mutation {
     std::unique_lock<std::recursive_mutex> lock_;
+    Memory* previous_;
   public:
-    explicit Mutation(Memory& memory) : lock_(memory.memoryLock_) { memory.RequireMutable(0, 0); }
+    explicit Mutation(Memory& memory) : lock_(memory.memoryLock_), previous_(mutatedMemory_) {
+      memory.RequireMutable(0, 0);
+      mutatedMemory_ = &memory;
+    }
+    ~Mutation() { mutatedMemory_ = previous_; }
+    Mutation(const Mutation&) = delete;
+    Mutation& operator=(const Mutation&) = delete;
   };
   Mutation Mutate() { return Mutation(*this); }
   Lease Borrow() { return Lease(*this); }
+  void BeginBlock();
+  void EndBlock() noexcept;
   static bool HasBorrow() { return threadBorrows_ != 0; }
   Memory();
   void Map(uint32_t address, uint32_t size);
@@ -95,8 +133,23 @@ public:
   uint8_t* Span(const X86Context& ctx, uint32_t address, size_t size);
   uint32_t GuestAddress(const X86Context& ctx, const void* pointer, size_t size);
   void CheckRange(const X86Context& ctx, uint32_t address, size_t size);
+  std::optional<uint64_t> PhysicalWriteVersion(const X86Context& ctx, uint32_t address, size_t size);
   void Read(const X86Context& ctx, uint32_t address, void* output, size_t size);
   void Write(const X86Context& ctx, uint32_t address, const void* input, size_t size);
+  template <typename T> [[gnu::noinline]] T Load(const X86Context& ctx, uint32_t address) {
+    T value;
+    auto* page = HasAccess() ? PageAt(address, sizeof(T)) : nullptr;
+    if (page) { std::memcpy(&value, page->bytes + (address & 4095), sizeof(T)); }
+    else { Read(ctx, address, &value, sizeof(T)); }
+    return value;
+  }
+  template <typename T> [[gnu::noinline]] void Store(const X86Context& ctx, uint32_t address, T value) {
+    auto* page = HasAccess() ? PageAt(address, sizeof(T)) : nullptr;
+    if (page) {
+      MarkPageWrite(ctx, address, sizeof(T), *page);
+      std::memcpy(page->bytes + (address & 4095), &value, sizeof(T));
+    } else { Write(ctx, address, &value, sizeof(T)); }
+  }
   void Copy(const X86Context& ctx, uint32_t destination, uint32_t source, size_t size);
   size_t BackingBytes() const;
   uint8_t* Base() { return reinterpret_cast<uint8_t*>(this); }
@@ -112,12 +165,10 @@ public:
   Reference(Memory& memory, X86Context& context, uint32_t address)
     : memory_(memory), context_(context), address_(address) {}
   operator T() const {
-    T value;
-    memory_.Read(context_, address_, &value, sizeof(value));
-    return value;
+    return memory_.Load<T>(context_, address_);
   }
   Reference& operator=(T value) {
-    memory_.Write(context_, address_, &value, sizeof(value));
+    memory_.Store<T>(context_, address_, value);
     return *this;
   }
   Reference& operator=(const Reference& value) { return *this = T(value); }

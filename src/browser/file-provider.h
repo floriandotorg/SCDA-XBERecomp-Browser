@@ -6,11 +6,17 @@
 
 namespace browser {
 
+class RawCache;
+
 struct DiscReadSnapshot {
   uint64_t assetBytes = 0;
   uint64_t assetOperations = 0;
   uint64_t executableBytes = 0;
   uint64_t executableOperations = 0;
+  uint64_t waitMicroseconds = 0;
+  std::string lastPath;
+  uint64_t lastOffset = 0;
+  uint32_t lastBytes = 0;
 };
 
 struct FileOpenDiagnostic {
@@ -25,12 +31,21 @@ struct FileOpenDiagnostic {
   uint64_t allocationBytes = 0;
 };
 
+struct FileOperationDiagnostic {
+  uint32_t ordinal;
+  uint32_t informationClass;
+  uint32_t status;
+  uint32_t length;
+  std::string path;
+};
+
 std::function<bool(uint32_t)> InstallFileProvider(Runtime& runtime, PreparedImage& image,
   std::shared_ptr<const kernel::DiscIndex> disc, std::shared_ptr<TemporaryFilesystem> temporary = {},
   std::vector<KernelDataExport>* dataExports = nullptr,
   std::function<DiscReadSnapshot()>* discReads = nullptr,
   std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic = {},
-  std::function<bool(uint32_t)>* ownsHandle = nullptr);
+  std::function<bool(uint32_t)>* ownsHandle = nullptr, std::shared_ptr<RawCache> cache = {},
+  std::function<void(FileOperationDiagnostic)> operationDiagnostic = {}, uint32_t maximumReadBytes = 1u << 20);
 std::shared_ptr<const kernel::DiscIndex> MountedIsoDisc();
 
 }

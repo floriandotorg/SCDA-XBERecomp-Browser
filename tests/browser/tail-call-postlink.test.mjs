@@ -46,6 +46,17 @@ test('optimizer identity pins the actual version and binary digest', () => {
   assert.throws(() => optimizerIdentity(fixture({ version: 132 }).tool), /133/);
 });
 
+test('SIMD postlink explicitly pins its additional feature without changing default flags', () => {
+  const files = fixture();
+  const identity = optimizerIdentity(files.tool, { simd: true });
+  assert.equal(identity.simd, true);
+  assert.deepEqual(identity.flags, [...tailCallFlags, '--enable-simd']);
+  publishWasm({ ...files, optimization: { ...identity, tool: files.tool } });
+  assert.deepEqual(JSON.parse(readFileSync(join(files.directory, 'args.json'), 'utf8')).slice(1, -2), identity.flags);
+  assert.deepEqual(optimizerIdentity(files.tool).flags, tailCallFlags);
+  assert.throws(() => publishWasm({ ...files, optimization: { ...identity, simd: false, tool: files.tool } }), /flags|changed/);
+});
+
 test('failure and provenance mismatches never replace the previous final artifact', () => {
   const files = fixture({ fail: true });
   const optimization = { ...optimizerIdentity(files.tool), tool: files.tool };

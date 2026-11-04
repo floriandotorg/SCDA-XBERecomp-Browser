@@ -15,7 +15,8 @@ X86_FUNC(ML_GUEST(XLaunchNewImageA)) {
 
 namespace browser {
 
-MenuLaunch::MenuLaunch(Runtime& runtime, PreparedImage& image) : runtime_(runtime), image_(image), memory_(image.memory.get()) {
+MenuLaunch::MenuLaunch(Runtime& runtime, PreparedImage& image, bool originalLaunch)
+  : runtime_(runtime), image_(image), memory_(image.memory.get()), originalLaunch_(originalLaunch) {
   runtime.Checkpoint({});
   if (!memory_ || image.importsBound || image.boundRuntime || runtime.HasPublishedImage() || runtime.ActiveWorkers() ||
       Memory::HasBorrow() || (image.diagnosticRuntime && image.diagnosticRuntime != &runtime) ||
@@ -73,7 +74,55 @@ bool MenuLaunch::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
     }
   }
   runtime_.Checkpoint(ctx);
+  if (originalLaunch_) { return true; }
   throw request;
+}
+
+void MenuLaunch::InstallFirmware(uint32_t launchCell) {
+  runtime_.Checkpoint({});
+  if (!originalLaunch_ || !BelongsTo(runtime_, image_) || image_.importsBound || runtime_.HasPublishedImage() ||
+      runtime_.ActiveWorkers() || runtime_.KernelTarget(49) || Memory::HasBorrow() || !launchCell || launchCell % 4) {
+    throw Fault({}, launchCell, 4, "firmware restart requires its cold owned story runtime and launch cell");
+  }
+  memory_->CheckRange({}, launchCell, 4);
+  runtime_.RegisterKernel(49, [this, launchCell](X86Context& ctx, uint8_t* base) {
+    if (!BelongsTo(runtime_, image_) || !image_.importsBound || image_.boundRuntime != &runtime_ ||
+        base != memory_->Base() || !runtime_.OwnsCurrentContext(ctx) || Memory::HasBorrow()) {
+      throw Fault(ctx, 49, 0, "firmware restart requires its bound current image worker");
+    }
+    runtime_.Checkpoint(ctx);
+    MenuLaunchRequested request;
+    {
+      auto lease = memory_->Borrow();
+      std::array<uint32_t, 2> frame{};
+      memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+      if (frame[1] != 2) { throw Fault(ctx, 49, frame[1], "unsupported firmware restart mode"); }
+      uint32_t address = 0;
+      memory_->Read(ctx, launchCell, &address, 4);
+      if (!address || address % 4096) { throw Fault(ctx, address, 4096, "missing or unaligned firmware launch page"); }
+      request.page.emplace();
+      memory_->Read(ctx, address, request.page->data(), request.page->size());
+      for (size_t n = 8; n < 528; ++n) {
+        const uint8_t value = (*request.page)[n];
+        if (!value) { break; }
+        if (value < 32 || value > 126 || n == 527) { throw Fault(ctx, address + 8, 520, "invalid firmware image path"); }
+        request.path.push_back(char(value));
+      }
+      auto lower = request.path;
+      for (char& value : lower) {
+        if (value >= 'A' && value <= 'Z') { value = char(value + ('a' - 'A')); }
+      }
+      constexpr std::string_view executable = "default.xbe";
+      if (!lower.ends_with(executable) || (lower.size() > executable.size() &&
+          lower[lower.size() - executable.size() - 1] != '\\' && lower[lower.size() - executable.size() - 1] != ';')) {
+        throw Fault(ctx, address + 8, 520, "unsupported firmware executable; return to the single player shell");
+      }
+      request.hasData = true;
+      std::copy(request.page->begin() + 1024, request.page->end(), request.data.begin());
+    }
+    runtime_.Checkpoint(ctx);
+    throw request;
+  });
 }
 
 }

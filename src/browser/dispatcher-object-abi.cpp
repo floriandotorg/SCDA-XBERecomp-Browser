@@ -43,8 +43,7 @@ void InvokeDispatcherObject(DispatcherHandles& handles, Memory& memory, X86Conte
   if (creating) {
     if (frame[2]) { throw Fault(ctx, frame[2], 0, "dispatcher object attributes are not implemented"); }
     if ((ordinal == 189 || ordinal == 194) && frame[3] > 1) { throw Fault(ctx, frame[3], 0, "invalid guest dispatcher type"); }
-    if (ordinal == 192 && frame[3] > 1) { throw Fault(ctx, frame[3], 0, "unsupported mutant ownership flags"); }
-    if (ordinal == 192 && frame[3] && !ctx.thread_handle) {
+    if (ordinal == 192 && (frame[3] & 0xFF) && !ctx.thread_handle) {
       throw Fault(ctx, 0, 0, "initial mutant ownership requires a nonzero context owner");
     }
   }

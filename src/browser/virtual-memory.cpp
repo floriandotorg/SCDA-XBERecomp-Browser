@@ -3,13 +3,18 @@
 #include "browser/kernel-provider.h"
 #include <algorithm>
 #include <array>
+#include <cstdio>
 
 namespace browser {
 namespace {
 
 class VirtualMemory {
   static constexpr uint32_t arenaBase = 0x10000000;
+#if defined(BROWSER_MISSION) && BROWSER_MISSION
+  static constexpr uint32_t capacity = 64u << 20;
+#else
   static constexpr uint32_t capacity = 16u << 20;
+#endif
   static constexpr size_t reservationLimit = 1024;
   struct Reservation {
     uint32_t base;
@@ -18,6 +23,7 @@ class VirtualMemory {
   };
   std::vector<Reservation> reservations_;
   std::vector<Reservation> stacks_;
+  uint32_t reportedFailures_ = 0;
 public:
   explicit VirtualMemory(Memory& memory) {
     reservations_.reserve(reservationLimit);
@@ -328,6 +334,13 @@ public:
         size = uint32_t(end - address);
       }
     }
+#if defined(BROWSER_MENU_TRACE_ABORTS) && BROWSER_MENU_TRACE_ABORTS
+    if (status == 0xc0000017 && reportedFailures_ < 64) {
+      ++reportedFailures_;
+      std::fprintf(stderr, "[browser-virtual-allocation] size=%u base=0x%08X flags=0x%08X capacity=%u reservations=%zu\n",
+        size, base, frame[4], capacity, reservations_.size());
+    }
+#endif
     if (!status) {
       memory.Write(ctx, frame[1], &base, 4);
       memory.Write(ctx, frame[3], &size, 4);

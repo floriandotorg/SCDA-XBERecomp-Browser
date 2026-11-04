@@ -147,7 +147,12 @@ public:
   std::shared_ptr<uint8_t> lifetime = std::make_shared<uint8_t>(0);
   uint32_t initializations = 0;
   uint32_t clears = 0;
+  uint32_t copies = 0, copiedCount = 0, copiedRects = 0, copiedPoints = 0;
+  bool copiedOnCpu = false;
+  bool HasGpuContents(uint32_t) const override { return !copiedOnCpu; }
+  gpu::Surface copiedSource{}, copiedDestination{};
   uint32_t draws = 0;
+  bool cancelDraw = false;
   uint32_t flags = 0;
   uint32_t lateSyncs = 0;
   uint32_t syncs = 0;
@@ -181,12 +186,18 @@ public:
   }
   void Draw(const gpu::State& value, uint32_t primitive, uint32_t start, uint32_t count, const uint8_t* data) override {
     check(primitive == 5 && !start && count == 3, "draw ABI mismatch");
+    if (cancelDraw) { throw browser::Cancelled({}); }
     state = value;
     indices.resize(data ? count : 0);
     if (data) { std::memcpy(indices.data(), data, count * 2); }
     ++draws;
   }
-  void Copy(const gpu::Surface&, const gpu::Surface&, uint32_t, uint32_t, uint32_t) override {}
+  void Copy(const gpu::Surface& source, const gpu::Surface& destination, uint32_t count, uint32_t rects, uint32_t points) override {
+    check(!browser::Memory::HasBorrow(), "CopyRects retained a guest lease");
+    copiedCount = count; copiedRects = rects; copiedPoints = points;
+    copiedSource = source; copiedDestination = destination;
+    ++copies;
+  }
   void Present(const gpu::Surface& value, bool pillarbox) override {
     check(!pillarbox, "unexpected diagnostic pillarbox substitution");
     if (rejectPresent) { throw std::runtime_error("injected present failure"); }
@@ -424,6 +435,7 @@ int captureContracts(bool rendering, bool failInitialization = false) {
       image.memory->Write(ctx, ctx.esp, invalid.data(), sizeof(invalid));
       rejects([&] { sub_0049A3D0(ctx, base); });
       check(ctx.esp == 0x22000 && probe->gammaCalls == 1, "invalid Gamma source reached backend or advanced stack");
+
     }
     const auto typedState = std::make_unique<gpu::State>();
     const auto refresh = [&]() -> const gpu::State& {
@@ -638,6 +650,16 @@ int captureContracts(bool rendering, bool failInitialization = false) {
       sub_004A6240(ctx, base);
       check(ctx.esp == 0x22010 && probe->draws == 2 &&
         probe->indices == std::vector<uint16_t>({2, 0, 1}), "indexed draw bytes were not delegated");
+      probe->cancelDraw = true;
+      ctx.esp = 0x22000;
+      image.memory->Write(ctx, ctx.esp, draw.data(), sizeof(draw));
+      bool cancellationPreserved = false;
+      try { sub_004A61A0(ctx, base); }
+      catch (const browser::Cancelled&) { cancellationPreserved = true; }
+      catch (const browser::Fault&) {}
+      check(cancellationPreserved && ctx.esp == 0x22000 && probe->draws == 2,
+        "graphics cancellation must retain its type instead of masking the original worker failure");
+      probe->cancelDraw = false;
       const auto draws = probe->draws;
       auto invalid = indexed;
       invalid[3] = 0x23ffe;
@@ -696,6 +718,43 @@ int captureContracts(bool rendering, bool failInitialization = false) {
         "invalid persistence metadata reached GPU or replaced the valid frame");
       image.memory->Write(ctx, snapshot.resources[0].header + 16, &snapshot.resources[0].size, 4);
       probe->onSync = {};
+      const std::array<uint32_t, 6> copy{0xabcdef, snapshot.resources[0].header, 0, 0, snapshot.resources[1].header, 0};
+      ctx.esp = 0x22000;
+      image.memory->Write(ctx, ctx.esp, copy.data(), sizeof(copy));
+      check(!graphics->Dispatch(ctx, base, 21) && ctx.esp == 0x22018 && ctx.eax == 0 && probe->copies == 1 &&
+        probe->copiedSource.header == copy[1] && probe->copiedDestination.header == copy[4], "checked CopyRects did not reach its actual backend surfaces");
+      for (const uint32_t source : {0u, 0x23ff0u}) {
+        auto invalidCopy = copy;
+        invalidCopy[1] = source;
+        ctx.esp = 0x22000;
+        image.memory->Write(ctx, ctx.esp, invalidCopy.data(), sizeof(invalidCopy));
+        rejects([&] { graphics->Dispatch(ctx, base, 21); });
+        check(ctx.esp == 0x22000 && probe->copies == 1, "invalid CopyRects source submitted or changed ABI");
+      }
+      auto partialCopy = copy;
+      partialCopy[3] = 1;
+      ctx.esp = 0x22000;
+      image.memory->Write(ctx, ctx.esp, partialCopy.data(), sizeof(partialCopy));
+      rejects([&] { graphics->Dispatch(ctx, base, 21); });
+      check(ctx.esp == 0x22000 && probe->copies == 1, "unowned partial CopyRects reached backend");
+      const std::array<int32_t, 4> copyRect{0, 0, 1, 1};
+      const std::array<int32_t, 2> copyPoint{1, 0};
+      image.memory->Write(ctx, 0x22100, copyRect.data(), sizeof(copyRect));
+      image.memory->Write(ctx, 0x22120, copyPoint.data(), sizeof(copyPoint));
+      partialCopy[2] = 0x22100; partialCopy[5] = 0x22120;
+      image.memory->Write(ctx, ctx.esp, partialCopy.data(), sizeof(partialCopy));
+      check(!graphics->Dispatch(ctx, base, 21) && ctx.esp == 0x22018 && probe->copies == 2 && probe->copiedCount == 1 &&
+        probe->copiedRects == 0x22100 && probe->copiedPoints == 0x22120, "partial CopyRects did not preserve checked guest lists");
+      probe->copiedOnCpu = true;
+      ctx.esp = 0x22000;
+      image.memory->Write(ctx, ctx.esp, copy.data(), sizeof(copy));
+      check(!graphics->Dispatch(ctx, base, 21), "CPU surface copy delegated to original");
+      const std::array<uint32_t, 2> copiedBlock{0xabcdef, copy[4]};
+      ctx.esp = 0x22000;
+      image.memory->Write(ctx, ctx.esp, copiedBlock.data(), sizeof(copiedBlock));
+      const auto copiedSyncs = probe->syncs;
+      check(!graphics->Dispatch(ctx, base, 8) && probe->syncs == copiedSyncs, "CPU-owned copy demanded unavailable GPU readback");
+      probe->copiedOnCpu = false;
 
     } else {
       rejects([&] { sub_0049CE00(ctx, base); });

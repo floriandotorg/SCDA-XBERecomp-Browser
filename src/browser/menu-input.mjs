@@ -64,6 +64,8 @@ export const createMenuInput = ({ buffer, byteOffset, target = globalThis.window
   const hostControl = (element) => element?.closest?.('input,textarea,select,button,a,summary,[contenteditable]:not([contenteditable="false"])');
   const keydown = (event) => {
     if (!bindings.has(event.code)) { return; }
+    if (event.code === 'Escape' && visibilityTarget.pointerLockElement) { return; }
+    focused = visibilityTarget.hasFocus?.() ?? focused;
     if (!available()) { return; }
     const element = event.composedPath?.()[0] ?? event.target;
     if (hostControl(element)) {
@@ -83,7 +85,10 @@ export const createMenuInput = ({ buffer, byteOffset, target = globalThis.window
     publish();
   };
   const focusout = (event) => { if (hostControl(event.relatedTarget)) { clear(); } };
-  const focusin = (event) => { if (hostControl(event.composedPath?.()[0] ?? event.target)) { clear(); } };
+  const focusin = (event) => {
+    focused = visibilityTarget.hasFocus?.() ?? focused;
+    if (hostControl(event.composedPath?.()[0] ?? event.target)) { clear(); }
+  };
   const blur = () => { focused = false; clear(); };
   const focus = () => { focused = true; clear(); };
   const visibility = () => { clear(); };

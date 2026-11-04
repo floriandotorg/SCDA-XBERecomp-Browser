@@ -28,8 +28,9 @@ constexpr uint32_t validButtons = 131071;
 static_assert(sizeof(std::atomic<uint32_t>) == 4 && std::atomic<uint32_t>::is_always_lock_free);
 }
 
-MenuInput::MenuInput(Runtime& runtime, PreparedImage& image)
-  : runtime_(runtime), image_(image), memory_(image.memory.get()) {
+MenuInput::MenuInput(Runtime& runtime, PreparedImage& image, std::shared_ptr<SharedStorage> storage)
+  : runtime_(runtime), image_(image), memory_(image.memory.get()),
+    storage_(storage ? std::move(storage) : std::make_shared<SharedStorage>()), shared_(*storage_) {
   runtime.Checkpoint({});
   if (!memory_ || image.importsBound || image.boundRuntime || runtime.HasPublishedImage() || runtime.ActiveWorkers() ||
       Memory::HasBorrow() || (image.diagnosticRuntime && image.diagnosticRuntime != &runtime) ||

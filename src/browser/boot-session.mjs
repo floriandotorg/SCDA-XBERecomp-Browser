@@ -1,3 +1,4 @@
+import { MISSION_METRICS_WORDS, MISSION_RENDERER_BYTES } from './mission-metrics.mjs';
 import { createWasmIsoReader } from './iso-wasm.mjs';
 import { prepareDiscImage } from './iso-image.mjs';
 import { readMenuStateDiagnostic, readMenuFileDiagnostics } from './menu-state-report.mjs';
@@ -168,7 +169,8 @@ export const readGraphicsDiagnostic = (module) => {
     const resident = wide(words[2], words[3]);
     if (words[0] > 256) { reject('renderer.pipelineCount', words[0]); }
     if (words[1] > 4096) { reject('renderer.resourceCount', words[1]); }
-    if (resident > 0x4000000n) { reject('renderer.residentBytes', resident); }
+    const mission = typeof module._image_metrics_words === 'function' && module._image_metrics_words() === MISSION_METRICS_WORDS;
+    if (resident > BigInt(mission ? MISSION_RENDERER_BYTES : 64 * 1024 * 1024)) { reject('renderer.residentBytes', resident); }
     if (completed > submitted) { reject('renderer.completedCommands', `${completed}>${submitted}`); }
     if (presented > submitted) { reject('renderer.renderedFrames', `${presented}>${submitted}`); }
     renderer = { pipelineCount: words[0], resourceCount: words[1], residentBytes: resident.toString(),
@@ -219,7 +221,17 @@ const readInputDescriptor = (module) => {
   if (!(buffer instanceof SharedArrayBuffer) || !Number.isInteger(byteOffset) || byteOffset <= 0 || byteOffset % 4 !== 0 ||
       words !== 2 || byteOffset + words * 4 > buffer.byteLength ||
       (Number.isInteger(progress) && byteOffset < progress + 4 && progress < byteOffset + words * 4)) { reject(); }
-  return { buffer, byteOffset, words };
+  const span = (offset, bytes) => {
+    if (!Number.isInteger(offset) || offset < 0 || offset % 4 || (offset && (offset > buffer.byteLength - bytes ||
+        (offset < byteOffset + 8 && byteOffset < offset + bytes) ||
+        (Number.isInteger(progress) && offset < progress + 4 && progress < offset + bytes)))) { reject(); }
+    return offset;
+  };
+  const motionOffset = span(module._image_motion_address?.() ?? 0, 20);
+  const metricsOffset = span(module._image_metrics_address?.() ?? 0, MISSION_METRICS_WORDS * 4);
+  if (metricsOffset && module._image_metrics_words?.() !== MISSION_METRICS_WORDS) { reject(); }
+  if (motionOffset && metricsOffset && motionOffset < metricsOffset + MISSION_METRICS_WORDS * 4 && metricsOffset < motionOffset + 20) { reject(); }
+  return { buffer, byteOffset, words, ...(motionOffset ? { motionOffset } : {}), ...(metricsOffset ? { metricsOffset } : {}) };
 };
 
 const readLaunchRequest = (module) => {
@@ -303,6 +315,10 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
       signal.throwIfAborted();
       module = await create({
         readIsoBytes: read, ...(webgpuMailbox ? { webgpuMailbox } : {}),
+        onFileOperation: operation => {
+          if (!diagnosticsActive || signal.aborted || wasmAborted) { return; }
+          onProgress({ generation, phase: 'file-operation', fileOperation: operation });
+        },
         onAbort: (reason) => {
           if (!diagnosticsActive || signal.aborted || wasmAborted) { return; }
           wasmAborted = true;
@@ -363,21 +379,36 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
       });
       signal.throwIfAborted();
       if (bound) {
-        const address = module._image_progress_address?.();
-        const buffer = module.HEAPU8.buffer;
-        if (!Number.isInteger(address) || address === 0 || address < -0x80000000 || address > 0xffffffff ||
-            (address >>> 0) % 4 || !(buffer instanceof SharedArrayBuffer) || (address >>> 0) + 4 > buffer.byteLength) {
-          throw Object.assign(new Error('A bounded shared runtime progress word is required.'), { code: 'PROGRESS_PROTOCOL' });
+        let completed;
+        for (;;) {
+          const address = module._image_progress_address?.();
+          const buffer = module.HEAPU8.buffer;
+          if (!Number.isInteger(address) || address === 0 || address < -0x80000000 || address > 0xffffffff ||
+              (address >>> 0) % 4 || !(buffer instanceof SharedArrayBuffer) || (address >>> 0) + 4 > buffer.byteLength) {
+            throw Object.assign(new Error('A bounded shared runtime progress word is required.'), { code: 'PROGRESS_PROTOCOL' });
+          }
+          signal.throwIfAborted();
+          onProgress({ generation, phase: 'progress', buffer, address: address >>> 0 });
+          signal.throwIfAborted();
+          const input = readInputDescriptor(module);
+          signal.throwIfAborted();
+          if (input) { onProgress({ generation, phase: 'input', ...input }); }
+          signal.throwIfAborted();
+          if (typeof module._image_restart_count === 'function') {
+            onProgress({ generation, phase: 'runtime', restarts: module._image_restart_count() });
+          }
+          signal.throwIfAborted();
+          completed = module._image_execute() === 1;
+          signal.throwIfAborted();
+          if (completed || module._image_can_restart?.() !== 1) { break; }
+          onProgress({ generation, phase: 'restarting' });
+          signal.throwIfAborted();
+          if (module._image_restart?.() !== 1) {
+            throw Object.assign(new Error('Story runtime replacement failed. Stop and start again to return to the menu.'), { code: 'STORY_RESTART' });
+          }
+          signal.throwIfAborted();
         }
-        signal.throwIfAborted();
-        onProgress({ generation, phase: 'progress', buffer, address: address >>> 0 });
-        signal.throwIfAborted();
-        const input = readInputDescriptor(module);
-        signal.throwIfAborted();
-        if (input) { onProgress({ generation, phase: 'input', ...input }); }
-        signal.throwIfAborted();
-        const completed = module._image_execute() === 1;
-        signal.throwIfAborted();
+
         const start = module._image_fault_message() >>> 0;
         const length = module._image_fault_message_size();
         const checkpoint = module._image_graphics_checkpoint?.() ?? 0;
@@ -415,7 +446,7 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
       }
       signal.throwIfAborted();
       const result = {
-        ok: false, generation, code: 'EXPORT_UNAVAILABLE',
+        ok: false, generation, runtimeRestarts: module._image_restart_count?.() ?? 0, code: 'EXPORT_UNAVAILABLE',
         message: 'Production kernel export binding is incomplete.', ...execution,
         ordinal: module._image_fault_ordinal(), exportName: catalog.get(module._image_fault_ordinal())?.name ?? null,
         ...prepared, coverage,

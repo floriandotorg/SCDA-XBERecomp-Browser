@@ -23,7 +23,16 @@ uint32_t Dispatcher::Create(Kind kind, int32_t signal, int32_t limit, uint32_t o
       return id;
     }
   }
-  throw Fault({}, 0, 0, "dispatcher object capacity exhausted");
+  size_t mutants = 0, closedOwned = 0, threads = 0, timers = 0;
+  for (const auto& object : objects_) {
+    mutants += object->kind == Kind::Mutant;
+    closedOwned += object->kind == Kind::Mutant && object->owner && object->unreferenced;
+    threads += object->kind == Kind::Thread;
+    timers += object->kind == Kind::NotificationTimer || object->kind == Kind::SynchronizationTimer;
+  }
+  const std::string reason = "dispatcher object capacity exhausted: mutants=" + std::to_string(mutants) +
+    " closed-owned=" + std::to_string(closedOwned) + " threads=" + std::to_string(threads) + " timers=" + std::to_string(timers);
+  throw Fault({}, 0, 0, reason.c_str());
 }
 
 uint32_t Dispatcher::CreateEvent(bool notification, bool signaled) {
@@ -128,6 +137,11 @@ void Dispatcher::RefreshTime(const X86Context& ctx) {
   const auto sample = runtime_.TimerTime(ctx);
   if (sample < timerTime_) { throw Fault(ctx, 0, 0, "dispatcher clock regressed"); }
   timerTime_ = sample;
+  bool expired = false;
+  for (auto& object : objects_) {
+    if (object && ExpireTimer(*object)) { expired = true; }
+  }
+  if (expired) { runtime_.Wake(); }
 }
 
 void Dispatcher::AdvanceTime(uint64_t elapsedTicks) {
@@ -254,7 +268,7 @@ Dispatcher::MutantInformation Dispatcher::QueryMutant(uint32_t id, uint32_t owne
 void Dispatcher::RetireUnreferenced(uint32_t id) {
   std::lock_guard lock(lock_);
   auto& object = Find(id);
-  if ((object->kind == Kind::Mutant && object->owner != 0) || (object->kind == Kind::Thread && !object->signal)) {
+  if (object->kind == Kind::Thread && !object->signal) {
     object->unreferenced = true;
     return;
   }
@@ -310,14 +324,17 @@ Dispatcher::WaitOutcome Dispatcher::WaitImpl(const X86Context& ctx, std::span<co
   std::array<std::shared_ptr<Object>, 64> objects{};
   const size_t count = ids.size();
   std::optional<uint64_t> guestDeadline;
+  bool pollClock = false;
   {
     std::lock_guard lock(lock_);
     runtime_.Checkpoint(ctx);
     RefreshTime(ctx);
     if (guestClock && guestTimeout) { guestDeadline = GuestDeadline(ctx, *guestTimeout); }
+    pollClock = runtimeClock_ && guestDeadline.has_value();
     if (waiters_ >= runtime_.WorkerCapacity()) { throw Fault(ctx, 0, 0, "dispatcher waiter capacity exhausted"); }
     for (size_t n = 0; n < count; ++n) {
       objects[n] = Find(ids[n]);
+      if (runtimeClock_ && (objects[n]->kind == Kind::NotificationTimer || objects[n]->kind == Kind::SynchronizationTimer)) { pollClock = true; }
       if (objects[n]->kind == Kind::Mutant && owner == 0) { throw Fault(ctx, ids[n], 0, "mutant wait requires a nonzero owner"); }
       for (size_t previous = 0; previous < n; ++previous) {
         if (objects[n] == objects[previous]) { throw Fault(ctx, ids[n], 0, "duplicate dispatcher wait object"); }
@@ -380,7 +397,7 @@ Dispatcher::WaitOutcome Dispatcher::WaitImpl(const X86Context& ctx, std::span<co
       deadline = now + timeout;
     }
     const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
-    runtime_.Wait(ctx, sequence, runtimeClock_ ? std::min(remaining, std::chrono::milliseconds(1)) : remaining);
+    runtime_.Wait(ctx, sequence, pollClock ? std::min(remaining, std::chrono::milliseconds(1)) : remaining);
   }
 }
 

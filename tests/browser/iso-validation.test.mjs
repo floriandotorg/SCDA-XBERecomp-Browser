@@ -143,3 +143,20 @@ test('validation snapshots the manifest across asynchronous reads', async () => 
   };
   assert.equal((await validateDiscImage(source)).sha256, expected);
 });
+test('required mission failures name the logical asset and operation without leaking host paths', async () => {
+  const source = fixture();
+  source.files.delete('default/story.dat');
+  await assert.rejects(validateDiscImage(source), error => {
+    assert.equal(error.code, 'MISSING_STORY');
+    assert.match(error.message, /default\/story.dat/);
+    assert.equal(error.path, 'default/story.dat');
+    return true;
+  });
+  source.disc.find = () => { throw new Error('/private/user/game.iso'); };
+  await assert.rejects(validateDiscImage(source), error => {
+    assert.equal(error.code, 'READ_FAILED');
+    assert.match(error.message, /default.xbe/);
+    assert.ok(!error.message.includes('/private/'));
+    return true;
+  });
+});

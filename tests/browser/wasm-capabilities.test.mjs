@@ -29,3 +29,19 @@ test('unrelated validator failures are not mislabeled as capabilities', () => {
   const error = new WebAssembly.CompileError('unrelated validation problem');
   assert.throws(() => assertWasmCapabilities(required, () => { throw error; }), (actual) => actual === error && actual.code !== 'CAPABILITY');
 });
+
+test('SIMD builds probe vector instructions and reject unsupported browsers before execution', () => {
+  let calls = 0;
+  assertWasmCapabilities({ wasmRequirements: ['simd128'] }, bytes => {
+    ++calls;
+    assert.equal(WebAssembly.validate(bytes), true);
+    assert.ok([...bytes].includes(0xfd));
+    return true;
+  });
+  assert.equal(calls, 1);
+  assert.throws(() => assertWasmCapabilities({ wasmRequirements: ['simd128'] }, () => false),
+    error => error.code === 'CAPABILITY' && /SIMD/.test(error.message));
+  calls = 0;
+  assertWasmCapabilities({ wasmRequirements: ['tail-call', 'simd128'] }, () => { ++calls; return true; });
+  assert.equal(calls, 2);
+});

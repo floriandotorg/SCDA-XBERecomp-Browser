@@ -13,7 +13,7 @@ export const tailCallFlags = Object.freeze([
 
 const digest = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
 
-export const optimizerIdentity = (tool) => {
+export const optimizerIdentity = (tool, { simd = false } = {}) => {
   if (!tool || !existsSync(tool)) {
     throw new Error(`Tail-call optimizer is missing: ${tool || 'set BROWSER_WASM_OPT'}`);
   }
@@ -22,11 +22,11 @@ export const optimizerIdentity = (tool) => {
   if (result.error || result.status !== 0 || version !== 'wasm-opt version 133') {
     throw new Error(`Tail-call optimizer requires Binaryen 133; found ${version || result.error?.message || result.stderr}`);
   }
-  return { mode: 'actual-tail-call', version, sha256: digest(tool), flags: [...tailCallFlags] };
+  return { mode: 'actual-tail-call', version, sha256: digest(tool), flags: [...tailCallFlags, ...(simd ? ['--enable-simd'] : [])], ...(simd ? { simd: true } : {}) };
 };
 
 const verifyOptimizer = (optimization) => {
-  const actual = optimizerIdentity(optimization.tool);
+  const actual = optimizerIdentity(optimization.tool, { simd: optimization.simd === true });
   if (actual.version !== optimization.version || actual.sha256 !== optimization.sha256 ||
       JSON.stringify(actual.flags) !== JSON.stringify(optimization.flags)) {
     throw new Error('Tail-call optimizer identity or flags changed; reconfigure the build.');
@@ -52,7 +52,7 @@ export const publishWasm = ({ input, output, optimization, companions = [] }) =>
     }
     if (optimization.mode === 'actual-tail-call') {
       verifyOptimizer(optimization);
-      const result = spawnSync(optimization.tool, [input, ...tailCallFlags, '-o', temporary], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+      const result = spawnSync(optimization.tool, [input, ...optimization.flags, '-o', temporary], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
       if (result.error || result.status !== 0) {
         throw new Error(`Tail-call optimizer failed: ${result.error?.message || result.stderr || `exit ${result.status}`}`);
       }

@@ -28,7 +28,11 @@ test('manifest inputs trigger reconfiguration while inactive files do not', asyn
   const absolute = join(source, 'webgpu-service.mjs');
   const inactive = join(source, 'inactive.html');
   for (const path of [relative, absolute, inactive]) { writeFileSync(path, 'initial'); }
-  const block = cmake.slice(cmake.indexOf('file(READ ${CMAKE_CURRENT_BINARY_DIR}/input-manifest.json'), cmake.indexOf('\n\nadd_library(browser_flags INTERFACE)'));
+  const start = cmake.indexOf('file(READ ${CMAKE_CURRENT_BINARY_DIR}/input-manifest.json');
+  const boundary = 'set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${identity_inputs})';
+  const end = cmake.indexOf(boundary, start);
+  assert.ok(start >= 0 && end > start);
+  const block = cmake.slice(start, end + boundary.length);
   const project = `cmake_minimum_required(VERSION 3.25)
 project(fixture NONE)
 set(root "\${CMAKE_CURRENT_SOURCE_DIR}")

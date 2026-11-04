@@ -90,6 +90,20 @@ const auto registrationContracts = [] {
 };
 
 const auto savedDisplayContracts = [] {
+  {
+    Fixture fixture;
+    browser::InstallAvProvider(fixture.runtime, fixture.memory, [] { return 0x80100000u; });
+    fixture.Run([&](X86Context& worker, uint8_t* base) {
+      auto request = worker;
+      fixture.runtime.Kernel(request, base, 1);
+      check(request.eax == 0x80100000, "restored display was not visible to the fresh runtime");
+      request = worker;
+      fixture.runtime.Kernel(request, base, 4);
+      request = worker;
+      fixture.runtime.Kernel(request, base, 1);
+      check(request.eax == 0, "cleared restored display was resurrected");
+    });
+  }
   for (uint32_t n = 0; n < 3; ++n) {
     Fixture fixture;
     const auto backing = fixture.memory.BackingBytes();

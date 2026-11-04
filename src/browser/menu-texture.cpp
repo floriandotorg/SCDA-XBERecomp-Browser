@@ -299,4 +299,26 @@ TextureResult DecodeTexture(const gpu::TextureDesc& d, std::span<const uint8_t> 
   return out;
 }
 
+SurfaceEncodeResult EncodeSurface(const gpu::TextureDesc& d, std::span<const uint8_t> original, std::span<const uint8_t> rgba) {
+  SurfaceEncodeResult result;
+  const auto layout = DescribeTextureLayout(d);
+  if (!layout.supported || d.cube || d.depth != 1 || d.levels != 1 ||
+      (d.format != 0x06 && d.format != 0x07 && d.format != 0x12 && d.format != 0x1e) ||
+      original.size() != layout.total_bytes || rgba.size() != uint64_t(d.width) * d.height * 4) {
+    result.diagnostic = "unsupported or truncated color surface readback";
+    return result;
+  }
+  result.bytes.assign(original.begin(), original.end());
+  for (uint32_t n = 0; n < d.width * d.height; ++n) {
+    const uint32_t x = n % d.width, y = n / d.width;
+    const size_t destination = d.linear ? size_t(y) * d.pitch + x * 4 : size_t(Morton(x, y, 0, d.width, d.height, 1)) * 4;
+    result.bytes[destination] = rgba[n * 4 + 2];
+    result.bytes[destination + 1] = rgba[n * 4 + 1];
+    result.bytes[destination + 2] = rgba[n * 4];
+    result.bytes[destination + 3] = d.format == 0x07 || d.format == 0x1e ? 255 : rgba[n * 4 + 3];
+  }
+  result.supported = true;
+  return result;
+}
+
 }

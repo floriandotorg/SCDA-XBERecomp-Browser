@@ -117,11 +117,14 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
     check(refused && ctx.esp == stack && read(ctx, base, 0x10100) == sentinel,
       "invalid handle output mutated stack, published or exhausted objects");
   }
-  for (const auto flags : {2u, 0x100u}) {
-    bool refused = false;
-    try { create(0x10100, 0, flags); } catch (const browser::Fault&) { refused = true; }
-    check(refused && read(ctx, base, 0x10100) == sentinel, "unsupported ownership flags were accepted");
+  for (const auto flags : {2u, 0x100u, 0x101u, 0xffffff00u}) {
+    check(create(0x10100, 0, flags) == 0, "mutant creation failed to use its BOOLEAN low byte");
+    const auto byteHandle = read(ctx, base, 0x10100);
+    check(invoke(ctx, base, 221, {byteHandle, 0}) == (flags & 255 ? 0u : 0xc0000046u),
+      "mutant initial ownership disagrees with the BOOLEAN low byte");
+    check(invoke(ctx, base, 187, {byteHandle}) == 0, "BOOLEAN mutant fixture leaked its handle");
   }
+  memory.Write(ctx, 0x10100, &sentinel, 4);
   bool refused = false;
   try { create(0x10100, 0x10180); } catch (const browser::Fault&) { refused = true; }
   check(refused && read(ctx, base, 0x10100) == sentinel, "named attributes were accepted");

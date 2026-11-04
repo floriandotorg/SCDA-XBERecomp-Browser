@@ -147,8 +147,84 @@ const auto reservations = [] {
     storage.CreateFile("HUGE", 0x80, 4 * unit) == 0xc000007f, "invalid allocation hints were rounded or accepted");
 };
 
+const auto resizing = [] {
+  using Storage = browser::TemporaryFilesystem;
+  uint64_t clock = 100;
+  bool failClock = false;
+  Storage storage(4 * Storage::AllocationUnit, 32, [&] {
+    if (failClock) { throw ClockFailure{}; }
+    return clock;
+  });
+  const std::array<uint8_t, 3> bytes{1, 2, 3};
+  check(storage.WriteFile("SAVE", bytes) == 0, "resize fixture creation failed");
+  ++clock;
+  check(storage.Resize("SAVE", 32768) == 0 && storage.Stat("SAVE")->size == 32768 &&
+    storage.Stat("SAVE")->lastWriteTime == clock && storage.Usage().allocated == 49152, "resize growth metadata or quota wrong");
+  std::vector<uint8_t> result(32768);
+  check(storage.Read("SAVE", 0, result) == result.size() && std::equal(bytes.begin(), bytes.end(), result.begin()) &&
+    std::all_of(result.begin() + 3, result.end(), [](uint8_t value) { return !value; }), "resize did not preserve bytes and zero growth");
+  const auto before = *storage.Stat("SAVE");
+  const auto usage = storage.Usage();
+  check(storage.Resize("SAVE", 65536) == 0xc000007f && storage.Resize("SAVE", UINT64_MAX) == 0xc000000d &&
+    sameMetadata(before, *storage.Stat("SAVE")) && sameUsage(usage, storage.Usage()), "failed resize mutated state");
+  failAllocation = 1;
+  bool allocationFailed = false;
+  try { storage.Resize("SAVE", 49152); } catch (const std::bad_alloc&) { allocationFailed = true; }
+  failAllocation = 0;
+  check(allocationFailed && sameMetadata(before, *storage.Stat("SAVE")) && sameUsage(usage, storage.Usage()),
+    "resize allocation failure changed committed data or quota");
+  failClock = true;
+  bool failed = false;
+  try { storage.Resize("SAVE", 1); } catch (const ClockFailure&) { failed = true; }
+  check(failed && sameMetadata(before, *storage.Stat("SAVE")), "resize clock failure truncated data");
+  failClock = false;
+  check(storage.Resize("SAVE", 1) == 0 && storage.Usage().allocated == 32768 && storage.Resize("SAVE", 3) == 0,
+    "truncate did not release quota");
+  std::array<uint8_t, 3> tail{};
+  check(storage.Read("SAVE", 0, tail) == 3 && tail == std::array<uint8_t, 3>{1, 0, 0}, "truncated bytes reappeared after growth");
+  check(storage.Reserve("SAVE", 32768) == 0 && storage.Stat("SAVE")->size == 3 &&
+    storage.Stat("SAVE")->allocationSize == 32768 && storage.Usage().allocated == 49152,
+    "allocation information changed EOF or lost reservation");
+  check(storage.Resize("SAVE", 4096) == 0 && storage.Stat("SAVE")->allocationSize == 32768 &&
+    storage.Resize("SAVE", 3) == 0 && storage.Stat("SAVE")->allocationSize == 16384 && storage.Reserve("SAVE", 32768) == 0,
+    "EOF growth lost preallocation or truncation retained excess allocation");
+  check(storage.Reserve("SAVE", 65536) == 0xc000007f && storage.Reserve("SAVE", UINT64_MAX) == 0xc000000d &&
+    storage.Stat("SAVE")->size == 3 && storage.Stat("SAVE")->allocationSize == 32768,
+    "failed reservation mutated the file");
+  check(storage.Reserve("SAVE", 1) == 0 && storage.Stat("SAVE")->size == 1 &&
+    storage.Stat("SAVE")->allocationSize == 16384 && storage.Resize("SAVE", 3) == 0,
+    "allocation shrink failed to truncate or release quota");
+  const std::array<uint64_t, 4> times{10, 20, 30, 40};
+  check(storage.SetBasic("SAVE", times, 1) == 0 && storage.Stat("SAVE")->creationTime == 10 &&
+    storage.Stat("SAVE")->lastAccessTime == 20 && storage.Stat("SAVE")->lastWriteTime == 30 &&
+    storage.Stat("SAVE")->changeTime == 40 && storage.Resize("SAVE", 1) == 0xc0000022, "basic metadata or readonly enforcement wrong");
+  check(storage.SetBasic("SAVE", {}, 0x80) == 0 && storage.Stat("SAVE")->creationTime == 10 &&
+    storage.Resize("SAVE", 1) == 0, "basic metadata could not preserve times and clear readonly");
+  check(storage.SetBasic("SAVE", {}, 0x10) == 0xc000000d && storage.SetBasic("SAVE", {}, 0x80000000) == 0xc000000d &&
+    storage.Resize("", 1) == 0xc00000ba && storage.Resize("ABSENT", 1) == 0xc0000034, "invalid metadata or resize accepted");
+};
+
 const auto contracts = [] {
   using browser::TemporaryFilesystem;
+  {
+    TemporaryFilesystem files(4 * TemporaryFilesystem::AllocationUnit);
+    const std::array<uint8_t, 3> bytes{3, 4, 5};
+    check(files.WriteFile("FIRST", bytes) == 0 && files.CreateFile("SECOND", 0x80, 16384) == 0, "rename fixtures failed");
+    const auto before = files.Usage();
+    check(files.Rename("FIRST", "SECOND", false) == 0xc0000035 && sameUsage(before, files.Usage()), "rename collision changed storage");
+    check(files.Rename("FIRST", "MISSING\\CHILD", true) == 0xc000003a && files.Stat("FIRST"), "rename synthesized a parent");
+    check(files.Rename("FIRST", "SECOND", true) == 0 && !files.Stat("FIRST") && files.Stat("SECOND")->size == 3 &&
+      files.Usage().allocated == before.allocated - 16384 && files.Usage().entries == before.entries - 1, "replace rename lost bytes or quota");
+    std::array<uint8_t, 3> read{};
+    check(files.Read("SECOND", 0, read) == 3 && read == bytes, "rename changed owned bytes");
+    check(files.Delete("SECOND") == 0 && files.Usage().allocated == 16384 && files.Usage().entries == 1 &&
+      files.Delete("SECOND") == 0xc0000034, "delete did not release exact ownership");
+    check(files.CreateDirectory("DIR") == 0 && files.CreateFile("DIRA", 0x80) == 0 && files.WriteFile("DIR\\CHILD", bytes) == 0 &&
+      files.Delete("DIR") == 0xc0000101 && files.Delete("") == 0xc0000022 && files.Delete("..\\CHILD") == 0xc0000033,
+      "deletion escaped its namespace or removed a nonempty directory");
+    check(files.CreateFile("READONLY", 1) == 0 && files.Delete("READONLY") == 0xc0000022 &&
+      files.Rename("READONLY", "OTHER", false) == 0xc0000022, "readonly file mutation succeeded");
+  }
   uint64_t clock = 100;
   size_t clockCalls = 0;
   bool failClock = false;
@@ -251,7 +327,7 @@ const auto contracts = [] {
 int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::strcmp(argv[1], "peak") == 0) { peakCopy(); }
-    else { reservations(); contracts(); }
+    else { reservations(); resizing(); contracts(); }
     return 0;
   } catch (const std::bad_alloc&) {
     std::fprintf(stderr, "temporary-filesystem-bad-alloc copied=%zu peak=%zu cumulative=%zu\n",

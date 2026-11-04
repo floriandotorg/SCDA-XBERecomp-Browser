@@ -6,7 +6,7 @@
 
 namespace browser {
 
-enum class RenderResourceKind : uint32_t { VertexBuffer = 1, IndexBuffer, Texture, Surface, IndexData };
+enum class RenderResourceKind : uint32_t { VertexBuffer = 1, IndexBuffer, Texture, Surface, IndexData, TextureReference, SurfaceReference };
 
 struct RenderResourceRequest {
   uint64_t id = 0;

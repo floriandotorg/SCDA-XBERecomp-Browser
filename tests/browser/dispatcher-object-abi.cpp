@@ -85,7 +85,11 @@ const auto contracts = [] {
   check(poll(synchronization) == 0x102, "high BOOLEAN bits do not signal creation");
   invoke(225, {synchronization, 0});
   check(poll(synchronization) == 0 && poll(synchronization) == 0x102, "optional previous output and single signal consumption");
-  reject(192, {output, 0, 0x101});
+  invoke(192, {output, 0, 0x101});
+  const auto byteOwned = readWord(memory, ctx, output);
+  check(handles.QueryMutant(byteOwned, ctx.thread_handle).ownedByCaller, "mutant BOOLEAN ownership must ignore unused upper bits");
+  invoke(221, {byteOwned, 0});
+  invoke(187, {byteOwned});
   invoke(192, {output, 0, 1});
   const auto mutant = readWord(memory, ctx, output);
   const auto alias = handles.Duplicate(mutant);
@@ -106,7 +110,7 @@ const auto contracts = [] {
   reject(187, {mutant});
   check(poll(alias) == 0, "closing original keeps alias live");
   invoke(187, {alias});
-  check(dispatcher.ActiveObjects() == 3 && handles.AbandonOwner(4) == 1, "ABI close retains owned mutant until explicit owner cleanup");
+  check(dispatcher.ActiveObjects() == 2 && handles.AbandonOwner(4) == 0, "ABI close retires owned mutants after their final operation reference");
 
   writeWord(memory, ctx, output, 0xAABBCCDD);
   for (const auto pointer : {0u, 0xFFFFu, 0x12FFEu, 0xFFFFFFFEu}) {
@@ -123,7 +127,11 @@ const auto contracts = [] {
   }
   ctx.thread_handle = 0;
   reject(192, {output, 0, 1});
-  reject(192, {output, 0, 0x100});
+  invoke(192, {output, 0, 0x100});
+  const auto byteFree = readWord(memory, ctx, output);
+  check(!handles.QueryMutant(byteFree, 8).ownedByCaller && handles.QueryMutant(byteFree, 8).count == 1,
+    "zero low BOOLEAN byte must create an unowned mutant without a context owner");
+  invoke(187, {byteFree});
   invoke(192, {output, 0, 0});
   const auto unowned = readWord(memory, ctx, output);
   writeWord(memory, ctx, output, 0xAABBCCDD);

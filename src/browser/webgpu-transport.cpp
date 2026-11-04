@@ -3,16 +3,10 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 
-uint32_t webgpu_exchange(uint32_t opcode, uint32_t resource, const uint8_t* input, uint32_t size, uint8_t* output, uint32_t* metadata) {
-  return MAIN_THREAD_EM_ASM_INT({
-  const opcode = $0 >>> 0;
-  const resource = $1 >>> 0;
-  const input = $2 >>> 0;
-  const size = $3 >>> 0;
-  const output = $4 >>> 0;
-  const metadata = $5 >>> 0;
+EM_JS(uint32_t, webgpu_exchange_local, (uint32_t opcode, uint32_t resource, const uint8_t* input, uint32_t size, uint8_t* output, uint32_t* metadata), {
+  opcode >>>= 0; resource >>>= 0; input >>>= 0; size >>>= 0; output >>>= 0; metadata >>>= 0;
   const mailbox = Module.webgpuMailbox;
-  if (!mailbox) { return 2; }
+  if (!mailbox) { return 4; }
   const header = new Int32Array(mailbox, 0, 16);
   const bytes = new Uint8Array(mailbox, 64);
   if (Atomics.load(header, 0) === 4) { return header[7]; }
@@ -43,6 +37,13 @@ uint32_t webgpu_exchange(uint32_t opcode, uint32_t resource, const uint8_t* inpu
   Atomics.compareExchange(header, 0, 3, 0);
   Atomics.notify(header, 0);
   return status;
+});
+uint32_t webgpu_exchange(uint32_t opcode, uint32_t resource, const uint8_t* input, uint32_t size, uint8_t* output, uint32_t* metadata) {
+  const auto local = webgpu_exchange_local(opcode, resource, input, size, output, metadata);
+  if (local != 4) { return local; }
+  return MAIN_THREAD_EM_ASM_INT({
+    const result = webgpu_exchange_local($0, $1, $2, $3, $4, $5);
+    return result === 4 ? 2 : result;
   }, opcode, resource, input, size, output, metadata);
 }
 #endif
@@ -54,11 +55,12 @@ Result Transport::Execute(Opcode opcode, uint32_t resource, std::span<const uint
   Result result{Status::Error, 0, resource, {}};
   if (bytes.size() > MaxBytes) { return result; }
 #ifdef __EMSCRIPTEN__
-  result.bytes.resize(MaxBytes);
+  static std::vector<uint8_t> reply(MaxBytes);
   uint32_t metadata[2]{};
-  result.status = static_cast<Status>(webgpu_exchange(static_cast<uint32_t>(opcode), resource, bytes.data(), bytes.size(), result.bytes.data(), metadata));
+  result.status = static_cast<Status>(webgpu_exchange(static_cast<uint32_t>(opcode), resource, bytes.data(), bytes.size(), reply.data(), metadata));
   result.command = metadata[0];
-  result.bytes.resize(metadata[1]);
+  if (metadata[1] > reply.size()) { return {Status::Error, 0, resource, {}}; }
+  result.bytes.assign(reply.begin(), reply.begin() + metadata[1]);
 #else
   result.status = Status::Closed;
 #endif

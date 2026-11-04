@@ -24,7 +24,11 @@ struct TimerClockCadence {
 };
 #endif
 constexpr uint32_t pageSize = 4096;
+#if defined(BROWSER_MISSION) && BROWSER_MISSION
+constexpr size_t backingBudget = 192u << 20;
+#else
 constexpr size_t backingBudget = 112u << 20;
+#endif
 const auto Describe = [](const X86Context& ctx, uint32_t address, size_t size, const char* reason) {
   std::array<char, 2048> message{};
   std::snprintf(message.data(), message.size(), "%s address=0x%08X size=%zu esp=0x%08X last_icall=0x%08X", reason, address, size, ctx.esp, ctx.last_icall);
@@ -48,6 +52,8 @@ Fault::Fault(const X86Context& ctx, uint32_t address, size_t size, const char* r
 }
 
 thread_local size_t Memory::threadBorrows_ = 0;
+thread_local Memory* Memory::borrowedMemory_ = nullptr;
+thread_local Memory* Memory::mutatedMemory_ = nullptr;
 
 Memory::Storage::Storage(uint32_t size) : bytes(size), committed(size / pageSize) {}
 
@@ -56,6 +62,37 @@ Memory::Memory() {
   std::fill(regions_[0].storage->committed.begin(), regions_[0].storage->committed.end(), 1);
   regions_.push_back({0xF0000000, regions_[0].storage});
   physicalStorage_ = regions_[0].storage;
+  physicalVersions_.resize(physicalStorage_->committed.size());
+}
+
+void Memory::BeginBlock() {
+  if (HasBorrow()) { throw Fault({}, 0, 0, "nested generated memory block"); }
+  std::unique_lock lock(memoryLock_);
+  InitializePages();
+  ++leases_;
+  ++threadBorrows_;
+  borrowedMemory_ = this;
+  lock.release();
+}
+
+void Memory::EndBlock() noexcept {
+  borrowedMemory_ = nullptr;
+  --threadBorrows_;
+  --leases_;
+  memoryLock_.unlock();
+}
+
+void Memory::InitializePages() {
+  if (!pages_.empty()) { return; }
+  std::vector<Page> pages(1u << 20);
+  for (const auto& region : regions_) {
+    for (size_t n = 0; n < region.storage->committed.size(); ++n) {
+      if (!region.storage->committed[n]) { continue; }
+      pages[region.address / pageSize + n] = {region.storage->bytes.data() + n * pageSize,
+        region.storage == physicalStorage_ ? &physicalVersions_[n] : nullptr};
+    }
+  }
+  pages_.swap(pages);
 }
 
 void Memory::RequireMutable(uint32_t address, size_t size) {
@@ -125,6 +162,10 @@ void Memory::Discard(uint32_t address, uint32_t size) {
         (region.address < address || regionEnd > end || region.storage.use_count() > 1)) {
       throw Fault({}, address, size, "discard crosses backing ownership");
     }
+  }
+  if (!pages_.empty()) {
+    const size_t limit = size_t((end + pageSize - 1) / pageSize);
+    for (size_t n = address / pageSize; n < limit; ++n) { pages_[n] = {}; }
   }
   std::erase_if(regions_, [&](const Region& region) { return region.address >= address && uint64_t(region.address) < end; });
 }
@@ -201,7 +242,7 @@ void Memory::DecommitMapped(uint32_t address, uint32_t size) {
 }
 
 Memory::Region& Memory::RegionAt(const X86Context& ctx, uint32_t address, size_t size) {
-  auto& cached = regionLookup_[(address / pageSize) % regionLookup_.size()];
+  auto& cached = regionLookup_[((address >> 12) ^ (address >> 20) ^ (address >> 28)) % regionLookup_.size()];
   const auto contains = [&](const Region& region) {
     return address >= region.address && uint64_t(address) < uint64_t(region.address) + region.storage->bytes.size();
   };
@@ -231,13 +272,35 @@ void Memory::Validate(const X86Context& ctx, uint32_t address, size_t size) {
   }
 }
 
+void Memory::MarkPhysicalWrite(const X86Context& ctx, const Region& region, size_t offset, size_t size) {
+  if (region.storage != physicalStorage_ || !size) { return; }
+  if (physicalEpoch_ == UINT64_MAX) { throw Fault(ctx, region.address + uint32_t(offset), size, "physical write version exhausted"); }
+  const uint64_t version = ++physicalEpoch_;
+  for (size_t n = offset / pageSize; n <= (offset + size - 1) / pageSize; ++n) { physicalVersions_[n] = version; }
+}
+
+std::optional<uint64_t> Memory::PhysicalWriteVersion(const X86Context& ctx, uint32_t address, size_t size) {
+  std::unique_lock lock(memoryLock_, std::defer_lock);
+  if (!HasAccess()) { lock.lock(); }
+  Validate(ctx, address, size);
+  if (!size) { return std::nullopt; }
+  const auto& region = RegionAt(ctx, address, size);
+  const size_t offset = address - region.address;
+  if (region.storage != physicalStorage_ || size > region.storage->bytes.size() - offset) { return std::nullopt; }
+  uint64_t version = 0;
+  for (size_t n = offset / pageSize; n <= (offset + size - 1) / pageSize; ++n) { version = std::max(version, physicalVersions_[n]); }
+  return version;
+}
+
 uint8_t* Memory::Span(const X86Context& ctx, uint32_t address, size_t size) {
-  std::lock_guard lock(memoryLock_);
+  std::unique_lock lock(memoryLock_, std::defer_lock);
+  if (!HasAccess()) { lock.lock(); }
   if (!leases_) { throw Fault(ctx, address, size, "host span requires a backing lease"); }
   Validate(ctx, address, size);
   auto& region = RegionAt(ctx, address, size);
   const size_t offset = address - region.address;
   if (size > region.storage->bytes.size() - offset) { throw Fault(ctx, address, size, "noncontiguous host span"); }
+  MarkPhysicalWrite(ctx, region, offset, size);
   return region.storage->bytes.data() + offset;
 }
 
@@ -256,12 +319,18 @@ uint32_t Memory::GuestAddress(const X86Context& ctx, const void* pointer, size_t
 }
 
 void Memory::CheckRange(const X86Context& ctx, uint32_t address, size_t size) {
-  std::lock_guard lock(memoryLock_);
+  std::unique_lock lock(memoryLock_, std::defer_lock);
+  if (!HasAccess()) { lock.lock(); }
   Validate(ctx, address, size);
 }
 
 void Memory::Read(const X86Context& ctx, uint32_t address, void* output, size_t size) {
-  std::lock_guard lock(memoryLock_);
+  std::unique_lock lock(memoryLock_, std::defer_lock);
+  if (!HasAccess()) { lock.lock(); }
+  if (auto* page = PageAt(address, size)) {
+    std::memcpy(output, page->bytes + (address & 4095), size);
+    return;
+  }
   if (size && size <= 16 && size <= pageSize - address % pageSize) {
     auto& region = RegionAt(ctx, address, size);
     const size_t offset = address - region.address;
@@ -283,11 +352,18 @@ void Memory::Read(const X86Context& ctx, uint32_t address, void* output, size_t 
 }
 
 void Memory::Write(const X86Context& ctx, uint32_t address, const void* input, size_t size) {
-  std::lock_guard lock(memoryLock_);
+  std::unique_lock lock(memoryLock_, std::defer_lock);
+  if (!HasAccess()) { lock.lock(); }
+  if (auto* page = PageAt(address, size)) {
+    MarkPageWrite(ctx, address, size, *page);
+    std::memcpy(page->bytes + (address & 4095), input, size);
+    return;
+  }
   if (size && size <= 16 && size <= pageSize - address % pageSize) {
     auto& region = RegionAt(ctx, address, size);
     const size_t offset = address - region.address;
     if (!region.storage->committed[offset / pageSize]) { throw Fault(ctx, address, size, "uncommitted guest memory"); }
+    MarkPhysicalWrite(ctx, region, offset, size);
     std::memcpy(region.storage->bytes.data() + offset, input, size);
     return;
   }
@@ -297,6 +373,7 @@ void Memory::Write(const X86Context& ctx, uint32_t address, const void* input, s
     auto& region = RegionAt(ctx, address, size);
     const size_t offset = address - region.address;
     const size_t count = std::min(size, region.storage->bytes.size() - offset);
+    MarkPhysicalWrite(ctx, region, offset, count);
     std::memcpy(region.storage->bytes.data() + offset, source, count);
     address += uint32_t(count);
     source += count;
@@ -331,6 +408,7 @@ void Memory::Pages(uint32_t address, uint32_t size, bool committed) {
         std::memset(region.storage->bytes.data() + offset, 0, pageSize);
         state = committed;
       }
+      if (!pages_.empty()) { pages_[cursor / pageSize] = {committed ? region.storage->bytes.data() + offset : nullptr, nullptr}; }
     }
     cursor += pageSize;
   }

@@ -33,6 +33,13 @@ struct TextureResult {
   std::vector<uint8_t> pixels;
 };
 
+struct SurfaceEncodeResult {
+  bool supported = false;
+  std::string diagnostic;
+  std::vector<uint8_t> bytes;
+};
+SurfaceEncodeResult EncodeSurface(const gpu::TextureDesc& desc, std::span<const uint8_t> original, std::span<const uint8_t> rgba);
+
 TextureResult DecodeTexture(const gpu::TextureDesc& desc, std::span<const uint8_t> resource,
   std::span<const uint32_t> palette = {}, uint32_t level = 0, uint32_t face = 0);
 

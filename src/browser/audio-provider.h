@@ -30,6 +30,7 @@ public:
   struct SnapshotData {
     uint32_t device = 0;
     uint32_t voices = 0;
+    uint32_t voiceLimitRejections = 0;
     uint32_t arenaFreeBytes = 0;
     uint64_t publishedCompletions = 0;
     uint64_t deliveredCallbacks = 0;
@@ -135,6 +136,7 @@ private:
   std::array<uint32_t, kMixBinCount> binHeadroom_{};
   std::vector<float> silence_;
   uint64_t nextToken_ = 0;
+  uint32_t voiceLimitRejections_ = 0;
   std::atomic<uint64_t> published_ = 0;
   std::atomic<uint64_t> delivered_ = 0;
 };

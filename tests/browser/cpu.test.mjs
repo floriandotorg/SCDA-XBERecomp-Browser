@@ -23,15 +23,17 @@ const fixtures = [
   ['generated/game/x86_recomp.75.cpp', 'sub_00309660'],
 ];
 const header = '#include "cpu/x86_ops.h"\nX86_EXTERN_FUNC(sub_002CDA25);\nX86_EXTERN_FUNC(sub_002CD410);\nX86_EXTERN_FUNC(sub_002CD860);\n';
-const bodies = fixtures.map(([path, name]) => {
+const rawBodies = fixtures.map(([path, name]) => {
   const source = readFileSync(path, 'utf8');
   const start = source.indexOf(`X86_FUNC(__imp__${name})`);
   const marker = `X86_WEAK_FUNC(${name}, __imp__${name})`;
   const end = source.indexOf(marker, start);
   assert.ok(start >= 0 && end > start, `Missing local fixture ${name}`);
-  return adaptArithmetic(adaptMemory(source.slice(start, end + marker.length)));
+  return source.slice(start, end + marker.length);
 });
+const bodies = rawBodies.map(source => adaptArithmetic(adaptMemory(source)));
 writeFileSync(`${directory}/fixtures.cpp`, `${header}${bodies.join('\n')}`);
+writeFileSync(`${directory}/mission-fixtures.cpp`, `${header}${rawBodies.map(source => adaptArithmetic(adaptMemory(source, { blocks: true }))).join('\n')}`);
 writeFileSync(`${directory}/run.mjs`, "import create from './cpu.mjs'; await create();\n");
 writeFileSync(`${directory}/index.html`, readFileSync('tests/browser/full-cpu.html', 'utf8').replaceAll('cpu_contracts.mjs', 'cpu.mjs').replaceAll('fullCpuEvidence', 'cpuEvidence').replaceAll('Full CPU contracts', 'CPU runtime tests').replaceAll('Running complete story metadata CPU contracts', 'Running CPU contracts'));
 
@@ -56,21 +58,25 @@ for (const [name, fixture, expected] of [
   });
 }
 
-for (const platform of ['native', 'wasm', 'wasm-tail']) {
+for (const platform of ['native', 'wasm', 'wasm-tail', 'mission-native', 'mission-wasm', 'mission-wasm-simd']) {
   test(`${platform} CPU contracts and real generated fixtures`, () => {
-    const wasm = platform !== 'native';
-    const output = `${directory}/${wasm ? platform === 'wasm-tail' ? 'cpu-tail.mjs' : 'cpu.mjs' : 'cpu-native'}`;
+    const mission = platform.startsWith('mission');
+    const simd = platform.endsWith('-simd');
+    const wasm = platform.includes('wasm');
+    const output = mission ? `${directory}/cpu-${platform}${wasm ? '.mjs' : ''}` : `${directory}/${wasm ? platform === 'wasm-tail' ? 'cpu-tail.mjs' : 'cpu.mjs' : 'cpu-native'}`;
     const flags = wasm
       ? ['-fwasm-exceptions', '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=web,node', '-sINITIAL_MEMORY=134217728', '-sALLOW_MEMORY_GROWTH=0', '-sPTHREAD_POOL_SIZE=3', '-sPTHREAD_POOL_SIZE_STRICT=2', '-sPROXY_TO_PTHREAD=1', '-sSTACK_SIZE=1048576', '-sDEFAULT_PTHREAD_STACK_SIZE=262144', '-sSTACK_OVERFLOW_CHECK=2', '-sEXIT_RUNTIME=1']
       : [];
-    const build = spawnSync(wasm ? 'em++' : 'clang++', ['-std=c++20', '-O3', '-pthread', '-fno-strict-aliasing', '-DX86_PORTABLE_RUNTIME', '-DX86_COMPACT_MEMORY', '-Isrc', 'tests/browser/cpu.cpp', 'src/browser/cpu_runtime.cpp', `${directory}/fixtures.cpp`, ...flags, '-o', output], { encoding: 'utf8', timeout: 120000 });
+    if (mission && wasm) { flags.push('-mtail-call'); }
+    if (simd) { flags.push('-msimd128'); }
+    const build = spawnSync(wasm ? 'em++' : 'clang++', ['-std=c++20', '-O3', '-pthread', '-fno-strict-aliasing', '-DX86_PORTABLE_RUNTIME', '-DX86_COMPACT_MEMORY', '-Isrc', 'tests/browser/cpu.cpp', 'src/browser/cpu_runtime.cpp', `${directory}/${mission ? 'mission-fixtures.cpp' : 'fixtures.cpp'}`, ...flags, '-o', output], { encoding: 'utf8', timeout: 120000 });
     assert.equal(build.status, 0, build.stderr);
-    if (platform === 'wasm-tail') {
+    if (platform === 'wasm-tail' || (mission && wasm)) {
       const tool = resolve(spawnSync('em-config', ['BINARYEN_ROOT'], { encoding: 'utf8' }).stdout.trim(), 'bin/wasm-opt');
       const input = output.replace(/\.mjs$/, '-pristine.wasm');
       const final = output.replace(/\.mjs$/, '.wasm');
       renameSync(final, input);
-      publishWasm({ input, output: final, optimization: { ...optimizerIdentity(tool), tool } });
+      publishWasm({ input, output: final, optimization: { ...optimizerIdentity(tool, { simd }), tool } });
     }
     if (wasm) { writeFileSync(`${directory}/${platform}-run.mjs`, `import create from 'file://${output}'; await create();\n`); }
     const execution = wasm

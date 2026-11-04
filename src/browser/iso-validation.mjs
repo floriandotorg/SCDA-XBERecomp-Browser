@@ -49,31 +49,31 @@ export const validateDiscImage = async ({ disc, manifest, signal }) => {
   checkpoint(signal);
   const identity = snapshotManifest(manifest);
   if (!globalThis.crypto?.subtle) { fail('CAPABILITY', 'Local executable hashing requires a secure browser context.'); }
-  const access = async (operation) => {
+  const access = async (path, operation) => {
     checkpoint(signal);
     let result;
     try {
       result = await operation();
     } catch {
       checkpoint(signal);
-      fail('READ_FAILED', 'The selected disc could not be read.');
+      fail('READ_FAILED', `Could not read ${path} from the selected disc.`, { path });
     }
     checkpoint(signal);
     return result;
   };
-  const image = await access(() => disc.find('default.xbe'));
+  const image = await access('default.xbe', () => disc.find('default.xbe'));
   if (!regularFile(image)) { fail('MISSING_IMAGE', 'The disc has no story executable.'); }
   if (image.size !== identity.size) { fail('IMAGE_SIZE', 'The executable size does not match this build.'); }
   for (const file of identity.story) {
-    const entry = await access(() => disc.find(file.path));
+    const entry = await access(file.path, () => disc.find(file.path));
     if (!regularFile(entry) || entry.size < file.minBytes) {
-      fail('MISSING_STORY', 'The disc is missing required story data.');
+      fail('MISSING_STORY', `Required story file is missing or truncated: ${file.path}.`, { path: file.path });
     }
   }
   const bytes = new Uint8Array(identity.size);
   for (let n = 0; n < bytes.length; n += maxRequestBytes) {
     const length = Math.min(maxRequestBytes, bytes.length - n);
-    const part = await access(() => disc.read('default.xbe', n, length));
+    const part = await access('default.xbe', () => disc.read('default.xbe', n, length));
     if (!(part instanceof Uint8Array) || part.length !== length) {
       fail('SHORT_READ', 'The selected executable could not be read completely.');
     }

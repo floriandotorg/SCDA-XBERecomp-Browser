@@ -2,6 +2,7 @@
 #include "browser/raw-cache.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <map>
 
 namespace browser {
@@ -12,10 +13,15 @@ class FileProvider {
   PreparedImage& image_;
   std::shared_ptr<const kernel::DiscIndex> disc_;
   std::shared_ptr<TemporaryFilesystem> temporary_;
-  RawCache rawCache_;
+  std::shared_ptr<RawCache> rawCache_;
   std::mutex lock_;
   DiscReadSnapshot discReads_;
+  std::mutex readStagingMutex_;
+  std::vector<uint8_t> readStaging_;
+  uint32_t maximumReadBytes_;
   std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic_;
+  std::function<void(FileOperationDiagnostic)> operationDiagnostic_;
+  std::array<uint32_t, 2> operationReports_{};
   struct DiscFile {
     std::shared_ptr<const kernel::DiscIndex> owner;
     const kernel::DiscIndex::Entry* entry;
@@ -42,6 +48,9 @@ class FileProvider {
     std::string pattern;
     size_t nextEntry = 0;
     bool listed = false;
+    bool deletes = false;
+    bool deletePending = false;
+    bool writeAttributes = false;
   };
   std::map<uint32_t, File> files_;
   std::map<uint32_t, std::string> links_;
@@ -98,7 +107,17 @@ class FileProvider {
   }
 
   std::shared_ptr<TemporaryFilesystem> Storage(const File& file) const {
-    return file.cache ? rawCache_.Partition(RawCache::FirstPartition)->Filesystem() : temporary_;
+    return file.cache ? rawCache_->Partition(RawCache::FirstPartition)->Filesystem() : temporary_;
+  }
+
+  void ReportOperationLocked(uint32_t handle, uint32_t ordinal, uint32_t information, uint32_t status, uint32_t length) {
+    if (!status || status == 0xc0000011 || !operationDiagnostic_) { return; }
+    auto& count = operationReports_[ordinal == 226 ? 0 : 1];
+    if (count == 32) { return; }
+    ++count;
+    const auto file = files_.find(handle);
+    try { operationDiagnostic_({ordinal, information, status, length, file == files_.end() ? "" : file->second.path}); }
+    catch (...) {}
   }
 
 public:
@@ -122,10 +141,16 @@ public:
   }
 
   FileProvider(Runtime& runtime, PreparedImage& image, std::shared_ptr<const kernel::DiscIndex> disc,
-      std::shared_ptr<TemporaryFilesystem> temporary, std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic)
+      std::shared_ptr<TemporaryFilesystem> temporary, std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic, std::shared_ptr<RawCache> cache,
+      std::function<void(FileOperationDiagnostic)> operationDiagnostic, uint32_t maximumReadBytes)
     : runtime_(runtime), image_(image), disc_(std::move(disc)),
       temporary_(temporary ? std::move(temporary) : std::make_shared<TemporaryFilesystem>()),
-      fileOpenDiagnostic_(std::move(fileOpenDiagnostic)) {}
+      rawCache_(cache ? std::move(cache) : std::make_shared<RawCache>()), maximumReadBytes_(maximumReadBytes),
+      fileOpenDiagnostic_(std::move(fileOpenDiagnostic)), operationDiagnostic_(std::move(operationDiagnostic)) {
+    if (maximumReadBytes < (1u << 20) || maximumReadBytes > (8u << 20) || (maximumReadBytes & (maximumReadBytes - 1))) {
+      throw Fault({}, 202, maximumReadBytes, "file read budget must be a power of two between one and eight MiB");
+    }
+  }
 
   DiscReadSnapshot DiscReads() {
     std::lock_guard lock(lock_);
@@ -142,7 +167,14 @@ public:
     if (links_.erase(handle)) { return true; }
     const auto file = files_.find(handle);
     if (file == files_.end()) { return false; }
-    if (file->second.raw && file->second.cache) { rawCache_.Partition(RawCache::FirstPartition)->CloseRaw(); }
+    if (file->second.raw && file->second.cache) { rawCache_->Partition(RawCache::FirstPartition)->CloseRaw(); }
+    if (file->second.deletePending) {
+      const auto& selected = file->second;
+      const bool retained = std::any_of(files_.begin(), files_.end(), [&](const auto& entry) {
+        return entry.first != handle && entry.second.temporary && entry.second.cache == selected.cache && entry.second.path == selected.path;
+      });
+      if (!retained && Storage(selected)->Delete(selected.path)) { throw Fault({}, handle, 0, "temporary deletion failed at final close"); }
+    }
     files_.erase(file);
     return true;
   }
@@ -185,9 +217,11 @@ public:
     const bool overwrite = create && disposition == 5 && (options == 0x60 || options == 0x64) && access == 0x40100080;
     const bool noReadCache = create && disposition == 1 && options == 0x6c && access == 0x80100080 && frame[6] == 0x80;
     const bool readMetadata = create && disposition == 3 && options == 0x60 && access == 0x80100080 && frame[6] == 4;
-    const bool writeOpenIf = create && disposition == 3 && options == 0x60 && access == 0x40100080 && frame[6] == 0x80;
+    const bool writableOpenIf = create && disposition == 3 && options == 0x60 &&
+      (access == 0x40100080 || access == 0xc0100080) && frame[6] == 0x80;
+    const bool deleteOpen = create && disposition == 1 && (options == 0x60 || options == 0x64) && access == 0x110080;
     if (!status && create && ((allocation && (options != 0x22 || (disposition != 2 && disposition != 3))) || (frame[6] & ~0x94u) || disposition < 1 || (disposition > 3 && !overwrite))) { status = 0xc00000bb; }
-    if (!status && create && !overwrite && !noReadCache && !readMetadata && !writeOpenIf && !(options & 1) && options != 0x22 &&
+    if (!status && create && !overwrite && !noReadCache && !readMetadata && !writableOpenIf && !deleteOpen && !(options & 1) && options != 0x22 &&
         (disposition != 1 || (options != 0x60 && options != 0x64) || !(access & 0x80000001u) || (access & ~0x80120089u))) { status = 0xc00000bb; }
     if (!status && create && !(options & 1) && (frame[6] & 0x10)) { status = 0xc000000d; }
     const uint32_t allowedOptions = (create ? 0x804067u : 0x804079u) | (noReadCache ? 8u : 0u);
@@ -218,7 +252,7 @@ public:
         if (!status && !raw && !ResolveDevice(path, temporary, &cache)) { status = 0xc00000bb; }
       }
     }
-    auto storage = cache ? rawCache_.Partition(RawCache::FirstPartition)->Filesystem() : temporary_;
+    auto storage = cache ? rawCache_->Partition(RawCache::FirstPartition)->Filesystem() : temporary_;
     if (!status && !raw && (options & 0x18) && (!noReadCache || temporary)) { status = 0xc00000bb; }
     if (!status && !raw && (options & 1) && path.size() > 1 && path.back() == '\\' && path[path.size() - 2] != '\\') {
       path.pop_back();
@@ -228,16 +262,17 @@ public:
         options != (cache ? 0x18u : 0x10u) || (cache && share))) { status = 0xc00000bb; }
     if (!status && allocation && (!temporary || raw || (options & 1))) { status = 0xc00000bb; }
     if (!status && allocation >> 63) { status = 0xc000000d; }
-    const uint32_t allowedAccess = temporary || raw ? 0xc012019fu : 0x80120089u;
+    const uint32_t allowedAccess = temporary && !raw ? 0xc013019fu : raw ? 0xc012019fu : 0x80120089u;
+    if (!status && deleteOpen && !temporary) { status = 0xc00000bb; }
     if (!status && (access & ~allowedAccess)) { status = 0xc0000022; }
     if (!status && create && !temporary && disposition != 1) { status = 0xc0000022; }
     if (!status && (options & 0x20) && !(access & 0xc0100000u)) { status = 0xc000000d; }
     if (!status && !temporary && !raw && !disc_) { status = 0xc00000a3; }
     if (!status && cache && !raw && !storage) {
       runtime_.Checkpoint(ctx);
-      status = rawCache_.Partition(RawCache::FirstPartition)->Mount();
+      status = rawCache_->Partition(RawCache::FirstPartition)->Mount();
       if (!status) {
-        storage = rawCache_.Partition(RawCache::FirstPartition)->Filesystem();
+        storage = rawCache_->Partition(RawCache::FirstPartition)->Filesystem();
         if (!storage) { throw Fault(ctx, 202, 0, "cache mount did not retain its namespace"); }
       }
     }
@@ -256,7 +291,7 @@ public:
         } else {
           directory = entry->directory;
           if (create && disposition == 2) { status = 0xc0000035; }
-          if (!directory && (entry->attributes & 1) && (access & 0x40000006u)) { status = 0xc0000022; }
+          if (!directory && (entry->attributes & 1) && (access & 0x40010006u)) { status = 0xc0000022; }
           overwriteEntry = overwrite;
         }
       } else {
@@ -272,18 +307,21 @@ public:
     }
     const bool reads = (access & 0x80000001u) != 0;
     const bool writes = (access & 0x40000006u) != 0;
+    const bool deletes = (access & 0x10000u) != 0;
     if (!status) {
       for (const auto& [handle, file] : files_) {
-        if (file.temporary == temporary && file.raw == raw && file.cache == cache && file.path == path &&
-            ((reads && !(file.share & 1)) || (file.reads && !(share & 1)) ||
-             (writes && !(file.share & 2)) || (file.writes && !(share & 2)))) {
+        if (file.temporary != temporary || file.raw != raw || file.cache != cache || file.path != path) { continue; }
+        if (file.deletePending) { status = 0xc0000056; break; }
+        if ((reads && !(file.share & 1)) || (file.reads && !(share & 1)) ||
+             (writes && !(file.share & 2)) || (file.writes && !(share & 2)) ||
+             (deletes && !(file.share & 4)) || (file.deletes && !(share & 4))) {
           status = 0xc0000043;
           break;
         }
       }
     }
     runtime_.Checkpoint(ctx);
-    if (!status && raw && cache) { status = rawCache_.Partition(RawCache::FirstPartition)->OpenRaw(); }
+    if (!status && raw && cache) { status = rawCache_->Partition(RawCache::FirstPartition)->OpenRaw(); }
     const uint32_t fileAttributes = overwrite && !frame[6] ? 0x80 : frame[6];
     if (!status && createEntry) { status = directory ? storage->CreateDirectory(path) : storage->CreateFile(path, fileAttributes, allocation); }
     if (!status && overwriteEntry) { status = storage->OverwriteFile(path, fileAttributes); }
@@ -291,6 +329,8 @@ public:
       const uint32_t handle = nextHandle_;
       File file{temporary, directory, path, reads, writes, share, bool(options & 0x30), bool(access & 0x40000002u), raw, cache};
       file.alertable = options & 0x10;
+      file.deletes = deletes;
+      file.writeAttributes = (access & 0x40000100u) != 0;
       if (!temporary && !raw) { file.disc = std::make_shared<DiscFile>(disc_, disc_->Find(path)); }
       files_.emplace(handle, std::move(file));
       nextHandle_ += 4;
@@ -405,6 +445,25 @@ public:
     ctx.esp += sizeof(frame);
   }
 
+  void DeleteAlias(X86Context& ctx, uint8_t* base) {
+    RequireOwner(ctx, base);
+    auto transition = image_.memory->Mutate();
+    runtime_.Checkpoint(ctx);
+    std::array<uint32_t, 2> frame{};
+    if (uint64_t(ctx.esp) + sizeof(frame) > UINT32_MAX) { throw Fault(ctx, ctx.esp, sizeof(frame), "alias deletion frame overflow"); }
+    image_.memory->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
+    std::string name;
+    uint32_t status = ReadName(ctx, frame[1], name);
+    if (!status && (name.size() != 6 || !name.starts_with("\\??\\") || name[4] < 'A' || name[4] > 'Z' || name[5] != ':')) {
+      status = 0xc0000033;
+    }
+    std::lock_guard lock(lock_);
+    runtime_.Checkpoint(ctx);
+    if (!status && !aliases_.erase(name.substr(4))) { status = 0xc0000034; }
+    ctx.eax = status;
+    ctx.esp += sizeof(frame);
+  }
+
   void DeviceControl(X86Context& ctx, uint8_t* base, bool filesystem = false) {
     RequireOwner(ctx, base);
     auto& memory = *image_.memory;
@@ -436,7 +495,7 @@ public:
       else { result = {0, 0, uint32_t(CacheFatx::Capacity), 0, 0, RawCache::FirstPartition, 0, 0}; }
     }
     runtime_.Checkpoint(ctx);
-    if (!status && filesystem) { status = rawCache_.Partition(RawCache::FirstPartition)->Dismount(); }
+    if (!status && filesystem) { status = rawCache_->Partition(RawCache::FirstPartition)->Dismount(); }
     if (!status && required) { memory.Write(ctx, output, result.data(), required); }
     const std::array<uint32_t, 2> ioStatus = {status, status ? 0u : required};
     memory.Write(ctx, statusOutput, ioStatus.data(), sizeof(ioStatus));
@@ -449,6 +508,7 @@ public:
     auto& memory = *image_.memory;
     std::array<uint32_t, 9> frame{};
     std::shared_ptr<DiscFile> selected;
+    std::string path;
     uint64_t explicitOffset = 0;
     uint32_t status = 0;
     const auto overlaps = [](uint32_t first, uint32_t size, uint32_t second, uint32_t count) {
@@ -485,10 +545,11 @@ public:
       else if (file->second.directory) { status = 0xc00000ba; }
       else if (!file->second.reads) { status = 0xc0000022; }
       else if (!file->second.synchronous || file->second.alertable || frame[2] || frame[3] || frame[4]) { status = 0xc00000bb; }
-      else if (frame[7] > (1u << 20) || (frame[8] && (explicitOffset >> 63) && explicitOffset != UINT64_MAX - 1)) { status = 0xc000000d; }
-      else { selected = file->second.disc; }
+      else if (frame[7] > maximumReadBytes_ || (frame[8] && (explicitOffset >> 63) && explicitOffset != UINT64_MAX - 1)) { status = 0xc000000d; }
+      else { selected = file->second.disc; path = file->second.path; }
       if (status) {
         runtime_.Checkpoint(ctx);
+        ReportOperationLocked(frame[1], 219, 0, status, frame[7]);
         const std::array<uint32_t, 2> result = {status, 0};
         memory.Write(ctx, frame[5], result.data(), sizeof(result));
         ctx.eax = status;
@@ -497,6 +558,7 @@ public:
       }
     }
     if (!selected || !selected->entry) { throw Fault(ctx, frame[1], 0, "disc handle lost its owned metadata"); }
+    const auto readStarted = std::chrono::steady_clock::now();
     std::unique_lock serial(selected->io);
     runtime_.Checkpoint(ctx);
     const uint64_t offset = !frame[8] || explicitOffset == UINT64_MAX - 1 ? selected->position : explicitOffset;
@@ -505,15 +567,41 @@ public:
       if (offset >= selected->entry->size) { status = 0xc0000011; }
       else { count = uint32_t(std::min<uint64_t>(frame[7], selected->entry->size - offset)); }
     }
-    std::vector<uint8_t> bytes(count);
+    {
+      std::lock_guard lock(lock_);
+      discReads_.lastPath = path;
+      discReads_.lastOffset = offset;
+      discReads_.lastBytes = count;
+    }
+    std::lock_guard stagingLock(readStagingMutex_);
+    if (count && readStaging_.capacity() < maximumReadBytes_) { std::vector<uint8_t>(maximumReadBytes_).swap(readStaging_); }
+    readStaging_.resize(count);
+    auto& bytes = readStaging_;
+    uint32_t failedOffset = 0, failedBytes = count;
     if (count) {
       try {
-        if (selected->owner->Read(*selected->entry, offset, bytes.data(), count) != count) { status = 0xc0000185; }
+        constexpr uint32_t chunkBytes = 1u << 20;
+        for (uint32_t n = 0; n < (count + chunkBytes - 1) / chunkBytes; ++n) {
+          runtime_.Checkpoint(ctx);
+          failedOffset = n * chunkBytes;
+          failedBytes = std::min(count - failedOffset, chunkBytes);
+          if (selected->owner->Read(*selected->entry, offset + failedOffset, bytes.data() + failedOffset, failedBytes) != failedBytes) { status = 0xc0000185; break; }
+        }
       } catch (const Cancelled&) {
         throw;
       } catch (...) {
         status = 0xc0000185;
       }
+    }
+    {
+      const auto elapsed = std::chrono::steady_clock::now() - readStarted;
+      std::lock_guard lock(lock_);
+      discReads_.waitMicroseconds += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
+    }
+    if (status == 0xc0000185) {
+      runtime_.Checkpoint(ctx);
+      const std::string reason = "ISO read failed: " + path + " offset=" + std::to_string(offset + failedOffset) + " bytes=" + std::to_string(failedBytes);
+      throw Fault(ctx, frame[6], count, reason.c_str());
     }
     auto transition = memory.Mutate();
     RequireOwner(ctx, base);
@@ -702,7 +790,7 @@ public:
     else if (file->second.directory) { status = 0xc00000ba; }
     else if (read ? !file->second.reads : !file->second.writeData) { status = 0xc0000022; }
     else if (!file->second.synchronous || frame[2] || frame[3] || frame[4] || frame[8]) { status = 0xc00000bb; }
-    else if (read && length > (1u << 20)) { status = 0xc00000bb; }
+    else if (read && length > maximumReadBytes_) { status = 0xc00000bb; }
     else if (!read && length > Storage(file->second)->Usage().capacity) { status = 0xc000007f; }
     std::vector<uint8_t> bytes;
     if (!status) {
@@ -711,8 +799,8 @@ public:
       if (!read && length) { memory.Read(ctx, input, bytes.data(), length); }
     }
     runtime_.Checkpoint(ctx);
-    if (!status && file->second.raw && file->second.cache) { status = rawCache_.Partition(RawCache::FirstPartition)->WriteRaw(offset, bytes); }
-    else if (!status && file->second.raw) { status = read ? rawCache_.Read(offset, bytes) : rawCache_.Write(offset, bytes); }
+    if (!status && file->second.raw && file->second.cache) { status = rawCache_->Partition(RawCache::FirstPartition)->WriteRaw(offset, bytes); }
+    else if (!status && file->second.raw) { status = read ? rawCache_->Read(offset, bytes) : rawCache_->Write(offset, bytes); }
     else if (!status && read) {
       bytes.resize(Storage(file->second)->Read(file->second.path, file->second.position, bytes));
       if (length && bytes.empty()) { status = 0xc0000011; }
@@ -721,6 +809,7 @@ public:
     const uint32_t count = uint32_t(bytes.size());
     if (!status && read && count) { memory.Write(ctx, input, bytes.data(), count); }
     if (!status) { file->second.position = file->second.raw ? offset + count : file->second.position + count; }
+    ReportOperationLocked(frame[1], read ? 219 : 236, 0, status, length);
     const std::array<uint32_t, 2> result = {status, status ? 0u : count};
     memory.Write(ctx, statusOutput, result.data(), sizeof(result));
     ctx.eax = status;
@@ -745,6 +834,7 @@ public:
       if (length) { memory.CheckRange(ctx, input, length); }
     };
     const auto publish = [&](uint32_t status) {
+      ReportOperationLocked(frame[1], 226, frame[5], status, frame[4]);
       const std::array<uint32_t, 2> result = {status, 0};
       memory.Write(ctx, frame[2], result.data(), sizeof(result));
       ctx.eax = status;
@@ -759,6 +849,83 @@ public:
       std::lock_guard lock(lock_);
       const auto file = files_.find(frame[1]);
       uint32_t status = 0;
+      if (file != files_.end() && (frame[5] == 19 || frame[5] == 20 || frame[5] == 4)) {
+        auto& selected = file->second;
+        if (!selected.temporary || selected.raw || (frame[5] != 4 ? !selected.writeData : !selected.writeAttributes)) { status = 0xc0000022; }
+        else if (frame[4] != (frame[5] != 4 ? 8u : 40u)) { status = 0xc0000004; }
+        else if (frame[5] != 4) {
+          uint64_t size = 0;
+          memory.Read(ctx, frame[3], &size, sizeof(size));
+          runtime_.Checkpoint(ctx);
+          status = frame[5] == 20 ? Storage(selected)->Resize(selected.path, size) : Storage(selected)->Reserve(selected.path, size);
+        } else {
+          std::array<uint64_t, 4> times{};
+          uint32_t attributes = 0;
+          memory.Read(ctx, frame[3], times.data(), sizeof(times));
+          memory.Read(ctx, frame[3] + 32, &attributes, sizeof(attributes));
+          runtime_.Checkpoint(ctx);
+          status = Storage(selected)->SetBasic(selected.path, times, attributes);
+        }
+        publish(status);
+        return;
+      }
+      if (file != files_.end() && (frame[5] == 13 || frame[5] == 10)) {
+        auto& selected = file->second;
+        if (!selected.temporary || selected.raw || !selected.deletes) { status = 0xc0000022; }
+        else if (selected.directory) { status = 0xc00000bb; }
+        else if (frame[5] == 13) {
+          if (frame[4] != 1) { status = 0xc0000004; }
+          else {
+            uint8_t value = 0;
+            memory.Read(ctx, frame[3], &value, 1);
+            runtime_.Checkpoint(ctx);
+            for (auto& [handle, opened] : files_) {
+              if (opened.temporary && opened.cache == selected.cache && opened.path == selected.path) { opened.deletePending = value != 0; }
+            }
+          }
+        } else if (frame[4] != 16) { status = 0xc0000004; }
+        else if (selected.deletePending) { status = 0xc0000056; }
+        else {
+          std::array<uint32_t, 4> rename;
+          memory.Read(ctx, frame[3], rename.data(), sizeof(rename));
+          std::string target;
+          status = ReadName(ctx, frame[3] + 8, target);
+          bool temporary = false, cache = false;
+          if (!status && rename[1]) {
+            const auto root = files_.find(rename[1]);
+            if (root == files_.end()) { status = 0xc0000008; }
+            else if (!root->second.directory) { status = 0xc0000024; }
+            else if (target.front() == '\\' || target.find(':') != std::string::npos) { status = 0xc0000033; }
+            else {
+              temporary = root->second.temporary; cache = root->second.cache;
+              target = root->second.path + (root->second.path.empty() ? "" : "\\") + target;
+            }
+          } else if (!status) {
+            if (target.starts_with("\\??\\")) { target.erase(0, 4); }
+            if (target.size() >= 2 && target[1] == ':') {
+              const auto alias = aliases_.find(target.substr(0, 2));
+              if (alias == aliases_.end()) { status = 0xc000003a; }
+              else { target = alias->second + target.substr(2); }
+            }
+            if (!status && !ResolveDevice(target, temporary, &cache)) { status = 0xc000003a; }
+          }
+          if (!status && !ValidPath(target)) { status = 0xc0000033; }
+          if (!status && (!temporary || cache != selected.cache)) { status = 0xc00000d4; }
+          std::vector<std::pair<File*, std::string>> replacements;
+          if (!status) {
+            for (auto& [handle, opened] : files_) {
+              if (!opened.temporary || opened.cache != selected.cache) { continue; }
+              if (opened.path == selected.path) { replacements.emplace_back(&opened, target); }
+              else if (opened.path == target) { status = 0xc0000043; break; }
+            }
+          }
+          runtime_.Checkpoint(ctx);
+          if (!status) { status = Storage(selected)->Rename(selected.path, target, (rename[0] & 0xff) != 0); }
+          if (!status) { for (auto& [opened, path] : replacements) { opened->path.swap(path); } }
+        }
+        publish(status);
+        return;
+      }
       if (file == files_.end()) { status = 0xc0000008; }
       else if (frame[5] != 14 || file->second.raw) { status = 0xc00000bb; }
       else if (frame[4] != 8) { status = 0xc0000004; }
@@ -811,6 +978,7 @@ public:
       memory.CheckRange(ctx, statusOutput, 8);
     };
     const auto publish = [&](uint32_t status, const void* bytes, uint32_t size) {
+      ReportOperationLocked(frame[1], volume ? 218 : 211, frame[5], status, frame[4]);
       if (!status) { memory.Write(ctx, frame[3], bytes, size); }
       const std::array<uint32_t, 2> result = {status, status ? 0u : size};
       memory.Write(ctx, frame[2], result.data(), sizeof(result));
@@ -896,15 +1064,17 @@ public:
 std::function<bool(uint32_t)> InstallFileProvider(Runtime& runtime, PreparedImage& image,
     std::shared_ptr<const kernel::DiscIndex> disc, std::shared_ptr<TemporaryFilesystem> temporary, std::vector<KernelDataExport>* dataExports,
     std::function<DiscReadSnapshot()>* discReads, std::function<void(FileOpenDiagnostic)> fileOpenDiagnostic,
-    std::function<bool(uint32_t)>* ownsHandle) {
+    std::function<bool(uint32_t)>* ownsHandle, std::shared_ptr<RawCache> cache,
+    std::function<void(FileOperationDiagnostic)> operationDiagnostic, uint32_t maximumReadBytes) {
   runtime.Checkpoint({});
   if (!image.memory || image.importsBound || runtime.ActiveWorkers() || !image.diagnosticImports.empty() || image.boundRuntime || image.diagnosticRuntime || runtime.KernelTarget(202) ||
       (dataExports && std::any_of(dataExports->begin(), dataExports->end(), [](const auto& entry) { return entry.ordinal == 40 || entry.ordinal == 326; }))) {
     throw Fault({}, 202, 0, "file provider requires an unpublished stopped image");
   }
-  auto provider = std::make_shared<FileProvider>(runtime, image, std::move(disc), std::move(temporary), std::move(fileOpenDiagnostic));
+  auto provider = std::make_shared<FileProvider>(runtime, image, std::move(disc), std::move(temporary), std::move(fileOpenDiagnostic), std::move(cache), std::move(operationDiagnostic), maximumReadBytes);
   if (dataExports) { provider->InstallData(*dataExports); }
   runtime.RegisterKernel(67, [provider](X86Context& ctx, uint8_t* base) { provider->CreateAlias(ctx, base); });
+  runtime.RegisterKernel(69, [provider](X86Context& ctx, uint8_t* base) { provider->DeleteAlias(ctx, base); });
   runtime.RegisterKernel(190, [provider](X86Context& ctx, uint8_t* base) { provider->Open(ctx, base, true); });
   runtime.RegisterKernel(196, [provider](X86Context& ctx, uint8_t* base) { provider->DeviceControl(ctx, base); });
   runtime.RegisterKernel(200, [provider](X86Context& ctx, uint8_t* base) { provider->DeviceControl(ctx, base, true); });

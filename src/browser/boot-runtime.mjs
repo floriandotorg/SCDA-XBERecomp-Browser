@@ -1,7 +1,7 @@
 import { createWorkerBroker } from './boot-worker-broker.mjs';
 import { createIsoMailbox, finishIsoRead, isoMailboxHeader } from './iso-mailbox.mjs';
 
-export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createWorkerBroker, createServices } = {}) => {
+export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createWorkerBroker, createServices, observeIo = false } = {}) => {
   const broker = createBroker({ WorkerClass });
   const pending = new Map();
   const ports = new Set();
@@ -12,6 +12,7 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
   let started = false;
   let progress;
   let sample;
+  let ioTimer;
   let ioBytes = 0;
   let statsPending = false;
   let services;
@@ -38,6 +39,7 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
   });
   const cancelIo = () => {
     retired = true;
+    clearInterval(ioTimer);
     cancelServices();
     progress = undefined;
     sample = undefined;
@@ -59,6 +61,7 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
       const owned = () => !retired && !signal.aborted && Atomics.load(ownership, 0) === generation;
       const publish = (data) => {
         if (!owned() || data?.generation !== generation) { return; }
+        if (data.phase === 'restarting') { progress = undefined; }
         if (data.phase === 'progress') {
           if (progress) { return; }
           if (!(data.buffer instanceof SharedArrayBuffer) || data.buffer.growable || data.buffer.byteLength > 0x80000000 ||
@@ -83,6 +86,7 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
           void request({ type: 'stats' }).then(({ stats }) => {
             if (owned() && stats?.generation === generation && Number.isSafeInteger(stats.bytesRead) && stats.bytesRead >= ioBytes) {
               ioBytes = stats.bytesRead;
+              if (observeIo) { publish({ generation, phase: 'io', stats }); }
             }
           }, () => {}).finally(() => { statsPending = false; });
         }
@@ -128,6 +132,10 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
       const guest = broker.create(new URL('./boot-worker.mjs', import.meta.url), { type: 'module', name: 'story-boot' }, publish, workerError);
       guest.postMessage({ port: channel.port2, mailbox, generation, ownership, size: source.size,
         ...(services?.webgpuMailbox ? { webgpuMailbox: services.webgpuMailbox } : {}) }, [channel.port2]);
+      if (observeIo) {
+        ioTimer = setInterval(() => { sample?.(); }, 1000);
+        ioTimer.unref?.();
+      }
     },
     cancelIo,
     sampleProgress: () => sample?.(),

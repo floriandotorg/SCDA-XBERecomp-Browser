@@ -53,6 +53,14 @@ int main() {
     const browser::RenderResourceRequest request{17, 9, browser::RenderResourceKind::Texture, 0x10000, 0x11000, 4};
     auto snapshot = browser::CaptureRenderSnapshot(context, memory, state, {&request, 1});
     check(!snapshot.state.vs && !snapshot.state.ps, "state contains no shared shader aliases");
+    browser::RenderSnapshotLimits exact;
+    exact.maxTotalBytes = uint32_t(browser::SerializeRenderSnapshot(snapshot).size());
+    check(browser::CaptureRenderSnapshot(context, memory, state, {&request, 1}, exact).resources[0].payload == snapshot.resources[0].payload,
+      "capture wire accounting rejected its exact serialized size");
+    --exact.maxTotalBytes;
+    rejects([&] { browser::CaptureRenderSnapshot(context, memory, state, {&request, 1}, exact); },
+      "capture wire accounting lost scalar, shader or payload bytes");
+
     state.vs->decl[0] = 99;
     state.ps->def[59] = 0;
     memory.Decommit(0x10000, 8192);
@@ -128,6 +136,25 @@ int main() {
     aliasState.textures[0] = 0x10000;
     aliasState.textures[1] = 0x10040;
     const browser::RenderResourceRequest aliases[] = {request, {request.id, request.version, request.kind, 0x10040, request.payloadAddress, request.payloadBytes}};
+    const browser::RenderResourceRequest references[] = {
+      {request.id, request.version, browser::RenderResourceKind::TextureReference, 0x10000, request.payloadAddress, 0},
+      {request.id, request.version, browser::RenderResourceKind::TextureReference, 0x10040, request.payloadAddress, 0}};
+    const auto referenced = browser::CaptureRenderSnapshot(context, memory, aliasState, references);
+    check(referenced.resources[0].payload.empty() && referenced.resources[0].header.size() == 20 &&
+      referenced.resources[0].id == request.id && referenced.resources[0].version == request.version,
+      "resident GPU references must own headers and exact storage versions without copying texture payloads");
+    const auto referencedWire = browser::SerializeRenderSnapshot(referenced);
+    check(browser::SerializeRenderSnapshot(browser::DeserializeRenderSnapshot(referencedWire)) == referencedWire,
+      "resident GPU reference snapshot wire roundtrip changed identities or ownership");
+    auto invalidReference = referenced;
+    invalidReference.resources[0].payload.push_back(1);
+    rejects([&] { browser::SerializeRenderSnapshot(invalidReference); }, "GPU references cannot smuggle CPU payload ownership");
+    invalidReference = referenced;
+    invalidReference.resources[1].version += 1;
+    rejects([&] { browser::SerializeRenderSnapshot(invalidReference); }, "shared GPU views cannot disagree on completed storage version");
+    invalidReference = referenced;
+    invalidReference.resources[0].id = 0;
+    rejects([&] { browser::SerializeRenderSnapshot(invalidReference); }, "GPU references require a nonzero storage identity");
     auto aliasSnapshot = browser::CaptureRenderSnapshot(context, memory, aliasState, aliases);
     check(aliasSnapshot.resources[0].id == aliasSnapshot.resources[1].id, "compatible distinct views retain physical storage identity");
     check(browser::DeserializeRenderSnapshot(browser::SerializeRenderSnapshot(aliasSnapshot)).resources.size() == 2, "shared physical storage views roundtrip without wire schema change");

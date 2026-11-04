@@ -4,7 +4,9 @@ namespace browser {
 namespace {
 
 struct SavedDisplay {
+  std::mutex lock;
   uint32_t address = 0;
+  std::function<uint32_t()> restoredDisplay;
 
   void Invoke(Runtime& runtime, Memory& memory, X86Context& context, uint32_t ordinal) {
     if (!runtime.OwnsCurrentContext(context) || Memory::HasBorrow()) {
@@ -22,6 +24,11 @@ struct SavedDisplay {
       throw Fault(context, frame[1], 0, "AV saved display requires lifetime-bound guest storage; non-null persistence is unavailable");
     }
     runtime.Checkpoint(context);
+    std::lock_guard guard(lock);
+    if (restoredDisplay) {
+      address = restoredDisplay();
+      restoredDisplay = {};
+    }
     if (ordinal == 4) { address = 0; }
     context.eax = ordinal == 1 ? address : 0;
     context.esp = uint32_t(stackEnd);
@@ -30,13 +37,14 @@ struct SavedDisplay {
 
 }
 
-void InstallAvProvider(Runtime& runtime, Memory& memory) {
+void InstallAvProvider(Runtime& runtime, Memory& memory, std::function<uint32_t()> restoredDisplay) {
   runtime.Checkpoint({});
   if (runtime.ActiveWorkers() || runtime.HasPublishedImage() || Memory::HasBorrow() ||
       runtime.KernelTarget(1) || runtime.KernelTarget(4)) {
     throw Fault({}, 1, 0, "AV provider requires an unpublished stopped runtime and unused saved-display ordinals");
   }
   auto saved = std::make_shared<SavedDisplay>();
+  saved->restoredDisplay = std::move(restoredDisplay);
   for (const uint32_t ordinal : {1u, 4u}) {
     runtime.RegisterKernel(ordinal, [&runtime, &memory, saved, ordinal](X86Context& context, uint8_t* base) {
       if (context.host != &runtime || base != memory.Base()) {

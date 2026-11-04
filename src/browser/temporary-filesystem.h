@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -40,6 +41,11 @@ public:
   uint32_t CreateDirectory(const std::string& path);
   uint32_t CreateFile(const std::string& path, uint32_t attributes, uint64_t allocation = 0);
   uint32_t OverwriteFile(const std::string& path, uint32_t attributes);
+  uint32_t Delete(const std::string& path);
+  uint32_t Rename(const std::string& source, const std::string& destination, bool replace);
+  uint32_t Resize(const std::string& path, uint64_t size);
+  uint32_t Reserve(const std::string& path, uint64_t size);
+  uint32_t SetBasic(const std::string& path, const std::array<uint64_t, 4>& times, uint32_t attributes);
   uint32_t WriteFile(const std::string& path, std::span<const uint8_t> bytes);
   uint32_t Write(const std::string& path, uint64_t offset, std::span<const uint8_t> bytes);
   size_t Read(const std::string& path, uint64_t offset, std::span<uint8_t> output) const;

@@ -28,9 +28,17 @@
       <button id="boot" type="button" disabled>Start</button>
       <button id="stop" type="button" disabled>Stop</button>
     </div>
+    <div role="group" aria-label="Camera controls">
+      <button id="capture" type="button" disabled>Capture mouse</button>
+      <button id="unlock" type="button" disabled>Unlock mouse</button>
+      <label for="sensitivity">Mouse sensitivity</label>
+      <input id="sensitivity" type="range" min="0.05" max="10" step="0.05" value="1">
+      <p id="capture-status" role="status">Start a mission session to enable mouse capture.</p>
+    </div>
     <p id="status" role="status" aria-live="polite" aria-atomic="true">Select an ISO to begin.</p>
+    <p id="loading" role="status" aria-live="polite"></p>
     <p id="detail" role="alert" aria-atomic="true"></p>
-    <p id="keys">Game keys: arrows navigate, Enter is Start, Space or Z confirms, Escape or Backspace returns. X and Y press those controller buttons; Q/E press Black/White and [/] press the left/right triggers. Focus the canvas to play. Switching windows or focusing host controls releases held buttons.</p>
+    <p id="keys">Game keys: WASD moves and arrows navigate. Enter starts or pauses, Space or Z confirms. Capture mouse to look around; Escape unlocks it. When unlocked, Escape or Backspace returns. X and Y press those controller buttons; Q/E press Black/White and [/] press the left/right triggers. Focus the canvas to play. Switching windows or focusing host controls releases held buttons.</p>
     <canvas id="game" width="640" height="480" tabindex="0" aria-label="Original game output" aria-describedby="keys"></canvas>
     <details>
       <summary>WebGPU diagnostics</summary>

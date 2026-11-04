@@ -10,6 +10,10 @@ const auto require = [](bool valid, const char* reason) {
   if (!valid) { throw std::runtime_error(reason); }
 };
 
+bool GpuReference(RenderResourceKind kind) {
+  return kind == RenderResourceKind::TextureReference || kind == RenderResourceKind::SurfaceReference;
+}
+
 struct Writer {
   std::vector<uint8_t> bytes;
   uint32_t limit;
@@ -23,6 +27,22 @@ struct Writer {
     Word(size);
     require(bytes.size() <= limit && value.size() <= limit - bytes.size(), "render snapshot wire budget exceeded");
     bytes.insert(bytes.end(), value.begin(), value.end());
+  }
+};
+
+struct WireSize {
+  uint64_t bytes = 0;
+  uint32_t limit;
+  void Word(uint32_t&) {
+    require(bytes <= limit && limit - bytes >= 4, "render snapshot wire budget exceeded");
+    bytes += 4;
+  }
+  void Blob(std::vector<uint8_t>& value, uint32_t maximum) {
+    require(value.size() <= maximum, "render snapshot blob budget exceeded");
+    uint32_t size = uint32_t(value.size());
+    Word(size);
+    require(bytes <= limit && value.size() <= limit - bytes, "render snapshot wire budget exceeded");
+    bytes += value.size();
   }
 };
 
@@ -159,10 +179,10 @@ void Validate(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits
   uint64_t bytes = 0;
   for (const auto& resource : snapshot.resources) {
     require(resource.id && resource.version, "render resource identity and version must be nonzero");
-    require(resource.payload.size() && resource.payload.size() <= limits.maxPayloadBytes, "invalid render resource payload size");
-    require(resource.payloadAddress && uint64_t(resource.payloadAddress) + resource.payload.size() <= (uint64_t(1) << 32), "invalid render resource payload range");
     const auto kind = resource.kind;
-    require(kind >= RenderResourceKind::VertexBuffer && kind <= RenderResourceKind::IndexData, "invalid render resource kind");
+    require(GpuReference(kind) ? resource.payload.empty() : resource.payload.size() && resource.payload.size() <= limits.maxPayloadBytes, "invalid render resource payload size");
+    require(resource.payloadAddress && uint64_t(resource.payloadAddress) + resource.payload.size() <= (uint64_t(1) << 32), "invalid render resource payload range");
+    require(kind >= RenderResourceKind::VertexBuffer && kind <= RenderResourceKind::SurfaceReference, "invalid render resource kind");
     if (kind == RenderResourceKind::IndexData) {
       require(!resource.headerAddress && resource.header.empty(), "raw index data cannot have a header");
     } else {
@@ -170,7 +190,7 @@ void Validate(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits
       require(resource.headerAddress && resource.header.size() == (shortHeader ? 12 : 20), "invalid render resource header size");
       require(uint64_t(resource.headerAddress) + resource.header.size() <= (uint64_t(1) << 32), "invalid render resource header range");
       const uint32_t type = HeaderWord(resource, 0) & 0x70000;
-      const uint32_t expected = kind == RenderResourceKind::VertexBuffer ? 0 : kind == RenderResourceKind::IndexBuffer ? 0x10000 : kind == RenderResourceKind::Texture ? 0x40000 : 0x50000;
+      const uint32_t expected = kind == RenderResourceKind::VertexBuffer ? 0 : kind == RenderResourceKind::IndexBuffer ? 0x10000 : (kind == RenderResourceKind::Texture || kind == RenderResourceKind::TextureReference) ? 0x40000 : 0x50000;
       require(type == expected, "render resource header type mismatch");
       const uint32_t data = HeaderWord(resource, 4);
       require(PhysicalAddress(data) == PhysicalAddress(resource.payloadAddress), "render resource payload does not match header data");
@@ -182,7 +202,7 @@ void Validate(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits
       require(!resource.headerAddress || other.headerAddress != resource.headerAddress, "duplicate render resource header");
       if (other.id == resource.id) {
         const auto storageView = [](RenderResourceKind value) {
-          return value == RenderResourceKind::Texture || value == RenderResourceKind::Surface;
+          return value == RenderResourceKind::Texture || value == RenderResourceKind::Surface || GpuReference(value);
         };
         require(storageView(other.kind) && storageView(resource.kind) && other.version == resource.version &&
           PhysicalAddress(other.payloadAddress) == PhysicalAddress(resource.payloadAddress) && other.payload == resource.payload &&
@@ -194,7 +214,9 @@ void Validate(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits
   const auto bound = [&](uint32_t address, RenderResourceKind kind) {
     if (!address) { return; }
     require(std::any_of(snapshot.resources.begin(), snapshot.resources.end(), [&](const auto& resource) {
-      return resource.headerAddress == address && resource.kind == kind;
+      const bool matching = resource.kind == kind || (kind == RenderResourceKind::Texture && resource.kind == RenderResourceKind::TextureReference) ||
+        (kind == RenderResourceKind::Surface && resource.kind == RenderResourceKind::SurfaceReference);
+      return resource.headerAddress == address && matching;
     }), "bound render resource missing from snapshot");
   };
   for (const auto address : snapshot.state.textures) { bound(address, RenderResourceKind::Texture); }
@@ -228,7 +250,7 @@ RenderSnapshot CaptureRenderSnapshot(const X86Context& context, Memory& memory, 
   uint64_t total = 0;
   for (const auto& request : resources) {
     require(request.id && request.version, "render resource identity and version must be nonzero");
-    require(request.payloadBytes && request.payloadBytes <= limits.maxPayloadBytes, "render resource payload budget exceeded");
+    require(GpuReference(request.kind) ? request.payloadBytes == 0 : request.payloadBytes && request.payloadBytes <= limits.maxPayloadBytes, "render resource payload budget exceeded");
     require(request.payloadAddress && uint64_t(request.payloadAddress) + request.payloadBytes <= (uint64_t(1) << 32), "invalid render resource payload range");
     RenderResourceSnapshot resource;
     resource.id = request.id;
@@ -244,13 +266,16 @@ RenderSnapshot CaptureRenderSnapshot(const X86Context& context, Memory& memory, 
       resource.header.resize(headerBytes);
       memory.Read(context, request.headerAddress, resource.header.data(), resource.header.size());
     }
-    memory.CheckRange(context, request.payloadAddress, request.payloadBytes);
-    resource.payload.resize(request.payloadBytes);
-    memory.Read(context, request.payloadAddress, resource.payload.data(), resource.payload.size());
+    memory.CheckRange(context, request.payloadAddress, std::max(request.payloadBytes, 1u));
+    if (request.payloadBytes) {
+      resource.payload.resize(request.payloadBytes);
+      memory.Read(context, request.payloadAddress, resource.payload.data(), resource.payload.size());
+    }
     snapshot.resources.push_back(std::move(resource));
   }
   Validate(snapshot, limits);
-  SerializeRenderSnapshot(snapshot, limits);
+  WireSize wire{0, limits.maxTotalBytes};
+  SnapshotFields(wire, snapshot, limits);
   return snapshot;
 }
 

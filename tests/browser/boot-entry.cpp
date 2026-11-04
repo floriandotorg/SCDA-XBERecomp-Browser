@@ -254,7 +254,11 @@ int main() {
     check(guest.ActiveWorkers() == 0, "entry fault leaked a runtime worker");
   }
   {
-    const std::array<X86FuncMapping, 1> mappings = {{{0x11000, [](X86Context& ctx, uint8_t*) { ctx.eax = 42; ctx.esp += 8; }}}};
+    const std::array<X86FuncMapping, 1> mappings = {{{0x11000, [](X86Context& ctx, uint8_t*) {
+      check(ctx.ebx == 0x13579bdf, "fresh image entry ran before host launch state restoration");
+      ctx.eax = 42;
+      ctx.esp += 8;
+    }}}};
     browser::Runtime guest(mappings, {});
     browser::PreparedImage startup;
     startup.memory = std::make_unique<browser::Memory>();
@@ -268,7 +272,13 @@ int main() {
     catch (const browser::Fault&) { trapped = true; }
     check(trapped && !execution.entered && startup.threads.empty(), "unsupported TLS callback was silently skipped");
     startup.tlsCallbacks.clear();
-    browser::ExecuteImageEntry(startup, guest, execution);
+    bool restored = false;
+    browser::ExecuteImageEntry(startup, guest, execution, [&](X86Context& context) {
+      check(guest.OwnsCurrentContext(context) && !restored, "launch restoration requires its one fresh owned worker");
+      context.ebx = 0x13579bdf;
+      restored = true;
+    });
+    check(restored, "host launch state was not restored");
     check(execution.entered && execution.returned && guest.ActiveWorkers() == 0, "entry return or joining failed");
   }
   for (uint32_t n = 0; n < 3; ++n) {

@@ -60,18 +60,26 @@ const auto contracts = [] {
     const auto mutant = handles.CreateMutant(4);
     check(poll(mutant, 8) == 0x102, "initial owner holds mutant without waiting");
     handles.Close(mutant);
-    check(handles.ActiveHandles() == 0 && dispatcher.ActiveObjects() == 1, "final close retains owned mutant after all operation pins end");
+    check(handles.ActiveHandles() == 0 && dispatcher.ActiveObjects() == 0, "final close destroys an owned mutant after all operation pins end");
     fault([&] { handles.ReleaseMutant(mutant, 4); }, "retained ownership does not resurrect closed handle");
-    check(handles.AbandonOwner(8) == 0 && handles.AbandonOwner(4) == 1 && handles.AbandonOwner(4) == 0,
-      "explicit owner exit retires closed ownership exactly once");
-    check(dispatcher.ActiveObjects() == 0, "closed owned object retires on abandonment");
+    check(handles.AbandonOwner(8) == 0 && handles.AbandonOwner(4) == 0,
+      "closed owned objects cannot survive as unreachable ownership");
+    check(dispatcher.ActiveObjects() == 0, "closed owned object stays retired after abandonment");
+  }
+  for (size_t n = 0; n < browser::kDispatcherCapacity * 4; ++n) {
+    const auto mutant = handles.CreateMutant(4);
+    const auto alias = handles.Duplicate(mutant);
+    handles.Close(mutant);
+    check(dispatcher.ActiveObjects() == 1, "live aliases must retain the owned mutant");
+    handles.Close(alias);
+    check(dispatcher.ActiveObjects() == 0, "owned mutex create and close cycles cannot exhaust object capacity");
   }
   {
     const auto mutant = handles.CreateMutant();
     check(poll(mutant, 4) == 0 && poll(mutant, 4) == 0, "recursive successful waits own beyond completion");
     handles.Close(mutant);
-    check(dispatcher.ActiveObjects() == 1 && handles.AbandonOwner(4) == 1 && dispatcher.ActiveObjects() == 0,
-      "acquired recursive ownership survives final closure then abandons fully");
+    check(dispatcher.ActiveObjects() == 0 && handles.AbandonOwner(4) == 0,
+      "recursive ownership cannot retain an object after its final reference closes");
   }
   for (size_t n = 0; n < 100; ++n) {
     const auto mutant = handles.CreateMutant(4);
@@ -82,9 +90,9 @@ const auto contracts = [] {
     const auto replacement = handles.CreateMutant();
     check(handles.AbandonOwner(4) == 1, "abandonment reaches pending closed original");
     waiter.join();
-    check(status == 0x80 && dispatcher.ActiveObjects() == 2 && poll(replacement, 12) == 0,
-      "closed wait reports abandonment and retains new ownership without touching replacement");
-    check(handles.AbandonOwner(8) == 1 && dispatcher.ActiveObjects() == 1, "new owner exit retires closed acquired mutant");
+    check(status == 0x80 && dispatcher.ActiveObjects() == 1 && poll(replacement, 12) == 0,
+      "closed wait reports abandonment and retires its final pin without touching replacement");
+    check(handles.AbandonOwner(8) == 0 && dispatcher.ActiveObjects() == 1, "completed closed waits cannot retain unreachable ownership");
     handles.ReleaseMutant(replacement, 12);
     handles.Close(replacement);
   }
@@ -138,8 +146,8 @@ const auto contracts = [] {
     handles.Close(mutant);
     dispatcher.AdvanceTime(1);
     waiter.join();
-    check(status == 0x102 && dispatcher.ActiveObjects() == 1 && handles.AbandonOwner(8) == 0,
-      "guest timeout drops wait pin without dropping original owner or granting new ownership");
+    check(status == 0x102 && dispatcher.ActiveObjects() == 0 && handles.AbandonOwner(8) == 0,
+      "guest timeout retires the final closed wait pin without granting ownership");
     handles.AbandonOwner(4);
     memory.Write(ctx, 0x10000, &zero, sizeof(zero));
   }
@@ -153,8 +161,8 @@ const auto contracts = [] {
     parked(dispatcher);
     handles.Close(mutant);
     waiter.join();
-    check(expired && dispatcher.ActiveObjects() == 1 && handles.AbandonOwner(8) == 0,
-      "host watchdog neither grants ownership nor drops existing owner");
+    check(expired && dispatcher.ActiveObjects() == 0 && handles.AbandonOwner(8) == 0,
+      "host watchdog retires the final closed wait pin without granting ownership");
     handles.AbandonOwner(4);
   }
   {
@@ -176,7 +184,7 @@ const auto contracts = [] {
     check(ctx.eax == 0 && ctx.esp == 0x10111 && poll(mutant, 4) == 0x102,
       "checked wait ABI uses context identity and retains acquired ownership");
     handles.Close(mutant);
-    check(handles.AbandonOwner(12) == 1, "ABI ownership survives final handle closure");
+    check(handles.AbandonOwner(12) == 0, "ABI ownership cannot retain a fully closed object");
     handles.Close(event);
   }
   {
@@ -200,18 +208,17 @@ const auto contracts = [] {
     for (size_t n = 0; n + 1 < mutants.size(); ++n) { check(poll(mutants[n], 4) == 0x80, "consume lower abandoned indices"); }
     check(wait(mutants, 8) == 0xBF, "any preserves highest abandoned index 63");
     for (const auto handle : mutants) { handles.Close(handle); }
-    check(handles.AbandonOwner(4) == 63 && handles.AbandonOwner(8) == 1,
-      "closed multiobject acquisition retains each distinct owner");
+    check(handles.AbandonOwner(4) == 0 && handles.AbandonOwner(8) == 0,
+      "closed multiobject acquisition releases every unreachable owner");
   }
   {
     std::array<uint32_t, browser::kDispatcherCapacity> mutants{};
     for (auto& handle : mutants) { handle = handles.CreateMutant(4); }
     fault([&] { handles.CreateMutant(8); }, "mutant handle capacity rejects before object allocation");
     for (const auto handle : mutants) { handles.Close(handle); }
-    fault([&] { handles.CreateMutant(); }, "closed ownership still consumes object budget");
-    check(handles.ActiveHandles() == 0 && dispatcher.ActiveObjects() == browser::kDispatcherCapacity && handles.AbandonOwner(8) == 0,
-      "failed creation leaks no owner or handle");
-    check(handles.AbandonOwner(4) == browser::kDispatcherCapacity && dispatcher.ActiveObjects() == 0, "owner exit releases full closed object budget");
+    check(handles.ActiveHandles() == 0 && dispatcher.ActiveObjects() == 0 && handles.AbandonOwner(8) == 0,
+      "closing a full owned table restores its entire object and handle capacity");
+    check(handles.AbandonOwner(4) == 0, "closed capacity fixtures retain no orphaned owner state");
     const auto replacement = handles.CreateMutant();
     handles.Close(replacement);
   }
@@ -219,8 +226,8 @@ const auto contracts = [] {
     DispatcherHandles scoped(dispatcher);
     scoped.CreateMutant(4);
   }
-  check(dispatcher.ActiveObjects() == 1 && handles.AbandonOwner(4) == 1,
-    "table destruction does not impersonate thread exit for owned mutants");
+  check(dispatcher.ActiveObjects() == 0 && handles.AbandonOwner(4) == 0,
+    "table destruction closes final references without retaining unreachable mutants");
   for (size_t n = 0; n < 100; ++n) {
     const auto mutant = handles.CreateMutant(4);
     std::jthread exiting([&] { handles.AbandonOwner(4); });
@@ -230,19 +237,17 @@ const auto contracts = [] {
   }
   for (size_t n = 0; n < 100; ++n) {
     const auto mutant = handles.CreateMutant(4);
-    bool released = false;
     std::jthread releasing([&] {
       try {
         handles.ReleaseMutant(mutant, 4);
-        released = true;
       } catch (const browser::Fault& error) {
         check(error.address == mutant, "release loses lookup only to final closure");
       }
     });
     handles.Close(mutant);
     releasing.join();
-    check(handles.AbandonOwner(4) == (released ? 0 : 1) && dispatcher.ActiveObjects() == 0,
-      "release racing final close either completes or leaves explicit owner cleanup");
+    check(handles.AbandonOwner(4) == 0 && dispatcher.ActiveObjects() == 0,
+      "release racing final close cannot retain an unreachable owner");
   }
   {
     const auto mutant = handles.CreateMutant(4);
@@ -307,12 +312,13 @@ const auto cancellation = [] {
   handles.Close(workerHandle);
   check(!runtime.Stop() && cancelled && dispatcher.ActiveWaiters() == 0 && runtime.ActiveWorkers() == 0,
     "Stop cancels and joins actual runtime owned mutant waiter");
-  check(dispatcher.ActiveObjects() == 2 && handles.AbandonOwner(8) == 0, "cancellation cannot acquire or abandon unrelated ownership");
+  check(dispatcher.ActiveObjects() == 1 && handles.AbandonOwner(8) == 0, "cancellation retires its closed wait pin without acquiring unrelated ownership");
   fault([&] { handles.CreateMutant(); }, "cancelled runtime rejects allocation");
   fault([&] { handles.ReleaseMutant(cleanup, 12); }, "cancelled runtime rejects release");
+  check(handles.AbandonOwner(4) == 0 && handles.AbandonOwner(12) == 1 && dispatcher.ActiveObjects() == 1,
+    "explicit owner exit remains available for the surviving handle after cancellation");
   handles.Close(cleanup);
-  check(handles.AbandonOwner(4) == 1 && handles.AbandonOwner(12) == 1 && dispatcher.ActiveObjects() == 0,
-    "explicit owner exit remains available after cancellation and final closure");
+  check(dispatcher.ActiveObjects() == 0, "cancellation cleanup leaves no closed ownership or live object");
   workerHandles = nullptr;
 };
 

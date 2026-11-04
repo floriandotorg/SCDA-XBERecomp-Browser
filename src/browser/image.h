@@ -116,7 +116,7 @@ struct ImageExecution {
   X86Context context{};
 };
 
-void ExecuteImageEntry(PreparedImage& prepared, Runtime& runtime, ImageExecution& execution);
+void ExecuteImageEntry(PreparedImage& prepared, Runtime& runtime, ImageExecution& execution, std::function<void(X86Context&)> initialize = {});
 uint32_t ImageExecutionThreadId(const PreparedImage& prepared, const ImageExecution& execution);
 void CompleteImageThread(PreparedImage& prepared, Runtime& runtime, const X86Context& context, uint32_t status);
 void DeclareDiagnosticImport(PreparedImage& prepared, Runtime& runtime, uint32_t ordinal, bool data);
