@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <thread>
 
+static_assert(sizeof(browser::Memory::BlockScope) == sizeof(void*));
+
 int main() {
   try {
     browser::Memory memory;

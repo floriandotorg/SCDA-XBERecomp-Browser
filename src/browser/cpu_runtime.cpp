@@ -102,7 +102,7 @@ Memory::Memory() {
   physicalVersions_.resize(physicalStorage_->committed.size());
 }
 
-void Memory::BeginBlock() {
+Memory::PageTable* Memory::BeginBlock() {
   if (HasBorrow()) {
     const auto* execution = Execution::current_;
     if (!execution || !execution->lease_ || execution->memory_ != this || threadBorrows_ != 1 || mutatedMemory_) {
@@ -110,7 +110,7 @@ void Memory::BeginBlock() {
     }
     ++leases_;
     ++threadBorrows_;
-    return;
+    return pages_.get();
   }
   std::unique_lock lock(memoryLock_);
   InitializePages();
@@ -118,6 +118,7 @@ void Memory::BeginBlock() {
   ++threadBorrows_;
   borrowedMemory_ = this;
   lock.release();
+  return pages_.get();
 }
 
 void Memory::EndBlock() noexcept {
@@ -135,12 +136,12 @@ void Memory::EndBlock() noexcept {
 }
 
 void Memory::InitializePages() {
-  if (!pages_.empty()) { return; }
-  std::vector<Page> pages(1u << 20);
+  if (pages_) { return; }
+  auto pages = std::make_unique<PageTable>(*this);
   for (const auto& region : regions_) {
     for (size_t n = 0; n < region.storage->committed.size(); ++n) {
       if (!region.storage->committed[n]) { continue; }
-      pages[region.address / pageSize + n] = {region.storage->bytes.data() + n * pageSize,
+      pages->entries[region.address / pageSize + n] = {region.storage->bytes.data() + n * pageSize,
         region.storage == physicalStorage_ ? &physicalVersions_[n] : nullptr};
     }
   }
@@ -215,9 +216,9 @@ void Memory::Discard(uint32_t address, uint32_t size) {
       throw Fault({}, address, size, "discard crosses backing ownership");
     }
   }
-  if (!pages_.empty()) {
+  if (pages_) {
     const size_t limit = size_t((end + pageSize - 1) / pageSize);
-    for (size_t n = address / pageSize; n < limit; ++n) { pages_[n] = {}; }
+    for (size_t n = address / pageSize; n < limit; ++n) { pages_->entries[n] = {}; }
   }
   std::erase_if(regions_, [&](const Region& region) { return region.address >= address && uint64_t(region.address) < end; });
 }
@@ -524,7 +525,7 @@ void Memory::Pages(uint32_t address, uint32_t size, bool committed) {
         std::memset(region.storage->bytes.data() + offset, 0, pageSize);
         state = committed;
       }
-      if (!pages_.empty()) { pages_[cursor / pageSize] = {committed ? region.storage->bytes.data() + offset : nullptr, nullptr}; }
+      if (pages_) { pages_->entries[cursor / pageSize] = {committed ? region.storage->bytes.data() + offset : nullptr, nullptr}; }
     }
     cursor += pageSize;
   }
@@ -798,10 +799,9 @@ void Runtime::Invoke(X86Context& ctx, uint8_t* base, uint32_t target) {
 #if defined(__EMSCRIPTEN__) && defined(BROWSER_MENU_TRACE_ABORTS) && BROWSER_MENU_TRACE_ABORTS
   browser_abort_record_context(uint32_t(workerId_), target, ctx.esp, ctx.ecx, ctx.ebx, ctx.esi, ctx.edi);
 #endif
-  Checkpoint(ctx);
-  RequireImageSession(ctx, base);
   if (target < 0xFD000000) { PollLoop(ctx, base); }
   else if (target < 0xFE000000) { Poll(ctx, base); }
+  else { Checkpoint(ctx); RequireImageSession(ctx, base); }
   ctx.last_icall = target;
   if (std::find(continuations_.begin(), continuations_.end(), target) != continuations_.end()) { throw X86Resume{target, ctx.esp}; }
   if (auto* function = Find(target)) {
@@ -1011,7 +1011,6 @@ void Runtime::Poll(X86Context& ctx, uint8_t* base) {
   RequireImageSession(ctx, base);
   RecordProgress(ctx);
   if (!expiryDriver_ || polling_ || Memory::HasBorrow()) { return; }
-  RequireImageSession(ctx, base);
   if (!OwnsCurrentContext(ctx)) { throw Fault(ctx, 149, 0, "expiry polling requires its current worker"); }
   struct Polling {
     bool& active;

@@ -64,13 +64,19 @@ class Memory {
     uint8_t* bytes = nullptr;
     uint64_t* version = nullptr;
   };
-  std::vector<Page> pages_;
+  struct PageTable {
+    Memory& memory;
+    std::array<Page, 1u << 20> entries{};
+    explicit PageTable(Memory& owner) : memory(owner) {}
+  };
+  std::unique_ptr<PageTable> pages_;
   void InitializePages();
-  Page* PageAt(uint32_t address, size_t size) {
-    if (pages_.empty() || !size || size > 16 || size > 4096 - (address & 4095)) { return nullptr; }
-    auto& page = pages_[address >> 12];
+  static Page* PageAt(Page* pages, uint32_t address, size_t size) {
+    if (!pages || !size || size > 16 || size > 4096 - (address & 4095)) { return nullptr; }
+    auto& page = pages[address >> 12];
     return page.bytes ? &page : nullptr;
   }
+  Page* PageAt(uint32_t address, size_t size) { return PageAt(pages_ ? pages_->entries.data() : nullptr, address, size); }
   [[noreturn, gnu::cold, gnu::noinline]] void WriteVersionExhausted(const X86Context& ctx, uint32_t address, size_t size);
   void MarkPageWrite(const X86Context& ctx, uint32_t address, size_t size, Page& page) {
     if (!page.version) { return; }
@@ -132,28 +138,28 @@ public:
   static void YieldExecution();
   Mutation Mutate() { return Mutation(*this); }
   Lease Borrow() { return Lease(*this); }
-  void BeginBlock();
+  PageTable* BeginBlock();
   void EndBlock() noexcept;
   class BlockScope {
-    Memory& memory_;
+    PageTable& table_;
   public:
-    explicit BlockScope(Memory& memory) : memory_(memory) { memory_.BeginBlock(); }
-    ~BlockScope() { memory_.EndBlock(); }
+    explicit BlockScope(Memory& memory) : table_(*memory.BeginBlock()) {}
+    ~BlockScope() { table_.memory.EndBlock(); }
     BlockScope(const BlockScope&) = delete;
     BlockScope& operator=(const BlockScope&) = delete;
     template <typename T> T Load(const X86Context& ctx, uint32_t address) {
       T value;
-      auto* page = memory_.PageAt(address, sizeof(T));
+      auto* page = Memory::PageAt(table_.entries.data(), address, sizeof(T));
       if (page) { std::memcpy(&value, page->bytes + (address & 4095), sizeof(T)); }
-      else { memory_.Read(ctx, address, &value, sizeof(T)); }
+      else { table_.memory.Read(ctx, address, &value, sizeof(T)); }
       return value;
     }
     template <typename T> void Store(const X86Context& ctx, uint32_t address, T value) {
-      auto* page = memory_.PageAt(address, sizeof(T));
+      auto* page = Memory::PageAt(table_.entries.data(), address, sizeof(T));
       if (page) {
-        memory_.MarkPageWrite(ctx, address, sizeof(T), *page);
+        table_.memory.MarkPageWrite(ctx, address, sizeof(T), *page);
         std::memcpy(page->bytes + (address & 4095), &value, sizeof(T));
-      } else { memory_.Write(ctx, address, &value, sizeof(T)); }
+      } else { table_.memory.Write(ctx, address, &value, sizeof(T)); }
     }
   };
   static bool HasBorrow() { return threadBorrows_ != 0; }

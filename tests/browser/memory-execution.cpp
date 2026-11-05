@@ -1,13 +1,16 @@
 #include "browser/cpu_runtime.h"
 #include <atomic>
 #include <cstdio>
+#include <source_location>
 #include <thread>
 
 int main() {
   try {
     browser::Memory memory;
     memory.Ensure(0x10000, 8192);
-    const auto check = [](bool valid) { if (!valid) { throw std::runtime_error("guest execution ownership contract changed"); } };
+    const auto check = [](bool valid, std::source_location location = std::source_location::current()) {
+      if (!valid) { throw std::runtime_error("guest execution ownership contract changed at line " + std::to_string(location.line())); }
+    };
     const auto rejects = [&](auto operation) {
       bool rejected = false;
       try { operation(); } catch (const browser::Fault&) { rejected = true; }
