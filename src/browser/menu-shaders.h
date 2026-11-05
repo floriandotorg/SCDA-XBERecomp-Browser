@@ -34,6 +34,7 @@ ShaderConstants BuildConstants(const gpu::State& state, uint32_t width, uint32_t
   const std::array<std::array<float, 4>, 4>& texsize = {});
 ShaderResult GenerateShaders(const gpu::State& state, uint16_t regs, bool pretransformed,
   const gpu::TexInfo (&textures)[4], uint64_t decode = 0, bool colorTarget = true, bool depthBias = false);
+std::string GuestVertexInputs(std::string vertex, const gpu::VertexShader& layout, uint16_t regs);
 std::string DescribeShaderFailure(const ShaderResult& shader, std::string_view error);
 
 }

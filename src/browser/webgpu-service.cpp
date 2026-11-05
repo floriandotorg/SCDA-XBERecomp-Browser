@@ -37,6 +37,9 @@ struct Texture {
   WGPUTextureView attachment = nullptr;
   uint32_t volumeDepth = 1;
 };
+struct ResidentBuffer { WGPUBuffer handle; uint32_t bytes; };
+std::map<uint32_t, ResidentBuffer> resident_buffers;
+uint64_t resident_buffer_bytes = 0;
 struct CachedSampler { WGPUSampler handle; uint64_t used; };
 std::map<std::array<uint32_t, 8>, CachedSampler> sampler_cache;
 uint64_t sampler_sequence = 0;
@@ -121,6 +124,8 @@ std::array<uint8_t, 768> gamma_ramp = [] {
   return result;
 }();
 void discard(uint32_t id) {
+  const auto buffer = resident_buffers.find(id);
+  if (buffer != resident_buffers.end()) { resident_buffer_bytes -= buffer->second.bytes; wgpuBufferDestroy(buffer->second.handle); wgpuBufferRelease(buffer->second.handle); resident_buffers.erase(buffer); }
   auto image = textures.find(id);
   if (image != textures.end()) { texture_bytes -= textureBytes(image->second.width, image->second.height, image->second.levels, image->second.volumeDepth) * (image->second.cube ? 6 : 1); release_views(image->second); wgpuTextureDestroy(image->second.handle); wgpuTextureRelease(image->second.handle); textures.erase(image); }
   auto pipeline = pipelines.find(id);
@@ -203,15 +208,34 @@ void submit(WGPUCommandEncoder encoder) {
   wgpuCommandBufferRelease(command);
   wgpuCommandEncoderRelease(encoder);
 }
+void write_buffer(WGPUBuffer buffer, std::span<const uint8_t> bytes, uint64_t offset = 0) {
+  std::vector<uint8_t> padded((bytes.size() + 3) & ~size_t(3));
+  std::memcpy(padded.data(), bytes.data(), bytes.size());
+  wgpuQueueWriteBuffer(queue, buffer, offset, padded.data(), padded.size());
+}
 WGPUBuffer buffer(std::span<const uint8_t> bytes, WGPUBufferUsage usage) {
   auto descriptor = WGPU_BUFFER_DESCRIPTOR_INIT;
   descriptor.size = (bytes.size() + 3) & ~uint64_t(3);
   descriptor.usage = usage | WGPUBufferUsage_CopyDst;
   auto result = wgpuDeviceCreateBuffer(device, &descriptor);
-  std::vector<uint8_t> padded(descriptor.size);
-  std::memcpy(padded.data(), bytes.data(), bytes.size());
-  wgpuQueueWriteBuffer(queue, result, 0, padded.data(), padded.size());
+  write_buffer(result, bytes);
   return result;
+}
+void upload_buffer(uint32_t resource, std::span<const uint8_t> bytes) {
+  const auto upload = packet<BufferUpload>(bytes);
+  const uint64_t length = (bytes.size() + 3) & ~uint64_t(3);
+  if (!resource || bytes.empty() || upload.offset % 4 || !upload.capacity || upload.capacity % 4 || upload.capacity > MaxBytes || uint64_t(upload.offset) + length > upload.capacity) { throw std::runtime_error("invalid resident buffer upload"); }
+  if (const auto found = resident_buffers.find(resource); found != resident_buffers.end()) {
+    if (upload.capacity != found->second.bytes) { throw std::runtime_error("resident buffer update size mismatch"); }
+    write_buffer(found->second.handle, bytes, upload.offset); return;
+  }
+  if (textures.contains(resource) || pipelines.contains(resource) || resident_buffers.size() >= 512 || textures.size() + pipelines.size() + resident_buffers.size() >= 4096 || resident_buffer_bytes + upload.capacity > (128u << 20)) { throw std::runtime_error("resident buffer budget exceeded"); }
+  auto descriptor = WGPU_BUFFER_DESCRIPTOR_INIT;
+  descriptor.size = upload.capacity; descriptor.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
+  const auto handle = wgpuDeviceCreateBuffer(device, &descriptor);
+  resident_buffers.emplace(resource, ResidentBuffer{handle, upload.capacity}); resident_buffer_bytes += upload.capacity; created_resource = resource;
+  write_buffer(handle, bytes, upload.offset);
+  return;
 }
 struct DrawUploads {
   std::array<std::vector<uint8_t>, 3> bytes;
@@ -231,6 +255,7 @@ struct DrawUploads {
         continue;
       }
       const auto draw = packet<DrawPacket>(payload);
+      if (draw.index32 == 2) { packet<ResidentDraw>(payload); }
       exact(payload, uint64_t(draw.vertex_bytes) + draw.index_bytes + draw.uniform_bytes);
       std::array<uint64_t, 3> row{};
       const std::array<uint32_t, 3> lengths{draw.vertex_bytes, draw.index_bytes, draw.uniform_bytes};
@@ -484,15 +509,18 @@ struct Output { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f3
   }
 }
 void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* uploads = nullptr, uint32_t upload = 0) {
-      auto spec = packet<DrawPacket>(bytes); exact(bytes, uint64_t(spec.vertex_bytes) + spec.index_bytes + spec.uniform_bytes);
+      auto spec = packet<DrawPacket>(bytes);
+      const bool resident = spec.index32 == 2;
+      const auto residentDraw = resident ? packet<ResidentDraw>(bytes) : ResidentDraw{};
+      exact(bytes, uint64_t(spec.vertex_bytes) + spec.index_bytes + spec.uniform_bytes);
       for (const float value : spec.blend_constant) {
         if (!std::isfinite(value) || value < 0 || value > 1) { throw std::runtime_error("invalid blend constant"); }
       }
       auto found = pipelines.find(spec.pipeline); if (found == pipelines.end()) { throw std::runtime_error("unknown pipeline resource"); }
       const uint32_t stride = found->second.vertexStride;
       auto* target = resource ? &texture(resource) : nullptr;
-      if ((!target && !spec.depth_target) || (target && (target->depth || target->cube || target->volumeDepth > 1)) || !spec.vertex_bytes || spec.vertex_bytes % stride || spec.vertex_count > spec.vertex_bytes / stride || spec.index32 > 1 || spec.index_bytes != uint64_t(spec.index_count) * (spec.index32 ? 4 : 2) || !spec.uniform_bytes || spec.uniform_bytes > 65536 || spec.uniform_bytes % 16) { throw std::runtime_error("invalid draw payload"); }
-      for (uint32_t n = 0; n < spec.index_count; ++n) {
+      if ((!target && !spec.depth_target) || (target && (target->depth || target->cube || target->volumeDepth > 1)) || (!resident && (!spec.vertex_bytes || spec.vertex_bytes % stride || spec.vertex_count > spec.vertex_bytes / stride || spec.index32 > 1 || spec.index_bytes != uint64_t(spec.index_count) * (spec.index32 ? 4 : 2))) || (resident && (spec.vertex_bytes || spec.index_bytes || !spec.index_count || residentDraw.index_bytes != uint64_t(spec.index_count) * 4)) || !spec.uniform_bytes || spec.uniform_bytes > 65536 || spec.uniform_bytes % 16) { throw std::runtime_error("invalid draw payload"); }
+      for (uint32_t n = 0; !resident && n < spec.index_count; ++n) {
         uint32_t index = 0;
         std::memcpy(&index, bytes.data() + spec.vertex_bytes + n * (spec.index32 ? 4 : 2), spec.index32 ? 4 : 2);
         if (index >= spec.vertex_bytes / stride) { throw std::runtime_error("draw index exceeds owned vertices"); }
@@ -502,11 +530,24 @@ void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* 
         if (spec.sampler[n][0] < 1 || spec.sampler[n][0] > 3 || spec.sampler[n][1] < 1 || spec.sampler[n][1] > 3 || spec.sampler[n][2] < 1 || spec.sampler[n][2] > 2 || spec.sampler[n][3] < 1 || spec.sampler[n][3] > 2 || spec.sampler[n][4] < 1 || spec.sampler[n][4] > 2 || spec.sampler[n][5] > spec.sampler[n][6] || spec.sampler[n][6] > 32 || spec.address_w[n] < 1 || spec.address_w[n] > 3) { throw std::runtime_error("unsupported sampler state"); }
       }
       if (spec.depth_target && !texture(spec.depth_target).depth) { throw std::runtime_error("invalid depth target resource"); }
+      std::array<WGPUBuffer, 16> residentVertices{};
+      WGPUBuffer residentIndices = nullptr;
+      if (resident) {
+        const auto index = resident_buffers.find(residentDraw.indices);
+        if (index == resident_buffers.end() || uint64_t(residentDraw.index_offset) + residentDraw.index_bytes > index->second.bytes || residentDraw.index_offset % 4) { throw std::runtime_error("invalid resident index buffer"); }
+        residentIndices = index->second.handle;
+        for (uint32_t n = 0; n < 16; ++n) {
+          if (!residentDraw.vertices[n]) { continue; }
+          const auto vertex = resident_buffers.find(residentDraw.vertices[n]);
+          if (n >= 8 || vertex == resident_buffers.end() || !residentDraw.sizes[n] || uint64_t(residentDraw.offsets[n]) + residentDraw.sizes[n] > vertex->second.bytes || residentDraw.offsets[n] % 4) { throw std::runtime_error("invalid resident vertex buffer"); }
+          residentVertices[n] = vertex->second.handle;
+        }
+      }
       const std::array<uint64_t, 3> offsets = uploads ? uploads->offsets[upload] : std::array<uint64_t, 3>{};
-      auto vertices = uploads ? uploads->buffers[0] : buffer(bytes.first(spec.vertex_bytes), WGPUBufferUsage_Vertex);
+      auto vertices = resident ? nullptr : uploads ? uploads->buffers[0] : buffer(bytes.first(spec.vertex_bytes), WGPUBufferUsage_Vertex);
       auto uniforms = uploads ? uploads->buffers[2] : buffer(bytes.subspan(spec.vertex_bytes + spec.index_bytes), WGPUBufferUsage_Uniform);
       WGPUBuffer indices = nullptr;
-      if (spec.index_count) { indices = uploads ? uploads->buffers[1] : buffer(bytes.subspan(spec.vertex_bytes, spec.index_bytes), WGPUBufferUsage_Index); }
+      if (resident) { indices = residentIndices; } else if (spec.index_count) { indices = uploads ? uploads->buffers[1] : buffer(bytes.subspan(spec.vertex_bytes, spec.index_bytes), WGPUBufferUsage_Index); }
       std::array<WGPUBindGroupEntry, 9> entries{}; std::array<WGPUTextureView, 4> views{}; std::array<WGPUSampler, 4> samplers{};
       entries[0] = WGPU_BIND_GROUP_ENTRY_INIT; entries[0].binding = 0; entries[0].buffer = uniforms; entries[0].offset = offsets[2]; entries[0].size = spec.uniform_bytes;
       for (uint32_t n = 0; n < 4; ++n) {
@@ -531,17 +572,22 @@ void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* 
       if (batch_encoder && batch_pass && (batch_color != resource || batch_depth != spec.depth_target)) { end_batch_pass(); }
       auto pass = batch_encoder && batch_pass ? batch_pass : wgpuCommandEncoderBeginRenderPass(encoder, &pass_descriptor);
       if (batch_encoder) { batch_pass = pass; batch_color = resource; batch_depth = spec.depth_target; }
-      wgpuRenderPassEncoderSetPipeline(pass, found->second.handle); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr); wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertices, offsets[0], spec.vertex_bytes);
+      wgpuRenderPassEncoderSetPipeline(pass, found->second.handle); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr); if (resident) {
+        for (uint32_t n = 0; n < 16; ++n) {
+          if (!residentDraw.vertices[n]) { continue; }
+          wgpuRenderPassEncoderSetVertexBuffer(pass, n, residentVertices[n], residentDraw.offsets[n], residentDraw.sizes[n]);
+        }
+      } else { wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertices, offsets[0], spec.vertex_bytes); }
       wgpuRenderPassEncoderSetStencilReference(pass, spec.stencil_reference);
       const WGPUColor blendConstant{spec.blend_constant[0], spec.blend_constant[1], spec.blend_constant[2], spec.blend_constant[3]};
       wgpuRenderPassEncoderSetBlendConstant(pass, &blendConstant);
       wgpuRenderPassEncoderSetViewport(pass, spec.viewport[0], spec.viewport[1], spec.viewport[2], spec.viewport[3], spec.viewport[4], spec.viewport[5]); wgpuRenderPassEncoderSetScissorRect(pass, spec.scissor[0], spec.scissor[1], spec.scissor[2], spec.scissor[3]);
-      if (indices) { wgpuRenderPassEncoderSetIndexBuffer(pass, indices, spec.index32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16, offsets[1], spec.index_bytes); wgpuRenderPassEncoderDrawIndexed(pass, spec.index_count, 1, 0, 0, 0); }
+      if (indices) { wgpuRenderPassEncoderSetIndexBuffer(pass, indices, spec.index32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16, resident ? residentDraw.index_offset : offsets[1], resident ? residentDraw.index_bytes : spec.index_bytes); wgpuRenderPassEncoderDrawIndexed(pass, spec.index_count, 1, 0, 0, 0); }
       else { wgpuRenderPassEncoderDraw(pass, spec.vertex_count, 1, 0, 0); }
       if (!batch_encoder) { wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass); submit(encoder); }
       for (auto item : samplers) { wgpuSamplerRelease(item); }
       wgpuBindGroupRelease(group);
-      if (!uploads) { wgpuBufferRelease(vertices); wgpuBufferRelease(uniforms); if (indices) { wgpuBufferRelease(indices); } }
+      if (!uploads) { if (vertices) { wgpuBufferRelease(vertices); } wgpuBufferRelease(uniforms); if (indices && !resident) { wgpuBufferRelease(indices); } }
 }
 void clear(uint32_t resource, std::span<const uint8_t> bytes) {
       const auto spec = packet<ClearPacket>(bytes); exact(bytes, uint64_t(spec.rect_count) * 16);
@@ -607,6 +653,47 @@ void copy(uint32_t resource, std::span<const uint8_t> bytes) {
       if (copy.force_opaque) { force_opaque_alpha(encoder, target, copy); }
       if (!batch_encoder) { submit(encoder); }
 }
+void render_batch(uint32_t resource, std::span<const uint8_t> bytes, bool mixed, std::span<const uint8_t> pending = {}, uint32_t uploadCount = 0) {
+  if (resource) { throw std::runtime_error("draw batch cannot name a target"); }
+  const uint32_t count = packet<uint32_t>(bytes);
+  if ((!count && !uploadCount) || count > 256 || uploadCount > 256 || count + uploadCount > 256) { throw std::runtime_error("invalid draw batch count"); }
+  DrawUploads uploads;
+  uploads.prepare(bytes, count, mixed);
+  for (uint32_t n = 0; n < uploadCount; ++n) {
+    const uint32_t target = packet<uint32_t>(pending), length = packet<uint32_t>(pending);
+    if (length > pending.size()) { throw std::runtime_error("truncated batched buffer upload"); }
+    upload_buffer(target, pending.first(length)); pending = pending.subspan(length);
+  }
+  exact(pending, 0); created_resource = 0;
+  if (!count) { return; }
+  auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
+  batch_encoder = encoder;
+  try {
+    for (uint32_t n = 0; n < count; ++n) {
+      const auto opcode = mixed ? static_cast<Opcode>(packet<uint32_t>(bytes)) : Opcode::Draw;
+      const uint32_t target = packet<uint32_t>(bytes), size = packet<uint32_t>(bytes);
+      if (size > bytes.size()) { throw std::runtime_error("truncated batched draw"); }
+      try {
+        if (opcode == Opcode::Draw) { draw(target, bytes.first(size), &uploads, n); }
+        else if (opcode == Opcode::Clear) { clear(target, bytes.first(size)); }
+        else if (opcode == Opcode::Copy) { copy(target, bytes.first(size)); }
+        else { throw std::runtime_error("unsupported staged render command"); }
+      }
+      catch (const std::exception& error) { throw std::runtime_error("batched draw " + std::to_string(n) + " target=" + std::to_string(target) + ": " + error.what()); }
+      bytes = bytes.subspan(size);
+    }
+    exact(bytes, 0);
+  } catch (...) {
+    end_batch_pass();
+    batch_encoder = nullptr;
+    wgpuCommandEncoderRelease(encoder);
+    throw;
+  }
+  end_batch_pass();
+  batch_encoder = nullptr;
+  submit(encoder);
+
+}
 void release_resources() {
   for (const auto& [key, item] : sampler_cache) { wgpuSamplerRelease(item.handle); }
   sampler_cache.clear(); sampler_sequence = 0;
@@ -628,6 +715,8 @@ void release_resources() {
   textures.clear(); texture_bytes = 0;
   for (auto& entry : pipelines) { wgpuRenderPipelineRelease(entry.second.handle); }
   pipelines.clear();
+  for (const auto& entry : resident_buffers) { wgpuBufferDestroy(entry.second.handle); wgpuBufferRelease(entry.second.handle); }
+  resident_buffers.clear(); resident_buffer_bytes = 0;
 }
 std::pair<WGPUBindGroupLayout, WGPUPipelineLayout> create_bindings(uint32_t cubeMask, uint32_t shadowMask = 0, uint32_t volumeMask = 0) {
   std::array<WGPUBindGroupLayoutEntry, 9> entries{};
@@ -693,7 +782,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_start() {
 #ifdef WEBGPU_SERVICE_TESTING
 EMSCRIPTEN_KEEPALIVE void webgpu_test_loss() { wgpuDeviceDestroy(device); }
 #endif
-EMSCRIPTEN_KEEPALIVE uint32_t webgpu_resources() { return textures.size() + pipelines.size() + sampler_cache.size() + cached_views + (gamma_texture ? 1 : 0) + (presentation_pipeline ? 1 : 0) + (presentation_target.handle ? 1 : 0) + (depth_upload_pipeline ? 1 : 0) + (depth_readback_pipeline ? 1 : 0) + std::count_if(partial_clear_pipelines.begin(), partial_clear_pipelines.end(), [](auto pipeline) { return pipeline != nullptr; }); }
+EMSCRIPTEN_KEEPALIVE uint32_t webgpu_resources() { return textures.size() + pipelines.size() + resident_buffers.size() + sampler_cache.size() + cached_views + (gamma_texture ? 1 : 0) + (presentation_pipeline ? 1 : 0) + (presentation_target.handle ? 1 : 0) + (depth_upload_pipeline ? 1 : 0) + (depth_readback_pipeline ? 1 : 0) + std::count_if(partial_clear_pipelines.begin(), partial_clear_pipelines.end(), [](auto pipeline) { return pipeline != nullptr; }); }
 EMSCRIPTEN_KEEPALIVE void webgpu_shutdown() {
   closed = true;
   if (active) { active = false; completed(2, nullptr, 0, "GPU service shutdown"); }
@@ -730,7 +819,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       break;
     }
     case Opcode::CreateTexture: {
-      if (!resource || textures.contains(resource) || pipelines.contains(resource) || textures.size() + pipelines.size() >= 4096) { throw std::runtime_error("duplicate or exhausted GPU resource ID"); }
+      if (!resource || textures.contains(resource) || pipelines.contains(resource) || resident_buffers.contains(resource) || textures.size() + pipelines.size() + resident_buffers.size() >= 4096) { throw std::runtime_error("duplicate or exhausted GPU resource ID"); }
       auto spec = packet<TexturePacket>(bytes);
       const uint32_t volumeDepth = spec.depth == 3 ? packet<uint32_t>(bytes) : 1;
       const uint32_t maximum = std::max({spec.width, spec.height, volumeDepth});
@@ -770,9 +859,13 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       break;
     }
     case Opcode::CreatePipeline: {
-      if (!resource || textures.contains(resource) || pipelines.contains(resource) || textures.size() + pipelines.size() >= 4096) { throw std::runtime_error("duplicate or exhausted GPU resource ID"); }
+      if (!resource || textures.contains(resource) || pipelines.contains(resource) || resident_buffers.contains(resource) || textures.size() + pipelines.size() + resident_buffers.size() >= 4096) { throw std::runtime_error("duplicate or exhausted GPU resource ID"); }
       if (pipelines.size() >= 256) { throw std::runtime_error("GPU pipeline budget exhausted"); }
-      auto spec = packet<PipelinePacket>(bytes); exact(bytes, uint64_t(spec.vertex_bytes) + spec.fragment_bytes);
+      auto spec = packet<PipelinePacket>(bytes);
+      const bool resident = spec.vertex_mask & ResidentVertexMask;
+      const auto rawLayout = resident ? packet<RawLayout>(bytes) : RawLayout{};
+      spec.vertex_mask &= ~ResidentVertexMask;
+      exact(bytes, uint64_t(spec.vertex_bytes) + spec.fragment_bytes);
       if (spec.vertex_mask > 65535) { throw std::runtime_error("invalid vertex register mask"); }
       if (spec.cube_mask > 15 || spec.shadow_mask > 15 || spec.volume_mask > 15 ||
           (spec.cube_mask & spec.shadow_mask) || (spec.volume_mask & (spec.cube_mask | spec.shadow_mask)) || spec.color_target > 1 || (!spec.color_target && spec.write_mask)) { throw std::runtime_error("invalid cube binding mask"); }
@@ -783,7 +876,6 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
         auto descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT; descriptor.nextInChain = &source.chain;
         return wgpuDeviceCreateShaderModule(device, &descriptor);
       };
-      auto vertex = shader(bytes.first(spec.vertex_bytes)); auto fragment = shader(bytes.subspan(spec.vertex_bytes));
       std::array<WGPUVertexAttribute, 16> attributes{};
       uint32_t attributeCount = 0;
       for (uint32_t n = 0; n < attributes.size(); ++n) {
@@ -794,6 +886,27 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
         ++attributeCount;
       }
       auto vertex_layout = WGPU_VERTEX_BUFFER_LAYOUT_INIT; vertex_layout.arrayStride = attributeCount * 16; vertex_layout.attributeCount = attributeCount; vertex_layout.attributes = attributes.data();
+      std::array<WGPUVertexBufferLayout, 16> rawLayouts{};
+      std::array<WGPUVertexAttribute, 16> rawAttributes{};
+      uint32_t rawStreams = 0, rawAttributesUsed = 0;
+      if (resident) {
+        for (uint32_t n = 0; n < 16; ++n) {
+          auto& stream = rawLayouts[n]; stream = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+          stream.arrayStride = rawLayout.strides[n]; stream.attributes = rawAttributes.data() + rawAttributesUsed;
+          const uint32_t streamNumber = n;
+          for (uint32_t n = 0; n < 16; ++n) {
+            if (!(spec.vertex_mask & (1u << n)) || rawLayout.attributes[n].stream != streamNumber) { continue; }
+            const auto& source = rawLayout.attributes[n];
+            if (!stream.arrayStride || stream.arrayStride > 2048 || stream.arrayStride % 4 || source.offset >= stream.arrayStride || !source.format || source.format > 41) { throw std::runtime_error("invalid resident vertex layout"); }
+            auto& attribute = rawAttributes[rawAttributesUsed++]; attribute = WGPU_VERTEX_ATTRIBUTE_INIT;
+            attribute.offset = source.offset; attribute.format = static_cast<WGPUVertexFormat>(source.format); attribute.shaderLocation = n;
+            ++stream.attributeCount;
+          }
+          if (stream.attributeCount) { rawStreams = n + 1; }
+        }
+        if (!rawStreams || rawStreams > 8) { throw std::runtime_error("resident stream budget exceeded"); }
+      }
+      auto vertex = shader(bytes.first(spec.vertex_bytes)); auto fragment = shader(bytes.subspan(spec.vertex_bytes));
       auto target = WGPU_COLOR_TARGET_STATE_INIT; target.format = WGPUTextureFormat_RGBA8Unorm; target.writeMask = spec.write_mask;
       auto blend = WGPU_BLEND_STATE_INIT;
       blend.color.srcFactor = static_cast<WGPUBlendFactor>(spec.src_color); blend.color.dstFactor = static_cast<WGPUBlendFactor>(spec.dst_color); blend.color.operation = static_cast<WGPUBlendOperation>(spec.color_op);
@@ -811,7 +924,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       }
       auto descriptor = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
       const auto custom = (spec.cube_mask || spec.shadow_mask || spec.volume_mask) ? create_bindings(spec.cube_mask, spec.shadow_mask, spec.volume_mask) : std::pair<WGPUBindGroupLayout, WGPUPipelineLayout>{};
-      descriptor.layout = (spec.cube_mask || spec.shadow_mask || spec.volume_mask) ? custom.second : layout; descriptor.vertex.module = vertex; descriptor.vertex.entryPoint = text("vs_main"); descriptor.vertex.bufferCount = 1; descriptor.vertex.buffers = &vertex_layout;
+      descriptor.layout = (spec.cube_mask || spec.shadow_mask || spec.volume_mask) ? custom.second : layout; descriptor.vertex.module = vertex; descriptor.vertex.entryPoint = text("vs_main"); descriptor.vertex.bufferCount = resident ? rawStreams : 1; descriptor.vertex.buffers = resident ? rawLayouts.data() : &vertex_layout;
       descriptor.fragment = &pixel; descriptor.primitive.topology = static_cast<WGPUPrimitiveTopology>(spec.topology); descriptor.primitive.cullMode = static_cast<WGPUCullMode>(spec.cull); descriptor.primitive.frontFace = static_cast<WGPUFrontFace>(spec.front_face);
       if (spec.depth) { descriptor.depthStencil = &depth; }
       auto pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor); pipelines.emplace(resource, Pipeline{pipeline, attributeCount * 16}); created_resource = resource;
@@ -819,41 +932,15 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       wgpuShaderModuleRelease(vertex); wgpuShaderModuleRelease(fragment);
       break;
     }
+    case Opcode::UploadBuffer: { upload_buffer(resource, bytes); break; }
     case Opcode::Draw: { draw(resource, bytes); break; }
-    case Opcode::DrawBatch:
-    case Opcode::RenderBatch: {
-      const bool mixed = static_cast<Opcode>(operation) == Opcode::RenderBatch;
-      if (resource) { throw std::runtime_error("draw batch cannot name a target"); }
-      const uint32_t count = packet<uint32_t>(bytes);
-      if (!count || count > 256) { throw std::runtime_error("invalid draw batch count"); }
-      DrawUploads uploads;
-      uploads.prepare(bytes, count, mixed);
-      auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
-      batch_encoder = encoder;
-      try {
-        for (uint32_t n = 0; n < count; ++n) {
-          const auto opcode = mixed ? static_cast<Opcode>(packet<uint32_t>(bytes)) : Opcode::Draw;
-          const uint32_t target = packet<uint32_t>(bytes), size = packet<uint32_t>(bytes);
-          if (size > bytes.size()) { throw std::runtime_error("truncated batched draw"); }
-          try {
-            if (opcode == Opcode::Draw) { draw(target, bytes.first(size), &uploads, n); }
-            else if (opcode == Opcode::Clear) { clear(target, bytes.first(size)); }
-            else if (opcode == Opcode::Copy) { copy(target, bytes.first(size)); }
-            else { throw std::runtime_error("unsupported staged render command"); }
-          }
-          catch (const std::exception& error) { throw std::runtime_error("batched draw " + std::to_string(n) + " target=" + std::to_string(target) + ": " + error.what()); }
-          bytes = bytes.subspan(size);
-        }
-        exact(bytes, 0);
-      } catch (...) {
-        end_batch_pass();
-        batch_encoder = nullptr;
-        wgpuCommandEncoderRelease(encoder);
-        throw;
-      }
-      end_batch_pass();
-      batch_encoder = nullptr;
-      submit(encoder);
+    case Opcode::DrawBatch: { render_batch(resource, bytes, false); break; }
+    case Opcode::RenderBatch: { render_batch(resource, bytes, true); break; }
+    case Opcode::UploadDrawBatch: {
+      const auto batch = packet<UploadDrawPacket>(bytes);
+      exact(bytes, uint64_t(batch.upload_bytes) + batch.draw_bytes);
+      if (batch.mixed > 1) { throw std::runtime_error("invalid upload draw batch kind"); }
+      render_batch(resource, bytes.subspan(batch.upload_bytes), batch.mixed != 0, bytes.first(batch.upload_bytes), batch.upload_count);
       break;
     }
     case Opcode::Clear: { clear(resource, bytes); break; }
@@ -995,6 +1082,9 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
     }
     case Opcode::Destroy: {
       exact(bytes, 0);
+      if (const auto found = resident_buffers.find(resource); found != resident_buffers.end()) {
+        resident_buffer_bytes -= found->second.bytes; wgpuBufferDestroy(found->second.handle); wgpuBufferRelease(found->second.handle); resident_buffers.erase(found); break;
+      }
       if (!textures.contains(resource) && !pipelines.contains(resource)) { throw std::runtime_error("unknown GPU resource"); }
       discard(resource);
       break;
@@ -1010,7 +1100,8 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
   } catch (const std::exception& error) { failure = error.what(); }
   const auto opcode = static_cast<Opcode>(operation);
   if (failure.empty() && pending_validations < 64 && (opcode == Opcode::Draw || opcode == Opcode::DrawBatch || opcode == Opcode::RenderBatch ||
-      opcode == Opcode::Clear || opcode == Opcode::Copy || opcode == Opcode::Destroy)) {
+      opcode == Opcode::Clear || opcode == Opcode::Copy || opcode == Opcode::Destroy || opcode == Opcode::UploadBuffer || opcode == Opcode::UploadDrawBatch)) {
+    created_resource = 0;
     defer_validation(command, resource);
     return;
   }

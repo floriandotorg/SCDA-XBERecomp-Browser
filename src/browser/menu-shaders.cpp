@@ -1,3 +1,4 @@
+#include "browser/guest-vertex.h"
 #include "browser/menu-shaders.h"
 #include "browser/menu-pixel-shaders.h"
 
@@ -736,4 +737,58 @@ std::string DescribeShaderFailure(const ShaderResult& shader, std::string_view e
   return "menu shader compile failure: " + std::string(error) + "\nstate: " + shader.state + "\nvertex WGSL:\n" + shader.vertex + "\nfragment WGSL:\n" + shader.fragment;
 }
 
+std::string GuestVertexInputs(std::string vertex, const gpu::VertexShader& layout, uint16_t regs) {
+  std::string declaration = R"(
+fn guest_unorm(value: u32, bit_count: u32) -> f32 {
+  let divisor = (1u << bit_count) - 1u;
+  if (value == 0u) { return 0.0; }
+  if (value >= divisor) { return 1.0; }
+  let lead = firstLeadingBit(value);
+  let numerator = value << (31u - lead);
+  var quotient = numerator / divisor;
+  var remainder = numerator % divisor;
+  let extra = bit_count - 8u;
+  let tail = remainder << extra;
+  quotient = (quotient << extra) + tail / divisor;
+  remainder = tail % divisor;
+  if (remainder * 2u > divisor) { quotient += 1u; }
+  let exponent = u32(i32(lead) - i32(bit_count) + 127);
+  return bitcast<f32>((exponent << 23u) | (quotient & 0x7fffffu));
+}
+fn guest_snorm(value: i32, bit_count: u32) -> f32 {
+  let bits = bitcast<u32>(guest_unorm(u32(abs(value)), bit_count));
+  return bitcast<f32>(bits | select(0u, 0x80000000u, value < 0));
+}
+struct RawIn {
+)", values;
+  uint32_t locations = regs;
+  for (uint32_t n = 0; n < 16; ++n) {
+    if (!(regs & (1u << n))) { continue; }
+    const auto format = menu::GuestVertex(layout.inputs[n].type);
+    if (!format.format) { throw std::runtime_error("unsupported guest vertex input"); }
+    const auto name = "r" + std::to_string(n);
+    declaration += "@location(" + std::to_string(n) + ") " + name + ": " + format.input + ",\n";
+    auto decode = format.decode;
+    if (format.extraFormat) {
+      uint32_t location = 0;
+      while (location < 16 && (locations & (1u << location))) { ++location; }
+      if (location == 16) { throw std::runtime_error("guest vertex input location budget exceeded"); }
+      locations |= 1u << location;
+      declaration += "@location(" + std::to_string(location) + ") e" + name + ": " + format.extraInput + ",\n";
+      decode.replace(decode.find('$'), 1, "raw.e" + name);
+    }
+    for (size_t at = 0; (at = decode.find('v', at)) != std::string::npos;) {
+      if (at + 1 < decode.size() && decode[at + 1] == 'e') { ++at; continue; }
+      decode.replace(at, 1, "raw." + name); at += name.size() + 4;
+    }
+    if (!values.empty()) { values += ", "; }
+    values += decode;
+  }
+  declaration += "}\n@vertex fn vs_main(raw: RawIn) -> VOut {\n  let i = VIn(" + values + ");";
+  const std::string original = "@vertex fn vs_main(i: VIn) -> VOut {";
+  const auto at = vertex.find(original);
+  if (at == std::string::npos) { throw std::runtime_error("missing raw vertex entry point"); }
+  vertex.replace(at, original.size(), declaration);
+  return vertex;
+}
 }

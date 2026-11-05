@@ -130,6 +130,7 @@ void Memory::EndBlock() noexcept {
   borrowedMemory_ = nullptr;
   --threadBorrows_;
   --leases_;
+  if (!leases_) { physicalSpan_ = false; }
   memoryLock_.unlock();
 }
 
@@ -338,7 +339,7 @@ std::optional<uint64_t> Memory::PhysicalWriteVersion(const X86Context& ctx, uint
   std::unique_lock lock(memoryLock_, std::defer_lock);
   if (!HasAccess()) { lock.lock(); }
   Validate(ctx, address, size);
-  if (!size) { return std::nullopt; }
+  if (!size || physicalSpan_) { return std::nullopt; }
   const auto& region = RegionAt(ctx, address, size);
   const size_t offset = address - region.address;
   if (region.storage != physicalStorage_ || size > region.storage->bytes.size() - offset) { return std::nullopt; }
@@ -356,6 +357,7 @@ uint8_t* Memory::Span(const X86Context& ctx, uint32_t address, size_t size) {
   const size_t offset = address - region.address;
   if (size > region.storage->bytes.size() - offset) { throw Fault(ctx, address, size, "noncontiguous host span"); }
   MarkPhysicalWrite(ctx, region, offset, size);
+  if (region.storage == physicalStorage_) { physicalSpan_ = true; }
   return region.storage->bytes.data() + offset;
 }
 

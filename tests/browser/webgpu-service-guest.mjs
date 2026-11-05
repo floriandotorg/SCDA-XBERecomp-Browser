@@ -30,6 +30,7 @@ globalThis.onmessage = async event => {
       if (status !== expected) { throw new Error(`command ${module._gpu_command()} resource ${resource}: status ${status} ${new TextDecoder().decode(reply)}`); }
       return reply;
     };
+    const uploadBuffer = (id, bytes, offset, capacity) => execute(Opcode.UploadBuffer, id, join(words(offset, capacity), bytes));
     if (event.data.blockOnly) {
       execute(Opcode.Flush, 0, undefined, Status.Closed);
       globalThis.postMessage({ ok: true, shutdownResolvedBlockedGuest: true, evidence });
@@ -60,10 +61,12 @@ globalThis.onmessage = async event => {
       vertices.set([-1, -1, 0, 1, 0, 1, 0, 0], 0); vertices.set([3, -1, 0, 1, 2, 1, 0, 0], 64); vertices.set([-1, 3, 0, 1, 0, -1, 0, 0], 128);
       const sampling = words(...Array(4).fill([1, 1, 1, 1, 1, 0, 32]).flat());
       const draw = (indices, pipeline = 3, reference = 0, image = 1, blend = [0, 0, 0, 0], addressW = [1, 1, 1, 1]) => join(words(pipeline, image, image, image, image, 4, 3, indices.length, indices.BYTES_PER_ELEMENT === 4 ? 1 : 0, vertices.byteLength, indices.byteLength, 16), floats(0, 0, width, 4, 0, 1), words(0, 0, width, 4), sampling, words(reference), floats(...blend), words(...addressW), vertices, indices, floats(1, 1, 1, 1));
-      if (event.data.invalidBatch) {
+      if (event.data.invalidBatch || event.data.invalidUploadBatch) {
         const invalid = draw(new Uint8Array());
         new Uint32Array(invalid.buffer, 0, 51)[20] = width + 1;
-        execute(Opcode.DrawBatch, 0, join(words(1, 2, invalid.byteLength), invalid));
+        const invalidDraws = join(words(1, 2, invalid.byteLength), invalid);
+        if (event.data.invalidUploadBatch) { execute(Opcode.UploadDrawBatch, 0, join(words(0, 0, invalidDraws.byteLength, 0), invalidDraws)); }
+        else { execute(Opcode.DrawBatch, 0, invalidDraws); }
         execute(Opcode.Flush, 0, undefined, Status.Error);
         globalThis.postMessage({ ok: true, deferredValidation: true, evidence });
         return;
@@ -135,6 +138,51 @@ globalThis.onmessage = async event => {
       new Uint32Array(compactRight.buffer, 0, 51)[20] = width / 2;
       execute(Opcode.DrawBatch, 0, join(words(2, 2, compactLeft.byteLength), compactLeft, words(2, compactRight.byteLength), compactRight));
       if (execute(Opcode.Readback, 2).some((value, n) => value !== pixels[n])) { throw new Error('compact indexed vertices changed shader locations, UVs or pixels'); }
+      const rawPipeline = pipeline(); rawPipeline[26] = 0x10003;
+      const rawLayout = new Uint32Array(64); rawLayout[0] = 32;
+      rawLayout.set([0, 0, 31, 0, 16, 31], 16);
+      const invalidRawLayout = rawLayout.slice(); invalidRawLayout[0] = 31;
+      execute(Opcode.CreatePipeline, 19, join(rawPipeline, invalidRawLayout, vertex, fragment), Status.Error);
+      execute(Opcode.CreatePipeline, 19, join(rawPipeline, rawLayout, vertex, fragment));
+      uploadBuffer(20, compactVertices, 16, 140);
+      uploadBuffer(20, words(0, 1, 2), 128, 140);
+      const resident = compactDraw.slice(0, 236);
+      const residentWords = new Uint32Array(resident.buffer);
+      residentWords[0] = 19; residentWords[8] = 2; residentWords[9] = 0; residentWords[10] = 0;
+      const residentBuffers = new Uint32Array(51);
+      residentBuffers[0] = 20; residentBuffers[16] = compactVertices.byteLength; residentBuffers[32] = 16; residentBuffers[48] = 20; residentBuffers[49] = 12; residentBuffers[50] = 128;
+      const residentDraw = join(resident, residentBuffers, floats(1, 1, 1, 1));
+      execute(Opcode.Clear, 2, join(floats(0, 0, 0, 0, 1), words(0, 7, 4, 0)));
+      execute(Opcode.Draw, 2, residentDraw);
+      if (execute(Opcode.Readback, 2).some((value, n) => value !== pixels[n])) { throw new Error('resident raw vertex draw changed pixels'); }
+      const updatedVertices = compactVertices.slice();
+      for (let n = 0; n < 3; ++n) { updatedVertices.set([0.25, 0.25], n * 8 + 4); }
+      execute(Opcode.DrawBatch, 0, join(words(1, 2, residentDraw.byteLength), residentDraw));
+      execute(Opcode.Copy, 5, words(2, width, 4, 0, 0, 0, 0, 0));
+      uploadBuffer(20, updatedVertices, 16, 140);
+      execute(Opcode.Draw, 2, residentDraw);
+      if (execute(Opcode.Readback, 5).some((value, n) => value !== pixels[n])) { throw new Error("buffer update changed previously submitted geometry"); }
+      if (execute(Opcode.Readback, 2).some((value, n) => value !== texels[0][n % 4])) { throw new Error('resident buffer update reused stale geometry'); }
+      uploadBuffer(20, compactVertices, 16, 140);
+      execute(Opcode.UploadBuffer, 20, words(1), Status.Error);
+      execute(Opcode.DrawBatch, 0, join(words(2, 2, residentDraw.byteLength), residentDraw, words(2, residentDraw.byteLength), residentDraw));
+      if (execute(Opcode.Readback, 2).some((value, n) => value !== pixels[n])) { throw new Error('resident batch upload offsets changed pixels'); }
+      const residentCopy = words(2, width, 4, 0, 0, 0, 0, 0);
+      execute(Opcode.RenderBatch, 0, join(words(3, Opcode.Draw, 2, residentDraw.byteLength), residentDraw, words(Opcode.Copy, 5, residentCopy.byteLength), residentCopy, words(Opcode.Draw, 2, residentDraw.byteLength), residentDraw));
+      if (execute(Opcode.Readback, 5).some((value, n) => value !== pixels[n]) || execute(Opcode.Readback, 2).some((value, n) => value !== pixels[n])) { throw new Error('resident mixed batch changed upload offsets or copy order'); }
+
+      const vertexUpload = join(words(16, 140), compactVertices);
+      const indexUpload = join(words(128, 140), words(0, 1, 2));
+      const queuedUploads = join(words(20, vertexUpload.byteLength), vertexUpload, words(20, indexUpload.byteLength), indexUpload);
+      const queuedDraws = join(words(2, 2, residentDraw.byteLength), residentDraw, words(2, residentDraw.byteLength), residentDraw);
+      execute(Opcode.UploadDrawBatch, 0, join(words(2, queuedUploads.byteLength, 4, 0), queuedUploads, words(0)));
+
+      execute(Opcode.UploadDrawBatch, 0, join(words(2, queuedUploads.byteLength, queuedDraws.byteLength, 0), queuedUploads, queuedDraws));
+      if (execute(Opcode.Readback, 2).some((value, n) => value !== pixels[n])) { throw new Error('upload draw batch changed resident pixels'); }
+      const queuedMixed = join(words(3, Opcode.Draw, 2, residentDraw.byteLength), residentDraw, words(Opcode.Copy, 5, residentCopy.byteLength), residentCopy, words(Opcode.Draw, 2, residentDraw.byteLength), residentDraw);
+      execute(Opcode.UploadDrawBatch, 0, join(words(2, queuedUploads.byteLength, queuedMixed.byteLength, 1), queuedUploads, queuedMixed));
+      if (execute(Opcode.Readback, 5).some((value, n) => value !== pixels[n])) { throw new Error('upload mixed batch changed copy order'); }
+      execute(Opcode.Destroy, 19); execute(Opcode.Destroy, 20);
       const samplerDraws = [];
       for (let n = 0; n < 140; ++n) {
         const owned = compactDraw.slice();

@@ -50,6 +50,7 @@ class Memory {
   };
   mutable std::recursive_mutex memoryLock_;
   size_t leases_ = 0;
+  bool physicalSpan_ = false;
   static constinit thread_local size_t threadBorrows_;
   static constinit thread_local Memory* borrowedMemory_;
   static constinit thread_local Memory* mutatedMemory_;
@@ -89,7 +90,7 @@ public:
     Memory* previous_;
   public:
     explicit Lease(Memory& memory) : memory_(memory), lock_(memory.memoryLock_), previous_(borrowedMemory_) { ++memory_.leases_; ++threadBorrows_; borrowedMemory_ = &memory_; }
-    ~Lease() { borrowedMemory_ = previous_; --threadBorrows_; --memory_.leases_; }
+    ~Lease() { borrowedMemory_ = previous_; --threadBorrows_; --memory_.leases_; if (!memory_.leases_) { memory_.physicalSpan_ = false; } }
     Lease(const Lease&) = delete;
     Lease& operator=(const Lease&) = delete;
   };

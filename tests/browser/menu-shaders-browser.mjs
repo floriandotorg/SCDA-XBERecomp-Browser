@@ -16,6 +16,16 @@ const run = async () => {
   const errors = [];
   device.addEventListener('uncapturederror', event => errors.push(event.error.message));
   const names = [...Array.from({ length: 16 }, (_, n) => `shadow${n}`), ...Array.from({ length: 16 }, (_, n) => `psshadow${n}`), 'depth-bias', 'depth-bias-color', 'depth-only', 'border', 'border-mip', 'cube', 'pscube', 'volume', 'psvolume1', 'psvolume2', 'psvolume3', 'psreflect', 'psdotst', 'psdep15', 'psdep16', 'plain', 'textured', 'flat', 'stages', 'program', 'paired', 'relative', 'rcc', 'rcp', 'rsq', 'pixel', 'psef', ...Array.from({ length: 8 }, (_, n) => `pssum${n}`), 'psdot1', 'psdot2', 'psdot3', 'pskill', 'pixel-program', 'psconstants', 'psmux', 'pssimultaneous', ...Array.from({ length: 8 }, (_, n) => `psinput${n}`), ...[0, 8, 16, 24, 32, 48].map(n => `psoutput${n}`), ...Array.from({ length: 13 }, (_, n) => `mac${n + 1}`), ...Array.from({ length: 23 }, (_, n) => n + 2).filter(n => n !== 17).map(n => `op${n}`), ...Array.from({ length: 5 }, (_, n) => `combine${n + 18}`)];
+  names.push(...[0x16, 0x40, 0x72, 0x11, 0x21, 0x31, 0x41, 0x15, 0x25, 0x35, 0x45, 0x12, 0x22, 0x32, 0x42, 0x14, 0x24, 0x34, 0x44].map(type => `guest-${type}`));
+  const guestAttributes = type => {
+    const count = type >> 4, kind = type & 15;
+    const integer = kind === 1 || kind === 5;
+    const scalar = integer ? 'sint16' : 'uint8';
+    const format = type === 0x16 ? 'uint32' : type === 0x40 ? 'uint8x4' : type === 0x72 ? 'float32x3' : kind === 2 ? `float32${count === 1 ? '' : `x${count}`}` : `${scalar}${count === 1 ? '' : `x${count === 3 ? 2 : count}`}`;
+    const attributes = [{ shaderLocation: 0, offset: 0, format }, { shaderLocation: 3, offset: 48, format: 'uint8x4' }, { shaderLocation: 9, offset: 144, format: 'float32x2' }];
+    if (count === 3 && (integer || kind === 4)) { attributes.push({ shaderLocation: 1, offset: integer ? 4 : 2, format: scalar }); }
+    return attributes;
+  };
   const pipelines = new Map();
   let textured;
   for (const name of names) {
@@ -32,7 +42,7 @@ const run = async () => {
     device.pushErrorScope('validation');
     const pipeline = await device.createRenderPipelineAsync({
       layout: 'auto',
-      vertex: { module: vertex, entryPoint: 'vs_main', buffers: [{ arrayStride: 256, attributes: regs.map(n => ({ shaderLocation: n, offset: n * 16, format: 'float32x4' })) }] },
+      vertex: { module: vertex, entryPoint: 'vs_main', buffers: [{ arrayStride: 256, attributes: name.startsWith('guest-') ? guestAttributes(Number(name.slice(6))) : regs.map(n => ({ shaderLocation: n, offset: n * 16, format: 'float32x4' })) }] },
       fragment: { module: fragment, entryPoint: 'fs_main', targets: name === 'depth-only' || name === 'depth-bias' ? [] : [{ format: 'rgba8unorm' }] },
       ...(name.startsWith('depth-') ? { depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: true, depthCompare: 'less-equal' } } : {}),
       primitive: { topology: 'triangle-list' }
@@ -45,6 +55,91 @@ const run = async () => {
     if (name === 'textured') {
       textured = pipeline;
     }
+  }
+  const decodedFormats = [];
+  for (const type of [0x16, 0x40, 0x72, 0x11, 0x21, 0x31, 0x41, 0x15, 0x25, 0x35, 0x45, 0x12, 0x22, 0x32, 0x42, 0x14, 0x24, 0x34, 0x44]) {
+    const vertex = device.createShaderModule({ code: await text(`decode-${type}.vs.wgsl`) });
+    const fragment = device.createShaderModule({ code: '@fragment fn fs_main(@location(0) @interpolate(flat) value: vec4<f32>) -> @location(0) vec4<f32> { return value; }' });
+    const formats = guestAttributes(type);
+    const attributes = [formats[0], { shaderLocation: 1, offset: 16, format: 'float32x4' }];
+    if (formats[3]) { attributes.push({ ...formats[3], shaderLocation: 2 }); }
+    const pipeline = await device.createRenderPipelineAsync({ layout: 'auto', vertex: { module: vertex, entryPoint: 'vs_main', buffers: [{ arrayStride: 32, attributes }] }, fragment: { module: fragment, entryPoint: 'fs_main', targets: [{ format: 'rgba32float' }] }, primitive: { topology: 'triangle-list' } });
+    const bytes = new ArrayBuffer(96), view = new DataView(bytes), expected = [0, 0, 0, 1];
+    for (let n = 0; n < 3; ++n) {
+      const at = n * 32, count = type >> 4, kind = type & 15;
+      if (type === 0x16) {
+        view.setUint32(at, 0x400 | (0x7ff << 11) | (0x1ff << 22), true);
+        expected.splice(0, 3, -1, Math.fround(-1 / 1023), 1);
+      } else if (type === 0x40) {
+        [17, 83, 149, 255].forEach((value, index) => view.setUint8(at + index, value));
+        expected.splice(0, 4, ...[149, 83, 17, 255].map(value => Math.fround(value / 255)));
+      } else if (type === 0x72) {
+        [1.25, -2.5, 0.75].forEach((value, index) => view.setFloat32(at + index * 4, value, true));
+        expected.splice(0, 4, 1.25, -2.5, 0, 0.75);
+      } else {
+        for (let n = 0; n < count; ++n) {
+          const value = kind === 1 || kind === 5 ? [-32768, -123, 73, 32767][n] : kind === 4 ? [1, 17, 128, 255][n] : [1.25, -2.5, 0.75, 3][n];
+          if (kind === 1 || kind === 5) { view.setInt16(at + n * 2, value, true); }
+          else if (kind === 4) { view.setUint8(at + n, value); }
+          else { view.setFloat32(at + n * 4, value, true); }
+          expected[n] = Math.fround(kind === 1 ? Math.max(value / 32767, -1) : kind === 4 ? value / 255 : value);
+        }
+      }
+      [-1, -1, 3, -1, -1, 3].slice(n * 2, n * 2 + 2).forEach((value, index) => view.setFloat32(at + 16 + index * 4, value, true));
+      view.setFloat32(at + 28, 1, true);
+    }
+    const buffer = device.createBuffer({ size: 96, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(buffer, 0, bytes);
+    const target = device.createTexture({ size: [1, 1], format: 'rgba32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const readback = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }] });
+    pass.setPipeline(pipeline); pass.setVertexBuffer(0, buffer); pass.draw(3); pass.end();
+    encoder.copyTextureToBuffer({ texture: target }, { buffer: readback, bytesPerRow: 256 }, [1, 1]);
+    device.queue.submit([encoder.finish()]); await readback.mapAsync(GPUMapMode.READ);
+    const actual = [...new Float32Array(readback.getMappedRange(), 0, 4)];
+    if (actual.some((value, n) => value !== expected[n])) { throw new Error(`guest format ${type}: ${actual} != ${expected}`); }
+    decodedFormats.push(type); readback.unmap(); readback.destroy(); buffer.destroy(); target.destroy();
+  }
+  const exhaustiveFormats = [];
+  for (const type of [0x11, 0x14, 0x16]) {
+    const vertex = device.createShaderModule({ code: await text(`decode-${type}.vs.wgsl`) });
+    const fragment = device.createShaderModule({ code: '@fragment fn fs_main(@location(0) @interpolate(flat) value: vec4<f32>) -> @location(0) vec4<f32> { return value; }' });
+    const pipeline = await device.createRenderPipelineAsync({ layout: 'auto', vertex: { module: vertex, entryPoint: 'vs_main', buffers: [{ arrayStride: 32, attributes: [guestAttributes(type)[0], { shaderLocation: 1, offset: 16, format: 'float32x4' }] }] }, fragment: { module: fragment, entryPoint: 'fs_main', targets: [{ format: 'rgba32float' }] }, primitive: { topology: 'triangle-list' } });
+    const samples = 65536, width = 256;
+    const data = new ArrayBuffer(samples * 6 * 32), view = new DataView(data);
+    const corners = [[0, 1], [1, 1], [0, 0], [1, 1], [1, 0], [0, 0]];
+    for (let n = 0; n < samples; ++n) {
+      for (const [corner, [dx, dy]] of corners.entries()) {
+        const at = (n * 6 + corner) * 32;
+        if (type === 0x11) { view.setInt16(at, n - 32768, true); }
+        else if (type === 0x14) { view.setUint8(at, n & 255); }
+        else { view.setUint32(at, (n & 2047) | (((n * 17) & 2047) << 11) | (((n * 13) & 1023) << 22), true); }
+        view.setFloat32(at + 16, ((n % width + dx) / width) * 2 - 1, true);
+        view.setFloat32(at + 20, 1 - ((Math.floor(n / width) + dy) / width) * 2, true);
+        view.setFloat32(at + 28, 1, true);
+      }
+    }
+    const buffer = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(buffer, 0, data);
+    const target = device.createTexture({ size: [width, width], format: 'rgba32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const readback = device.createBuffer({ size: samples * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }] });
+    pass.setPipeline(pipeline); pass.setVertexBuffer(0, buffer); pass.draw(samples * 6); pass.end();
+    encoder.copyTextureToBuffer({ texture: target }, { buffer: readback, bytesPerRow: width * 16 }, [width, width]);
+    device.queue.submit([encoder.finish()]); await readback.mapAsync(GPUMapMode.READ);
+    const actual = new Float32Array(readback.getMappedRange());
+    for (let n = 0; n < samples; ++n) {
+      let expected;
+      if (type === 0x11) { expected = [Math.fround(Math.max((n - 32768) / 32767, -1)), 0, 0, 1]; }
+      else if (type === 0x14) { expected = [Math.fround((n & 255) / 255), 0, 0, 1]; }
+      else {
+        const value = (n & 2047) | (((n * 17) & 2047) << 11) | (((n * 13) & 1023) << 22);
+        expected = [Math.fround(Math.max(((value << 21) >> 21) / 1023, -1)), Math.fround(Math.max(((value << 10) >> 21) / 1023, -1)), Math.fround(Math.max((value >> 22) / 511, -1)), 1];
+      }
+      if (expected.some((value, component) => actual[n * 4 + component] !== value)) { throw new Error(`exhaustive guest format ${type} sample ${n}: ${[...actual.slice(n * 4, n * 4 + 4)]} != ${expected}`); }
+    }
+    exhaustiveFormats.push(type); readback.unmap(); readback.destroy(); buffer.destroy(); target.destroy();
   }
   const uniform = device.createBuffer({ size: 3824, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const constants = new Float32Array(await (await fetch(root + 'constants.bin')).arrayBuffer());
@@ -412,7 +507,7 @@ const run = async () => {
     throw new Error(errors.join('\n'));
   }
   device.destroy();
-  return { compiled: names.length, dotLookupPixels, shadowPixels, reflectionPixel, normalizationPixels, plainReciprocalPixels, depthOnlyPixels, depthBiasPixels, borderPixels, borderMipPixels, pixel, flatPixel, programPixel, registerPixels, macPixels, reciprocalPixels, psPixels, muxLowPixel, psAlphaDiscard, psAlphaKill, alphaDiscard, depthClip, combinePixels, result: 'menu-shaders-browser-ok' };
+  return { compiled: names.length, decodedFormats, exhaustiveFormats, dotLookupPixels, shadowPixels, reflectionPixel, normalizationPixels, plainReciprocalPixels, depthOnlyPixels, depthBiasPixels, borderPixels, borderMipPixels, pixel, flatPixel, programPixel, registerPixels, macPixels, reciprocalPixels, psPixels, muxLowPixel, psAlphaDiscard, psAlphaKill, alphaDiscard, depthClip, combinePixels, result: 'menu-shaders-browser-ok' };
 };
 
 window.menuShaderResult = run().then(result => {

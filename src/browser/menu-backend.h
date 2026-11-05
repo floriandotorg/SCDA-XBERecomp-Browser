@@ -19,6 +19,7 @@ struct MenuBackendLimits {
   bool compactVertices = false;
   bool indexedVertices = false;
   bool postCommands = false;
+  bool residentVertices = false;
 };
 
 class MenuBackend final : public gpu::Backend {

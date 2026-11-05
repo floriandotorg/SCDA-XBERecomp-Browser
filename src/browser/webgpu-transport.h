@@ -5,7 +5,7 @@
 
 namespace browser::webgpu {
 constexpr uint32_t MaxBytes = 4 * 1024 * 1024;
-enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15 };
+enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17 };
 enum class Status : uint32_t { Ok, Error, Closed, Lost };
 struct Dimensions { uint32_t width, height; };
 struct TexturePacket { uint32_t width, height, depth; uint32_t levels = 1; };
@@ -25,6 +25,14 @@ struct DrawPacket {
   float blend_constant[4];
   uint32_t address_w[4] = {1, 1, 1, 1};
 };
+constexpr uint32_t ResidentVertexMask = 0x10000;
+struct RawAttribute { uint32_t stream, offset, format; };
+struct RawLayout { uint32_t strides[16]{}; RawAttribute attributes[16]{}; };
+struct UploadDrawPacket { uint32_t upload_count, upload_bytes, draw_bytes, mixed; };
+struct BufferUpload { uint32_t offset, capacity; };
+struct ResidentDraw { uint32_t vertices[16]{}, sizes[16]{}, offsets[16]{}, indices = 0, index_bytes = 0, index_offset = 0; };
+static_assert(sizeof(UploadDrawPacket) == 16);
+static_assert(sizeof(BufferUpload) == 8 && sizeof(ResidentDraw) == 204 && sizeof(RawLayout) == 256);
 struct DepthUploadPacket { uint32_t width, height, depth_bits, stencil_mask[8]; };
 static_assert(sizeof(DepthUploadPacket) == 44);
 struct ClearPacket { float color[4], depth; uint32_t stencil, flags, depth_target; uint32_t rect_count = 0; };

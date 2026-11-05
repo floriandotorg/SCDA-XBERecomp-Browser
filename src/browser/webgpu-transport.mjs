@@ -1,6 +1,6 @@
 export const MAX_BYTES = 4 * 1024 * 1024;
 export const HEADER_BYTES = 64;
-export const Opcode = Object.freeze({ Configure: 1, CreateTexture: 2, CreatePipeline: 3, Draw: 4, Readback: 5, Destroy: 6, Flush: 7, Shutdown: 8, Present: 9, Clear: 10, Copy: 11, SetGamma: 12, UploadDepth: 13, DrawBatch: 14, RenderBatch: 15 });
+export const Opcode = Object.freeze({ Configure: 1, CreateTexture: 2, CreatePipeline: 3, Draw: 4, Readback: 5, Destroy: 6, Flush: 7, Shutdown: 8, Present: 9, Clear: 10, Copy: 11, SetGamma: 12, UploadDepth: 13, DrawBatch: 14, RenderBatch: 15, UploadBuffer: 16, UploadDrawBatch: 17 });
 export const Status = Object.freeze({ Ok: 0, Error: 1, Closed: 2, Lost: 3 });
 export const createMailbox = () => new SharedArrayBuffer(HEADER_BYTES + MAX_BYTES);
 const views = mailbox => {

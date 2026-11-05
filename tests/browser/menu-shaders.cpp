@@ -264,6 +264,20 @@ int main(int argc, char** argv) {
       std::ofstream(std::string(argv[1]) + "/" + name + ".vs.wgsl") << fixture.vertex;
       std::ofstream(std::string(argv[1]) + "/" + name + ".fs.wgsl") << fixture.fragment;
     };
+    for (const uint32_t type : {0x16u, 0x40u, 0x72u, 0x11u, 0x21u, 0x31u, 0x41u, 0x15u, 0x25u, 0x35u, 0x45u, 0x12u, 0x22u, 0x32u, 0x42u, 0x14u, 0x24u, 0x34u, 0x44u}) {
+      gpu::VertexShader layout;
+      layout.inputs[0].type = type;
+      layout.inputs[3].type = 0x40;
+      layout.inputs[9].type = 0x22;
+      auto raw = shader;
+      raw.vertex = browser::menu::GuestVertexInputs(raw.vertex, layout, 1 | 8 | 512);
+      assert(raw.vertex.find("RawIn") != std::string::npos && raw.vertex.find('$') == std::string::npos);
+      save("guest-" + std::to_string(type), raw);
+      layout.inputs[1].type = 0x42;
+      const std::string decoding = "struct VIn { @location(0) v0: vec4<f32>, @location(1) v1: vec4<f32> }\nstruct VOut { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(flat) value: vec4<f32> }\n@vertex fn vs_main(i: VIn) -> VOut { return VOut(i.v1, i.v0); }";
+      std::ofstream(std::string(argv[1]) + "/decode-" + std::to_string(type) + ".vs.wgsl") << browser::menu::GuestVertexInputs(decoding, layout, 3);
+
+    }
     save("plain", shader);
     save("textured", textured);
     const auto depthOnly = browser::menu::GenerateShaders(s, 1 | 8 | 512, true, tex, 0, false);

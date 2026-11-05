@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createGPUService } from '../../src/browser/webgpu-service.mjs';
 import { Opcode, Status } from '../../src/browser/webgpu-transport.mjs';
 
-for (const opcode of [Opcode.DrawBatch, Opcode.RenderBatch]) {
+for (const opcode of [Opcode.DrawBatch, Opcode.RenderBatch, Opcode.UploadBuffer, Opcode.UploadDrawBatch]) {
   test(`deferred validation for opcode ${opcode} retains identity, fails barriers and ignores retirement`, async () => {
     const moduleURL = `data:text/javascript,${encodeURIComponent(`export default async options => {
       globalThis.deferredGPUFixture = { options, calls: [] };
