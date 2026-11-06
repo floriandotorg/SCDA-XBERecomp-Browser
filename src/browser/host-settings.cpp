@@ -20,6 +20,9 @@ constexpr BoolField kBools[] = {
   {kPauseOnFocusLossBit, &app::Settings::pause_on_focus_loss},
   {kInvertMouseBit, &app::Settings::invert_mouse},
   {kSmaaBit, &app::Settings::smaa},
+  {kHdrRenderingBit, &app::Settings::hdr_rendering},
+  {kToneMappingBit, &app::Settings::tone_mapping},
+  {kHdrOutputBit, &app::Settings::hdr_output},
 };
 struct FloatField {
   uint32_t word;
@@ -61,6 +64,7 @@ app::Settings Decode(const Snapshot& snapshot) {
   settings.fps_cap = snapshot.words[kFpsCapWord];
   settings.audio_output = snapshot.words[kAudioOutputWord];
   settings.msaa = snapshot.words[kMsaaWord] == 4 ? 4 : 0;
+  settings.shader_model = snapshot.words[kShaderModelWord] ? 3 : 1;
   if (snapshot.words[kShadowResolutionWord]) { settings.shadow_resolution = std::clamp<uint32_t>(snapshot.words[kShadowResolutionWord], 512, 4096); }
   if (snapshot.words[kShadowFilterWord]) { settings.shadow_filter = snapshot.words[kShadowFilterWord] >= 3 ? 3 : 1; }
   if (snapshot.words[kShadowDistanceWord]) { settings.shadow_distance = std::clamp<uint32_t>(snapshot.words[kShadowDistanceWord], 1, 8); }

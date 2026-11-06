@@ -1,4 +1,5 @@
 #include "browser/menu-pixel-shaders.h"
+#include "browser/menu-shaders.h"
 
 #include <algorithm>
 #include <array>
@@ -157,7 +158,7 @@ std::string Textures(const gpu::PixelKey& key) {
     if (texture.shadow > 2 || (texture.shadow && (texture.kind != gpu::kTex2D || (mode != 1 && mode != 2)))) {
       throw std::invalid_argument(prefix + "shadow compare");
     }
-    if (texture.flags) {
+    if (!SupportedFlags(texture)) {
       throw std::invalid_argument(prefix + "texture flags " + Number(texture.flags));
     }
     if (texture.kind != gpu::kTexNone && texture.kind != gpu::kTex2D && texture.kind != gpu::kTexCube && texture.kind != gpu::kTex3D) {
@@ -311,7 +312,7 @@ PixelTranslation TranslatePixel(const gpu::PixelKey& key) {
     } else {
       body += "  var outc = r0;\n";
     }
-    body += "  outc = vec4<f32>(clamp(outc.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), outc.a);\n";
+    body += "  outc = vec4<f32>(clamp(outc.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * u.hdr.x, outc.a);\n";
     result.body = std::move(body);
     result.supported = true;
   } catch (const std::invalid_argument& error) {

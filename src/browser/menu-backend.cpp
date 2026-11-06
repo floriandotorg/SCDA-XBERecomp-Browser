@@ -280,6 +280,11 @@ struct MenuBackend::Impl {
     uint32_t hostWidth = 0, hostHeight = 0;
     uint32_t lateSource = 0;  // the texture a late readback reads: the resource, or its console sized copy
     bool multisampled = false;  // its GPU texture has a 4x companion the draws render into
+    // HDR rendering (native's d3d12.cpp): hdrTarget, its texture is an HDR scene target; inHdr, it holds colour over
+    // the headroom since the frame's first 3D draw, until a read resolves it; hdrFrame, the frame it entered in
+    bool hdrTarget = false, inHdr = false;
+    uint64_t hdrFrame = UINT64_MAX;
+    bool normCube = false;  // a normalization cube by its face centres (native's UpdateNormCube)
     bool scaled() const { return hostWidth != desc.width || hostHeight != desc.height; }
   };
   Runtime& runtime;
@@ -325,6 +330,62 @@ struct MenuBackend::Impl {
   uint32_t anisotropy = 0, brightness = 50, contrast = 50, msaa = 0;
   uint32_t softScene = 0;  // the scene a soft shadow waits to be applied to
   bool smaa = false;
+  bool hdr = false, tone = false;
+  uint64_t hdrResolves = 0;
+  bool exposureFresh = true;
+  std::chrono::steady_clock::time_point exposureTime = std::chrono::steady_clock::now();
+  static constexpr float kHeadroom = 8;
+  // native's HDR targets: colour targets of the back buffer's size
+  bool hdrEligible(const Resource& item) const {
+    return hdr && item.renderTarget && !item.depth && item.desc.width == width && item.desc.height == height && item.desc.levels == 1 &&
+      !item.desc.cube && item.desc.depth == 1;
+  }
+  // exposure, bloom and tone mapping take an entered target back to 0..1; exposure follows the scene's over about a
+  // second of wall clock
+  void resolve(Resource& item) {
+    if (!item.inHdr) { return; }
+    const auto now = std::chrono::steady_clock::now();
+    const float seconds = std::clamp(std::chrono::duration<float>(now - exposureTime).count(), 0.0f, 0.25f);
+    exposureTime = now;
+    const float blend = exposureFresh ? 1.0f : 1.0f - std::exp(-seconds * 1.5f);
+    exposureFresh = false;
+    const auto result = sendPacket(webgpu::Opcode::Resolve, item.id, webgpu::ResolvePacket{blend, uint32_t(tone)});
+    item.inHdr = false; item.dirty = true; item.command = result.command; ++item.version; ++hdrResolves;
+  }
+  // the first depth written 3D draw of a frame into an HDR target: what it holds goes over the headroom
+  void enterHdr(Resource& item) {
+    item.hdrFrame = frames;
+    const uint32_t copy = feedbackTexture(item);
+    const std::array<float, 4> whole{0, 0, float(item.hostWidth), float(item.hostHeight)};
+    const auto result = blit(copy, item.id, whole, whole, false, 1 / kHeadroom);
+    item.inHdr = true; item.dirty = true; item.command = result.command; ++item.version;
+  }
+  // native's ShaderModel3 normalization cube test on the decoded faces: each face's centre points along its axis
+  static bool normalizationCube(const gpu::TextureDesc& desc, const std::vector<uint8_t>& rgba) {
+    if (!desc.cube || desc.width < 8) { return false; }
+    size_t faceBytes = 0;
+    for (uint32_t n = 0; n < desc.levels; ++n) { faceBytes += size_t(std::max(desc.width >> n, 1u)) * std::max(desc.height >> n, 1u) * 4; }
+    if (rgba.size() < faceBytes * 6) { return false; }
+    for (uint32_t face = 0; face < 6; ++face) {
+      const uint8_t* centre = rgba.data() + face * faceBytes + (size_t(desc.width / 2) * desc.width + desc.width / 2) * 4;
+      for (uint32_t channel = 0; channel < 3; ++channel) {
+        const int want = channel == face / 2 ? (face & 1 ? 0 : 255) : 128;
+        if (std::abs(int(centre[channel]) - want) > 16) { return false; }
+      }
+    }
+    // off the centres too: the game also has a cube whose centres pass but whose texels lean towards the face's edges,
+    // and drawing that one per pixel turns the opening mission's sky white. The +X face: direction (1, -t, -s)
+    for (const auto [x, y] : {std::pair{desc.width / 4, desc.width / 2}, std::pair{desc.width / 2, desc.width / 4}, std::pair{desc.width / 4, desc.width / 4}}) {
+      const float u = (x + 0.5f) / desc.width * 2 - 1, v = (y + 0.5f) / desc.width * 2 - 1;
+      const float length = std::sqrt(1 + u * u + v * v);
+      const std::array<float, 3> direction{1 / length, -v / length, -u / length};
+      const uint8_t* texel = rgba.data() + (size_t(y) * desc.width + x) * 4;
+      for (uint32_t channel = 0; channel < 3; ++channel) {
+        if (std::abs(texel[channel] - (direction[channel] * 0.5f + 0.5f) * 255) > 16) { return false; }
+      }
+    }
+    return true;
+  }
   // native's MSAA rule: render targets of the back buffer's size, colour and depth, get the samples
   void multisample(Resource& item) {
     if (!msaa || item.multisampled || !item.renderTarget || item.desc.width != width || item.desc.height != height ||
@@ -343,27 +404,31 @@ struct MenuBackend::Impl {
     }
     return render_scale::HostSize(desc.width, desc.height, width, height, scale);
   }
-  static size_t feedbackBytes(const Resource& item) { return size_t(item.hostWidth) * item.hostHeight * 4; }
-  // a texture of width x height drawn over from source's rectangle: box filtered when shrinking, bilinear otherwise
-  webgpu::Result blit(uint32_t source, uint32_t destination, std::array<float, 4> from, std::array<float, 4> to, bool forceOpaque = false) {
+  static size_t feedbackBytes(const Resource& item) { return size_t(item.hostWidth) * item.hostHeight * (item.hdrTarget ? 8 : 4); }
+  // a texture of width x height drawn over from source's rectangle: box filtered when shrinking, bilinear otherwise;
+  // colour times scale
+  webgpu::Result blit(uint32_t source, uint32_t destination, std::array<float, 4> from, std::array<float, 4> to, bool forceOpaque = false, float scale = 1) {
     webgpu::BlitPacket packet{source, {from[0], from[1], from[2], from[3]}, {to[0], to[1], to[2], to[3]}};
     const float shrink = std::max(from[2] / to[2], from[3] / to[3]);
     packet.taps = shrink > 1.01f ? std::min(16u, uint32_t(std::ceil(shrink))) : 0;
     packet.force_opaque = forceOpaque;
+    packet.scale = scale;
     return sendPacket(webgpu::Opcode::Blit, destination, packet);
   }
-  uint32_t createEmpty(uint32_t w, uint32_t h, bool depth) {
+  uint32_t createEmpty(uint32_t w, uint32_t h, bool depth, bool hdrTarget = false) {
     const uint32_t id = newId();
     std::vector<uint8_t> payload;
-    append(payload, webgpu::TexturePacket{w, h, depth ? 1u : 0u, 1});
+    append(payload, webgpu::TexturePacket{w, h, depth ? 1u : hdrTarget ? webgpu::HdrTexture : 0u, 1});
     send(webgpu::Opcode::CreateTexture, id, payload);
     return id;
   }
-  // the resource's texture at another size, its picture kept
-  void resample(Resource& item, uint32_t w, uint32_t h) {
-    if (item.hostWidth == w && item.hostHeight == h) { return; }
+  // the resource's texture at another size or format, its picture kept
+  void resample(Resource& item, uint32_t w, uint32_t h) { reshape(item, w, h, item.hdrTarget); }
+  void reshape(Resource& item, uint32_t w, uint32_t h, bool hdrTarget) {
+    if (item.hostWidth == w && item.hostHeight == h && item.hdrTarget == hdrTarget) { return; }
     collectLate(item);
-    const uint32_t id = createEmpty(w, h, item.depth);
+    if (!hdrTarget) { resolve(item); }
+    const uint32_t id = createEmpty(w, h, item.depth, hdrTarget);
     const auto result = blit(item.id, id, {0, 0, float(item.hostWidth), float(item.hostHeight)}, {0, 0, float(w), float(h)});
     send(webgpu::Opcode::Destroy, item.id);
     if (item.feedback) {
@@ -373,6 +438,7 @@ struct MenuBackend::Impl {
       item.feedback = 0; item.feedbackVersion = 0; item.feedbackUsed = 0;
     }
     item.id = id; item.hostWidth = w; item.hostHeight = h; item.command = result.command; ++item.version;
+    item.hdrTarget = hdrTarget;
     item.multisampled = false;
     multisample(item);
   }
@@ -486,7 +552,8 @@ struct MenuBackend::Impl {
     require(bytes.size() <= webgpu::MaxBytes, "menu backend command payload budget exceeded");
     const auto started = std::chrono::steady_clock::now();
     const bool deferred = limits.postCommands && (opcode == webgpu::Opcode::Draw || opcode == webgpu::Opcode::DrawBatch || opcode == webgpu::Opcode::ReadbackStart || opcode == webgpu::Opcode::Present ||
-      opcode == webgpu::Opcode::RenderBatch || opcode == webgpu::Opcode::Clear || opcode == webgpu::Opcode::Copy || opcode == webgpu::Opcode::UploadBuffer || opcode == webgpu::Opcode::UploadDrawBatch);
+      opcode == webgpu::Opcode::RenderBatch || opcode == webgpu::Opcode::Clear || opcode == webgpu::Opcode::Copy || opcode == webgpu::Opcode::UploadBuffer || opcode == webgpu::Opcode::UploadDrawBatch ||
+      opcode == webgpu::Opcode::Resolve);
     auto result = (deferred ? post : execute)(opcode, resource, bytes);
     const uint64_t elapsed = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
     commandWaitMicroseconds += elapsed;
@@ -802,7 +869,7 @@ struct MenuBackend::Impl {
           return item;
         }
         require(!depth, "menu backend unsupported CPU depth surface upload");
-        if (item.scaled()) { return over(item, std::move(source), cpuVersion); }
+        if (item.scaled() || item.hdrTarget) { return over(item, std::move(source), cpuVersion); }
         changedSource = std::move(source);
       }
     }
@@ -821,6 +888,7 @@ struct MenuBackend::Impl {
         rgba.insert(rgba.end(), decoded.pixels.begin(), decoded.pixels.end());
       }
     }
+    const bool normCube = hdr && normalizationCube(desc, rgba);
     const size_t residentBytes = size_t(bytes) + (depth ? size_t(desc.width) * desc.height * 4 : rgba.size());
     const size_t oldBytes = found == resources.end() ? 0 : found->second.residentBytes + found->second.late.size();
     trimFeedback(found == resources.end() ? 1 : 0, residentBytes > oldBytes ? residentBytes - oldBytes : 0,
@@ -861,7 +929,7 @@ struct MenuBackend::Impl {
     Resource item;
     item.id = id; item.version = version; item.command = result.command; item.cpuVersion = cpuVersion;
     item.desc = desc; item.headerAddress = headerAddress; item.header = std::move(header); item.uploaded = std::move(source); item.depth = depth; item.residentBytes = residentBytes;
-    item.hostWidth = hostWidth; item.hostHeight = hostHeight;
+    item.hostWidth = hostWidth; item.hostHeight = hostHeight; item.normCube = normCube;
     if (found != resources.end() && !replacedStorage) { item.views = std::move(found->second.views); item.renderTarget = found->second.renderTarget; }
     item.views.insert(headerAddress);
     resources[key] = std::move(item);
@@ -892,7 +960,7 @@ struct MenuBackend::Impl {
       send(webgpu::Opcode::CreateTexture, staging, payload);
       const float ky = float(item.hostHeight) / item.desc.height;
       const auto result = blit(staging, item.id, {0, float(first), float(item.desc.width), float(last - first)},
-        {0, std::floor(first * ky), float(item.hostWidth), std::ceil(last * ky) - std::floor(first * ky)});
+        {0, std::floor(first * ky), float(item.hostWidth), std::ceil(last * ky) - std::floor(first * ky)}, false, item.inHdr ? 1 / kHeadroom : 1);
       send(webgpu::Opcode::Destroy, staging);
       item.command = result.command; ++item.version;
     }
@@ -902,10 +970,10 @@ struct MenuBackend::Impl {
   Resource& surface(const gpu::Surface& value, bool depth = false) {
     auto& item = ensure(value.header, true, depth);
     if (!item.renderTarget) {
+      item.renderTarget = true;
       const auto [w, h] = hostSize(item.desc, true);
-      resample(item, w, h);
+      reshape(item, w, h, hdrEligible(item));
     }
-    item.renderTarget = true;
     multisample(item);
     require(item.desc.data == address(value.data) && word(item.header, 12) == value.format && word(item.header, 16) == value.size, "menu backend stale or incompatible surface descriptor");
     return item;
@@ -968,7 +1036,7 @@ struct MenuBackend::Impl {
         " limit=" + std::to_string(limits.maxResources)).c_str());
       require(bytes <= limits.maxResourceBytes && bytes <= limits.maxResidentBytes && resident <= limits.maxResidentBytes - bytes, "menu backend feedback resident byte budget exceeded");
       std::vector<uint8_t> payload;
-      append(payload, webgpu::TexturePacket{item.hostWidth, item.hostHeight, 0});
+      append(payload, webgpu::TexturePacket{item.hostWidth, item.hostHeight, item.hdrTarget ? webgpu::HdrTexture : 0u});
       const uint32_t id = newId();
       send(webgpu::Opcode::CreateTexture, id, payload);
       item.feedback = id; item.residentBytes += bytes; resident += bytes;
@@ -1019,7 +1087,8 @@ struct MenuBackend::Impl {
     return false;
   }
   std::vector<uint8_t> readback(Resource& item) {
-    if (!item.scaled()) { return decodeReadback(item, send(webgpu::Opcode::Readback, item.id)); }
+    resolve(item);
+    if (!item.scaled() && !item.hdrTarget) { return decodeReadback(item, send(webgpu::Opcode::Readback, item.id)); }
     const uint32_t copy = shrink(item);
     auto result = send(webgpu::Opcode::Readback, copy);
     send(webgpu::Opcode::Destroy, copy);
@@ -1031,7 +1100,8 @@ struct MenuBackend::Impl {
     const uint32_t slot = uint32_t(free - lateSlots.begin());
     std::vector<uint8_t> request;
     append(request, slot);
-    item.lateSource = item.scaled() ? shrink(item) : item.id;
+    resolve(item);
+    item.lateSource = item.scaled() || item.hdrTarget ? shrink(item) : item.id;
     send(webgpu::Opcode::ReadbackStart, item.lateSource, request);
     *free = item.lateSource;
     item.lateStarted = true; item.lateSlot = slot;
@@ -1170,7 +1240,8 @@ MenuBackend::SnapshotData MenuBackend::Snapshot() const {
   std::lock_guard lock(impl_->mutex);
   return {uint32_t(impl_->pipelines.size()), uint32_t(impl_->resourceCount()), impl_->resident,
     impl_->submittedCount, impl_->completedCount, impl_->frames, impl_->storageViewFailure,
-    impl_->shaderTranslations, uint32_t(impl_->shaderCacheBytes), uint32_t(impl_->shaderCache.size()), uint32_t(impl_->uploadVersions.size() + impl_->residentBuffers.size())};
+    impl_->shaderTranslations, uint32_t(impl_->shaderCacheBytes), uint32_t(impl_->shaderCache.size()), uint32_t(impl_->uploadVersions.size() + impl_->residentBuffers.size()),
+    impl_->hdr, impl_->hdrResolves};
 }
 bool MenuBackend::Init(uint32_t width, uint32_t height) {
   std::lock_guard lock(impl_->mutex);
@@ -1178,7 +1249,11 @@ bool MenuBackend::Init(uint32_t width, uint32_t height) {
   require(width && height && width <= 4096 && height <= 4096, "menu backend target dimension budget exceeded");
   impl_->sendPacket(webgpu::Opcode::Configure, 0, webgpu::Dimensions{width, height});
   impl_->width = width; impl_->height = height; impl_->initialized = true;
-  if (impl_->outputSource) { impl_->msaa = impl_->outputSource().msaa == 4 ? 4 : 0; }
+  if (impl_->outputSource) {
+    const auto output = impl_->outputSource();
+    impl_->msaa = output.msaa == 4 ? 4 : 0;
+    impl_->hdr = output.hdrRendering;
+  }
   impl_->canvasWidth = width; impl_->canvasHeight = height;
   return true;
 }
@@ -1312,6 +1387,12 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   // (its feedback copy included) is bound
   if (!depthOnly) { impl_->surface(input.rt); }
   if (input.zs.header && (input.rs[gpu::kRsZEnable] || input.rs[gpu::kRsStencilEnable])) { impl_->surface(input.zs, true); }
+  // native's EnterHdrForScene: screen quads never start it, so loading fades draw over the last tone mapped picture
+  if (!depthOnly && input.zs.header && input.rs[gpu::kRsZEnable] && input.simple[gpu::kMZWriteEnable / 4] &&
+      !(!(input.vs_handle & 1) && (input.vs_handle & 14) == 4)) {
+    auto& scene = impl_->surface(input.rt);
+    if (scene.hdrTarget && !scene.inHdr && scene.hdrFrame != impl_->frames) { impl_->enterHdr(scene); }
+  }
   gpu::TexInfo texinfo[4]{};
   std::array<uint32_t, 4> textureFormats{};
   std::array<std::array<float, 4>, 4> texsize{};
@@ -1329,6 +1410,8 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
       }
       textureFormats[n] = item.desc.format;
       texinfo[n].kind = item.desc.cube ? gpu::kTexCube : item.desc.depth > 1 ? gpu::kTex3D : gpu::kTex2D; texinfo[n].rect = item.desc.linear;
+      if (item.inHdr) { texinfo[n].flags |= gpu::kTexHdr; }
+      if (item.normCube && impl_->hdr) { texinfo[n].flags |= gpu::kTexNormCube; }
       texsize[n] = {float(item.desc.width), float(item.desc.height), item.renderTarget ? -0.5f / item.desc.width : 0, item.renderTarget ? -0.5f / item.desc.height : 0};
       packet.texture[n] = input.rt.data && item.desc.data == address(input.rt.data) ? impl_->feedbackTexture(item) : item.id;
       addRequest(RenderResourceKind::Texture, input.textures[n], item.desc.data, uint32_t(item.uploaded.size()), item.version, item.id);
@@ -1396,6 +1479,7 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   webgpu::PipelinePacket pipeline{};
   pipeline.vertex_mask = raw ? rawMask | webgpu::ResidentVertexMask : budget.compactVertices ? regs : 0;
   pipeline.color_target = colorTarget != nullptr;
+  pipeline.color_format = colorTarget && colorTarget->hdrTarget;
   pipeline.sample_count = (colorTarget ? colorTarget->multisampled : depthTarget->multisampled) ? 4 : 1;
   require(!colorTarget || !depthTarget || colorTarget->multisampled == depthTarget->multisampled, "menu backend draw targets disagree on multisampling");
   for (uint32_t n = 0; n < 4; ++n) { if (texinfo[n].kind == gpu::kTexCube) { pipeline.cube_mask |= 1u << n; } if (texinfo[n].shadow) { pipeline.shadow_mask |= 1u << n; } if (texinfo[n].kind == gpu::kTex3D) { pipeline.volume_mask |= 1u << n; } }
@@ -1494,6 +1578,11 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   }
   for (uint32_t n = 0; n < 4; ++n) {
     if (!state.textures[n] || (packet.sampler[n][6] == 0 && packet.sampler[n][2] == packet.sampler[n][3])) { constants.lod_bias[n] = 0; }
+  }
+  // native's FillHdrConstants: colour lands over the headroom unless the blend multiplies it with what the target holds
+  if (colorTarget && colorTarget->inHdr) {
+    const uint32_t source = pipeline.blend ? state.simple[gpu::kMSrcBlend / 4] : 1;
+    constants.hdr[0] = source != 0 && source != 0x306 ? 1 / Impl::kHeadroom : 1;
   }
   packet.uniform_bytes = sizeof(constants);
   require(uint64_t(state.viewport.x) + state.viewport.w <= target.desc.width && uint64_t(state.viewport.y) + state.viewport.h <= target.desc.height && state.viewport.w && state.viewport.h, "menu backend unsupported viewport outside target");
@@ -1630,6 +1719,7 @@ void MenuBackend::Clear(const gpu::State& state, uint32_t count, const uint8_t* 
   packet.color[0] = ((color >> 16) & 255) / 255.0f; packet.color[1] = ((color >> 8) & 255) / 255.0f;
   packet.color[2] = (color & 255) / 255.0f; packet.color[3] = (color >> 24) / 255.0f;
   packet.depth = z; packet.stencil = stencil & 255;
+  if (target && target->inHdr) { for (uint32_t n = 0; n < 3; ++n) { packet.color[n] /= Impl::kHeadroom; } }
   if (target) { packet.flags |= 1; }
   if (flags & gpu::kClearZ) { packet.flags |= 2; }
   if (flags & gpu::kClearStencil) { packet.flags |= 4; }
@@ -1724,6 +1814,9 @@ void MenuBackend::Copy(const gpu::Surface& source, const gpu::Surface& destinati
     return;
   }
   auto& from = impl_->surface(source); auto& to = impl_->surface(destination);
+  impl_->resolve(from);
+  const bool sameFormat = from.hdrTarget == to.hdrTarget && !to.inHdr;
+  const float scale = to.inHdr ? 1 / Impl::kHeadroom : 1;
   const auto colorFamily = [](uint32_t format) { return format == 0x06 || format == 0x12 ? 1u : format == 0x07 || format == 0x1e ? 2u : 0u; };
   require(colorFamily(from.desc.format) && colorFamily(to.desc.format), "menu backend incompatible surface copy");
   const auto copies = regions(1);
@@ -1735,7 +1828,7 @@ void MenuBackend::Copy(const gpu::Surface& source, const gpu::Surface& destinati
     packet.source = sourceId;
     packet.force_opaque = colorFamily(to.desc.format) == 2;
     webgpu::Result result;
-    if (fx == tx && fy == ty) {
+    if (fx == tx && fy == ty && sameFormat) {
       const auto source = impl_->scaledRect(from, {int32_t(packet.source_x), int32_t(packet.source_y), int32_t(packet.source_x + packet.width), int32_t(packet.source_y + packet.height)});
       const auto destination = impl_->scaledRect(to, {int32_t(packet.destination_x), int32_t(packet.destination_y), int32_t(packet.destination_x + packet.width), int32_t(packet.destination_y + packet.height)});
       packet.source_x = uint32_t(source[0]); packet.source_y = uint32_t(source[1]);
@@ -1746,7 +1839,7 @@ void MenuBackend::Copy(const gpu::Surface& source, const gpu::Surface& destinati
       result = impl_->sendPacket(webgpu::Opcode::Copy, to.id, packet);
     } else {
       result = impl_->blit(sourceId, to.id, {packet.source_x * fx, packet.source_y * fy, packet.width * fx, packet.height * fy},
-        {packet.destination_x * tx, packet.destination_y * ty, packet.width * tx, packet.height * ty}, packet.force_opaque);
+        {packet.destination_x * tx, packet.destination_y * ty, packet.width * tx, packet.height * ty}, packet.force_opaque, scale);
     }
     to.dirty = true; to.command = result.command; ++to.version;
   }
@@ -1767,6 +1860,8 @@ void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
   require(impl_->initialized, "menu backend present before initialization");
   auto& item = impl_->surface(front);
   const Output output = impl_->outputSource ? impl_->outputSource() : Output{};
+  impl_->tone = output.toneMapping;
+  impl_->resolve(item);
   if (output.scale > 0) { impl_->applyScale(output.scale); }
   impl_->anisotropy = output.anisotropy;
   impl_->smaa = output.smaa;
@@ -1788,8 +1883,9 @@ void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
     impl_->canvasWidth = output.width;
     impl_->canvasHeight = output.height;
   }
-  const uint32_t flags = (pillarbox ? webgpu::PresentPillarbox : 0) | (output.linear ? webgpu::PresentLinear : 0) | (output.smaa ? webgpu::PresentSmaa : 0);
-  const auto result = impl_->sendPacket(webgpu::Opcode::Present, item.id, webgpu::PresentPacket{flags});
+  const uint32_t flags = (pillarbox ? webgpu::PresentPillarbox : 0) | (output.linear ? webgpu::PresentLinear : 0) | (output.smaa ? webgpu::PresentSmaa : 0) |
+    (output.hdrOutput ? webgpu::PresentHdr : 0);
+  const auto result = impl_->sendPacket(webgpu::Opcode::Present, item.id, webgpu::PresentPacket{flags, std::clamp(output.hdrHeadroom, 1.0f, 10.0f)});
   item.command = result.command; ++impl_->frames;
   if (impl_->metricsSink) {
     impl_->metricsSink({impl_->frames, impl_->commandWaitMicroseconds, impl_->readbackWaitMicroseconds, impl_->uploadWaitMicroseconds,

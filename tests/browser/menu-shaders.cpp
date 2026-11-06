@@ -49,7 +49,9 @@ int main(int argc, char** argv) {
   assert(c.wvp[0] == 0.5f && c.wvp[5] == 0.5f && c.wvp[10] == 0.5f);
   assert(std::abs(c.wvp[12] - 1.55f) < 0.00001f);
   assert(std::abs(c.tfactor[0] - 64 / 255.0f) < 0.00001f);
-  static_assert(sizeof(browser::menu::ShaderConstants) == 3824);
+  static_assert(sizeof(browser::menu::ShaderConstants) == 3840);
+  static_assert(offsetof(browser::menu::ShaderConstants, hdr) == 3824);
+  assert((c.hdr == std::array<float, 4>{1, 8, 0, 0}));
   static_assert(offsetof(browser::menu::ShaderConstants, pc) == 3504);
   for (int n = 0; n < 8; ++n) {
     assert(c.pc[n * 2][0] == float(n + 1) / 255 && c.pc[n * 2][3] == 128 / 255.0f);
@@ -81,6 +83,26 @@ int main(int argc, char** argv) {
   assert(textured.fragment.find("i.t0.xy / i.t0.w") != std::string::npos);
   assert(textured.fragment.find("/ u.texsize[0].xy") != std::string::npos);
   assert(textured.fragment.find("textureSampleBias(tex0, smp0") != std::string::npos);
+  assert(textured.fragment.find("clamp(cur.rgb + v1.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * u.hdr.x") != std::string::npos);
+  {
+    gpu::TexInfo hdr[4]{};
+    hdr[0] = tex[0];
+    hdr[0].flags = gpu::kTexHdr;
+    const auto scene = browser::menu::GenerateShaders(s, 1 | 8 | 512, true, hdr);
+    assert(scene.supported);
+    assert(scene.fragment.find("fn hdr_sample0(") != std::string::npos);
+    assert(scene.fragment.find("clamp(t.rgb * u.hdr.y, vec3<f32>(0.0), vec3<f32>(1.0))") != std::string::npos);
+    assert(scene.fragment.find("let t0 = hdr_sample0(") != std::string::npos);
+    hdr[0].flags = gpu::kTexWide;
+    assert(!browser::menu::GenerateShaders(s, 1 | 8 | 512, true, hdr).supported);
+    hdr[0] = {gpu::kTexCube, 0, 0, gpu::kTexNormCube};
+    auto cube = s;
+    cube.tss[0][gpu::kTssTextureTransformFlags] = 0;
+    const auto normalized = browser::menu::GenerateShaders(cube, 1 | 8 | 512, false, hdr);
+    assert(normalized.supported);
+    assert(normalized.fragment.find("select(t, vec4<f32>(normalize(d) * 0.5 + vec3<f32>(0.5), t.a), dot(d, d) > 1e-30)") != std::string::npos);
+    assert(normalized.fragment.find("let t0 = norm_cube0(") != std::string::npos);
+  }
   auto borderStorage = std::make_unique<gpu::State>(s);
   auto& borderState = *borderStorage;
   borderState.tss[0][gpu::kTssAddressU] = 4;
@@ -132,6 +154,7 @@ int main(int argc, char** argv) {
     throw std::runtime_error(pixel_shader.diagnostic + "\n" + pixel_shader.state);
   }
   assert(pixel_shader.fragment.find("var outc = r0") != std::string::npos);
+  assert(pixel_shader.fragment.find("outc = vec4<f32>(clamp(outc.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * u.hdr.x, outc.a)") != std::string::npos);
   assert(pixel_shader.fragment.find("if (!ok) { discard; }") != std::string::npos);
   assert(pixel_shader.fragment.find("outc.rgb + i.d1.rgb") == std::string::npos);
   auto invalid_pixel = pixel_state;

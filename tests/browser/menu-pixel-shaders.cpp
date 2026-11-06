@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
   Contains(plain, "var t0 = vec4<f32>(0.0, 0.0, 0.0, 1.0);");
   Contains(plain, "var r0 = vec4<f32>(0.0, 0.0, 0.0, 1.0);");
   Contains(plain, "var outc = r0;");
-  Contains(plain, "outc = vec4<f32>(clamp(outc.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), outc.a);");
+  Contains(plain, "outc = vec4<f32>(clamp(outc.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * u.hdr.x, outc.a);");
   assert(plain == Body(key));
   const std::array<std::string, 8> rgb = {
     "max((v0).rgb, vec3<f32>(0.0))",
@@ -282,7 +282,7 @@ int main(int argc, char** argv) {
   Contains(Body(key), "i.t0.xyz / i.t0.w");
   key.tex[0].kind = gpu::kTex2D;
   key.tex_modes = 1;
-  key.tex[0].flags = gpu::kTexHdr;
+  key.tex[0].flags = gpu::kTexWide;
   Reject(key, "texture flags");
   key = Key();
   key.rgb_out[0] |= 0x28u << 12;

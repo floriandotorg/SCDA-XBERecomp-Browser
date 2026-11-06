@@ -11,7 +11,7 @@
 
 namespace browser::menu {
 
-static_assert(sizeof(ShaderConstants) == 3824);
+static_assert(sizeof(ShaderConstants) == 3840);
 static_assert(offsetof(ShaderConstants, pc) == 3504);
 static_assert(offsetof(ShaderConstants, surf) == 3072);
 static_assert(offsetof(ShaderConstants, misc) == 3088);
@@ -49,6 +49,7 @@ const char* kUniform = R"(struct Constants {
   pc: array<vec4<f32>, 18>,
   lod_bias: vec4<f32>,
   depth_bias: vec4<f32>,
+  hdr: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: Constants;
 fn rowmul(p: vec4<f32>, m: array<vec4<f32>, 4>) -> vec4<f32> {
@@ -586,7 +587,7 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     if (textures[n].kind != gpu::kTexNone && textures[n].kind != gpu::kTex2D && textures[n].kind != gpu::kTexCube && textures[n].kind != gpu::kTex3D) {
       return reject("stage " + std::to_string(n) + " texture dimensionality");
     }
-    if (textures[n].shadow > 2 || textures[n].flags) {
+    if (textures[n].shadow > 2 || !SupportedFlags(textures[n])) {
       return reject("stage " + std::to_string(n) + " shadow or HDR texture flags");
     }
     if (s.tss[n][gpu::kTssColorKeyOp] || s.tss[n][gpu::kTssColorSign]) {
@@ -709,7 +710,7 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     fragment += std::string(f[8] == 5 ? "tmp" : "cur") + " = vec4<f32>(rgb, alpha); }\n";
   }
   if (!key.programmable) {
-    fragment += "  var outc = vec4<f32>(clamp(cur.rgb + v1.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), cur.a);\n";
+    fragment += "  var outc = vec4<f32>(clamp(cur.rgb + v1.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * u.hdr.x, cur.a);\n";
   }
   if (key.alphatest) {
     fragment += "  let v = floor(outc.a * 255.0 + 0.5);\n  let r = u.misc.x;\n  let f = u32(u.misc.y);\n";
@@ -721,6 +722,21 @@ ShaderResult GenerateShaders(const gpu::State& s, uint16_t regs, bool pretransfo
     fragment += "  result.depth = biased_depth;\n  return result;\n";
   } else if (colorTarget) { fragment += "  return outc;\n"; }
   fragment += "}\n";
+  for (uint32_t n = 0; n < 4; ++n) {
+    const auto name = std::to_string(n);
+    const auto sample = "textureSampleBias(tex" + name + ", smp" + name + ",";
+    if (textures[n].flags & gpu::kTexHdr) {
+      ReplaceAll(fragment, sample, "hdr_sample" + name + "(");
+      fragment += "fn hdr_sample" + name + "(uv: vec2<f32>, b: f32) -> vec4<f32> {\n  let t = " + sample + " uv, b);\n" +
+        "  return vec4<f32>(clamp(t.rgb * u.hdr.y, vec3<f32>(0.0), vec3<f32>(1.0)), t.a);\n}\n";
+    }
+    if (textures[n].flags & gpu::kTexNormCube) {
+      ReplaceAll(fragment, sample, "norm_cube" + name + "(");
+      // a zero direction has no normal: the cube's own texel, where normalize would give NaN
+      fragment += "fn norm_cube" + name + "(d: vec3<f32>, b: f32) -> vec4<f32> {\n  let t = " + sample + " d, b);\n" +
+        "  return select(t, vec4<f32>(normalize(d) * 0.5 + vec3<f32>(0.5), t.a), dot(d, d) > 1e-30);\n}\n";
+    }
+  }
   for (uint32_t n = 0; n < 4; ++n) {
     if (textures[n].kind == gpu::kTex2D && (s.tss[n][gpu::kTssAddressU] == 4 || s.tss[n][gpu::kTssAddressV] == 4)) {
       const auto name = std::to_string(n);

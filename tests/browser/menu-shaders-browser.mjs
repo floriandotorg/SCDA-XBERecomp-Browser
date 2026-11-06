@@ -141,7 +141,7 @@ const run = async () => {
     }
     exhaustiveFormats.push(type); readback.unmap(); readback.destroy(); buffer.destroy(); target.destroy();
   }
-  const uniform = device.createBuffer({ size: 3824, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const uniform = device.createBuffer({ size: 3840, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const constants = new Float32Array(await (await fetch(root + 'constants.bin')).arrayBuffer());
   device.queue.writeBuffer(uniform, 0, constants);
   const source = device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });

@@ -119,3 +119,19 @@ test('MSAA offers off and 4x only: 2 and 8 become 4, garbage stays off; SMAA is 
   assert.equal(settings.get('msaa'), 0);
   assert.equal(createSettings({ storage: memory(JSON.stringify({ msaa: 'x' })) }).get('msaa'), 0);
 });
+
+test('shader model 3.0 renders HDR and tone maps only when asked; HDR output defaults on with a 5x headroom', () => {
+  const settings = createSettings({ storage: memory() });
+  assert.deepEqual(['shaderModel', 'hdrRendering', 'toneMapping', 'hdrOutput', 'hdrHeadroom'].map(name => settings.get(name)), ['1.1', false, false, true, 5]);
+  settings.set('shaderModel', '2.0');
+  assert.equal(settings.get('shaderModel'), '1.1');
+  settings.set('shaderModel', '3.0');
+  settings.set('hdrHeadroom', 12);
+  assert.equal(settings.get('shaderModel'), '3.0');
+  assert.equal(settings.get('hdrHeadroom'), 10);
+  settings.set('hdrHeadroom', 2.3);
+  assert.equal(settings.get('hdrHeadroom'), 2.5);
+  settings.set('hdrHeadroom', 0);
+  assert.equal(settings.get('hdrHeadroom'), 1);
+  assert.equal(createSettings({ storage: memory(JSON.stringify({ hdrRendering: 1, toneMapping: 'yes' })) }).get('hdrRendering'), true);
+});

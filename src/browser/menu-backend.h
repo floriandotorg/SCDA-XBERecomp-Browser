@@ -48,6 +48,10 @@ public:
     uint32_t msaa = 0;                        // 4: screen sized targets multisample; taken once, at Init
     bool smaa = false;                        // SMAA over the presented frame
     uint32_t shadowResolution = 512;          // the game's shadow map edge (gpu::g_shadow), 512 the console's
+    bool hdrRendering = false;                // screen sized targets hold colour over an 8x headroom; taken at Init
+    bool toneMapping = false;                 // the HDR resolve's exposure and highlight roll off
+    bool hdrOutput = false;                   // the canvas shows extended range, highlights to hdrHeadroom x white
+    float hdrHeadroom = 5;
   };
   void SetOutputSource(std::function<Output()> source);
   struct SnapshotData {
@@ -62,6 +66,8 @@ public:
     uint32_t shaderCacheBytes = 0;
     uint32_t shaderCacheEntries = 0;
     uint32_t uploadCacheEntries = 0;
+    bool hdr = false;          // HDR rendering latched at Init
+    uint64_t hdrResolves = 0;  // HDR scene resolves so far
   };
   SnapshotData Snapshot() const;
   bool Init(uint32_t width, uint32_t height) override;

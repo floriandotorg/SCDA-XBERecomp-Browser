@@ -41,6 +41,11 @@ const TABS = Object.freeze([
     { setting: 'shadowResolution', label: 'Shadow resolution', values: { 512: '512 (console)', 1024: '1024', 2048: '2048', 4096: '4096' } },
     { setting: 'shadowFilter', label: 'Shadow filter', values: { console: 'Console', soft: 'Soft (SM3)' } },
     { setting: 'shadowDistance', label: 'Shadow distance', values: { 1: '1x', 2: '2x', 4: '4x', 8: '8x' } },
+    { setting: 'shaderModel', label: 'Shader model', values: { '1.1': '1.1 (console)', '3.0': '3.0' } },
+    { setting: 'hdrRendering', label: 'HDR rendering', restart: true, unavailable: shell => shell.settings.get('shaderModel') !== '3.0' && 'Off' },
+    { setting: 'toneMapping', label: 'Tone mapping', unavailable: shell => shell.settings.get('shaderModel') !== '3.0' && 'Off' },
+    { setting: 'hdrOutput', label: 'HDR output', unavailable: shell => !shell.hdrDisplay() && 'Not supported' },
+    { setting: 'hdrHeadroom', label: 'HDR highlights', format: value => `${value.toFixed(1)}x`, shown: shell => shell.hdrDisplay() && shell.settings.get('hdrOutput') },
   ] },
   { id: 'audio', label: 'Audio', rows: [
     { setting: 'volume', label: 'Master volume', format: value => `${value}%` },
@@ -131,6 +136,15 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     if (!diagnostic.hidden) { diagnostic.textContent = JSON.stringify(evidence, null, 2); }
   };
   let shape = { aspect: 4 / 3 }, hostSettings, layoutTimer, displayRate = 0;
+  // HDR output needs an HDR display and a browser whose WebGPU canvas takes an extended range
+  const hdrQuery = window.matchMedia?.('(dynamic-range: high)');
+  const hdrCanvas = typeof GPUCanvasContext !== 'undefined' && 'getConfiguration' in GPUCanvasContext.prototype;
+  const hdrDisplay = () => Boolean(hdrQuery?.matches && hdrCanvas);
+  const rowShell = { settings, hdrDisplay };
+  hdrQuery?.addEventListener?.('change', () => {
+    hostSettings?.refresh();
+    if (panel === 'settings') { renderSettings(); }
+  });
   // the language a session starts in: Automatic follows the browser's, English when the game lacks it
   const bootLanguage = () => {
     const chosen = settings.get('language');
@@ -230,7 +244,12 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
         element.value = String(value);
         element.style.setProperty('--fill', `${(value - setting.min) / (setting.max - setting.min) * 100}%`);
         element.nextElementSibling.textContent = row.format(value);
-      } else { element.querySelector('b').textContent = choiceText(row); }
+      } else {
+        const unavailable = row.unavailable?.(rowShell);
+        element.disabled = Boolean(unavailable);
+        element.querySelector('b').textContent = unavailable || choiceText(row);
+      }
+      if (row.shown) { element.closest('.row').hidden = !row.shown(rowShell); }
     }
   };
   const renderSettings = () => {
@@ -247,6 +266,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     rowList.replaceChildren(...current.rows.map((row, index) => {
       const line = root.createElement(row.bind || row.padBind || row.reset ? 'div' : 'label');
       line.className = row.heading ? 'row heading' : 'row';
+      line.hidden = Boolean(row.shown && !row.shown(rowShell));
       const name = root.createElement('span');
       name.textContent = row.restart ? `${row.label} (next start)` : row.label ?? row.heading;
       if (row.heading) {
@@ -495,7 +515,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       output: text => { consoleModel.print(text); if (consoleOpen) { showConsoleLog(); } },
       setting: value => { applyHostMessage(settings, value); },
     }, HOST_MESSAGES),
-    hostComputed: () => ({ effectiveAspect: shape.aspect, ...deviceSize(), displayRate, bootLanguage: bootLanguage() }),
+    hostComputed: () => ({ effectiveAspect: shape.aspect, ...deviceSize(), displayRate, bootLanguage: bootLanguage(), hdrDisplay: hdrDisplay() }),
     onHostSettings: value => { hostSettings = value; },
     acquireCanvas: () => {
       if (!globalThis.navigator?.gpu || typeof canvas.transferControlToOffscreen !== 'function') {

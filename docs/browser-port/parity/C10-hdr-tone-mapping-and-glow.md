@@ -108,3 +108,66 @@ Flow: settings.mjs to the C01 host-settings channel to the app::Settings shim, r
 - Brightness and contrast sliders replacing the game ramp (open question 7).
 - An in-canvas settings panel; the browser UI is HTML and composited by the browser.
 - PQ / BT.2020 output; the browser path is extended sRGB only.
+
+## Implementation notes
+
+What C10 built.
+
+- Settings: `shaderModel` ('1.1' or '3.0'), `hdrRendering`, `toneMapping`, `hdrOutput` (on) and `hdrHeadroom` (1 to
+  10, 5) in settings.mjs. Host word 24 fills `shader_model` (1 or 3), flag bits 4 to 6 fill `hdr_rendering`,
+  `tone_mapping` and `hdr_output`, word 25 carries the headroom and bit 7 the page's computed `hdrDisplay`
+  (`matchMedia('(dynamic-range: high)')` and a `GPUCanvasContext.getConfiguration`). The Output source turns HDR
+  rendering and tone mapping on only at shader model 3.0, HDR output only on an HDR display.
+- Rows: Graphics tab Shader model, HDR rendering (next start), Tone mapping, HDR output, HDR highlights; the in-game
+  GRAPHICS page SHADER MODEL to HDR OUTPUT. Rows gained `unavailable` (dimmed, a label such as "Off" or "Not supported")
+  and `shown`; settings-rows.cpp `Enabled` dims the HDR rows at 1.1 and HDR OUTPUT without an HDR display.
+- Glow: `glow` is in the default hook list, compiled unchanged; `d3d::State()` was already the live device state.
+  tests/browser/glow-hook.test.mjs runs the hook over a fake stack: the two `1, -1` quads move by native's 640x480
+  shift, the other two stay.
+- WGSL: `Constants.hdr` (x what a draw writes, y 8), the final colour `clamp(rgb) * u.hdr.x` in both generators;
+  `kTexHdr` stages sample through `hdr_sampleN` (times 8, clamped), `kTexNormCube` stages through `norm_cubeN`
+  (the direction, the cube's alpha); `kTexWide` stays rejected.
+- Service: texture kind 4 is an empty HDR scene target, `PipelinePacket.color_format`, `BlitPacket.scale`; partial
+  clear, force opaque, blit, MSAA seed and the soft shadow apply pipelines have HDR variants; copies between formats
+  and HDR readbacks are refused. Opcode `Resolve` (24) ports `exposure`, `bright`, `blur` and `tone` (persistent
+  1x1 r16f exposure cleared to 1, quarter size rgba16f bloom pair, a same format copy of the scene), writing the result
+  back into the scene (seeding a 4x companion after).
+- MenuBackend: HDR latched at Init like MSAA. Back buffer sized colour targets become HDR targets when first drawn to
+  (`reshape`); the first depth written, non pretransformed draw of a frame enters HDR (blit of the feedback copy times
+  1/8); `hdr.x` is 1/8 unless the source factor is ZERO or DESTCOLOR; clears divide colour by 8; CPU writes into an HDR
+  target go through `over` with scale 1/8 while entered; a sampled entered target gets `kTexHdr`. Present, Copy from
+  it, Sync, ReleaseResource and late readbacks resolve first (exposure blend from wall clock, dt clamped to 0.25 s);
+  readbacks of HDR targets go through an RGBA8 copy, copies between formats or into an entered target blit with the
+  scale. `Snapshot()` reports `hdr` and `hdrResolves`.
+- HDR output: `PresentHdr` with the headroom. The service configures the canvas RGBA16Float with
+  `WGPUSurfaceColorManagement { SRGB, Extended }`, checks `getConfiguration().toneMapping.mode` and otherwise falls
+  back to SDR for the session; the RGBA8 presentation target (still what capture reads) is expanded into the canvas:
+  gamma 2.2 to linear, inverse Reinhard on luminance up to the headroom, sRGB encoded past 1.
+
+### Decisions
+
+- Format: RGBA16Float. Chrome on this M1 Max offers `texture-formats-tier1`, but RGBA16Unorm is unfilterable
+  there ("None of the supported sample types (UnfilterableFloat) ... match ... (Float)"), and the game samples its scene
+  through filtering samplers. Float differs from native only past 8x white and for alpha above 1 (Risk 1).
+- Normalization cubes: native's centre test alone also accepts the opening mission's 64x64 cube whose texels are
+  `normalize(2s, 2t, 1)`, not the lookup direction; drawing it per pixel turned the sky pure white even with tone
+  mapping. The browser also checks three off-centre texels of +X against the true direction, so only real
+  normalization cubes are computed per pixel. A zero direction keeps the cube's texel.
+- HDR rendering applies at the next start (as MSAA); tone mapping, HDR output and the headroom are live. Task 8's live
+  switch is not built.
+
+### Checked in the browser (out/parity, development start, 1280x960)
+
+- 3.0 + HDR, 3.0 + HDR + tone mapping, and HDR with MSAA 4x and soft shadows: opening mission to world 60, no
+  validation errors. Bloom shows around the sun; with tone mapping the bright sky rolls off. Non-sky pixels stay within
+  a few levels of 1.1 (for example 36,52,63 against 35,52,63).
+- Perf (bench, opening and control phases, one pair): off 16.2 / 16.4 ms mean, HDR + tone mapping 16.2 / 16.6 ms.
+- The Graphics rows: at 1.1 the HDR rows are dimmed "Off"; HDR output is "Not supported" without an HDR display and
+  HDR highlights hidden.
+
+### Not done
+
+HDR output on a real HDR display (none here), comparisons against native captures, the GPU contract test of an HDR
+texture in webgpu-service.html, the MenuBackend packet sequence test (tests/browser/menu-backend.cpp already stops at
+"missing expected diagnostic: sampler filter" at HEAD), the CPU reference for the resolve math, the live HDR switch
+and the exposure value in diagnostics.

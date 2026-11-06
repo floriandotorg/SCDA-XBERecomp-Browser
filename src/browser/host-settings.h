@@ -40,6 +40,12 @@ inline constexpr uint32_t kSmaaBit = 3;
 inline constexpr uint32_t kShadowResolutionWord = 21;
 inline constexpr uint32_t kShadowFilterWord = 22;
 inline constexpr uint32_t kShadowDistanceWord = 23;
+inline constexpr uint32_t kShaderModelWord = 24;
+inline constexpr uint32_t kHdrRenderingBit = 4;
+inline constexpr uint32_t kToneMappingBit = 5;
+inline constexpr uint32_t kHdrOutputBit = 6;
+inline constexpr uint32_t kHdrHeadroomWord = 25;
+inline constexpr uint32_t kHdrDisplayBit = 7;
 
 struct Block {
   std::array<std::atomic<uint32_t>, kWords> words{};

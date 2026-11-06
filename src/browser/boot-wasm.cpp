@@ -217,11 +217,17 @@ struct Session {
       if (mode == rs::kDynamic && output.scale != 1) { output.scale = dynamic.Next(output.scale, frame); }
       const bool linear = hs::HostValue("filter") != "sharp" || output.height != 480;
       const bool written = words[hs::kSchemaWord].load() == hs::kSchema;
+      const uint32_t flags = written ? words[hs::kFlagsWord].load() : 0;
+      // native: HDR rendering and tone mapping only at shader model 3, HDR output only on an HDR display
+      const bool model3 = written && words[hs::kShaderModelWord].load() == 1;
+      const float headroom = std::bit_cast<float>(words[hs::kHdrHeadroomWord].load());
       return browser::MenuBackend::Output{output.width, output.height, linear, output.scale,
         written ? std::min(words[hs::kBrightnessWord].load(), 100u) : 50, written ? std::min(words[hs::kContrastWord].load(), 100u) : 50,
         std::min(words[hs::kAnisoWord].load(), 16u), words[hs::kMsaaWord].load() == 4 ? 4u : 0u,
-        written && (words[hs::kFlagsWord].load() >> hs::kSmaaBit & 1),
-        written && words[hs::kShadowResolutionWord].load() ? words[hs::kShadowResolutionWord].load() : 512u};
+        bool(flags >> hs::kSmaaBit & 1),
+        written && words[hs::kShadowResolutionWord].load() ? words[hs::kShadowResolutionWord].load() : 512u,
+        model3 && (flags >> hs::kHdrRenderingBit & 1), model3 && (flags >> hs::kToneMappingBit & 1),
+        (flags >> hs::kHdrOutputBit & 1) && (flags >> hs::kHdrDisplayBit & 1), std::isfinite(headroom) && headroom >= 1 ? headroom : 5.0f};
     });
     graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), graphics_mode, std::move(backend));
     graphics->ConfigurePresentCheckpoint(BROWSER_MENU_TRACE_FRAMES);

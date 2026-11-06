@@ -64,6 +64,10 @@ const std::vector<Setting>& Settings() {
     {23, "shadowResolution", "512", {{"512", "512"}, {"1024", "1024"}, {"2048", "2048"}, {"4096", "4096"}}},
     {24, "shadowFilter", "console", {{"console", "CONSOLE"}, {"soft", "SM3 SOFT"}}},
     {25, "shadowDistance", "1", {{"1", "1X"}, {"2", "2X"}, {"4", "4X"}, {"8", "8X"}}},
+    {26, "shaderModel", "1.1", {{"1.1", "1.1"}, {"3.0", "3.0"}}},
+    {27, "hdrRendering", "false", {}, true},
+    {28, "toneMapping", "false", {}, true},
+    {29, "hdrOutput", "true", {}, true},
   };
   return list;
 }
@@ -95,6 +99,10 @@ constexpr Row kSettingsRows[] = {
   {Kind::Value, 23, "SHADOW RESOLUTION"},
   {Kind::Value, 24, "SHADOW FILTER"},
   {Kind::Value, 25, "SHADOW DISTANCE"},
+  {Kind::Value, 26, "SHADER MODEL"},
+  {Kind::Value, 27, "HDR RENDERING"},
+  {Kind::Value, 28, "TONE MAPPING"},
+  {Kind::Value, 29, "HDR OUTPUT"},
   {Kind::Heading, -1, "GENERAL"},
   {Kind::Value, 3, "MASTER VOLUME"},
   {Kind::Value, 4, "SKIP INTROS"},
@@ -188,6 +196,21 @@ void StepSetting(const Setting& setting, int step) {
   }
 }
 
+// native's menu.cpp: the HDR rows only act at shader model 3.0, HDR output only on an HDR display
+bool ShaderModel3() {
+  const Setting* model = Find(26);
+  return Current(*model) == "3.0";
+}
+bool HdrDisplay() {
+  namespace hs = browser::host_settings;
+  return (hs::Shared().words[hs::kFlagsWord].load() >> hs::kHdrDisplayBit) & 1;
+}
+bool Usable(int id) {
+  if (id == 27 || id == 28) { return ShaderModel3(); }
+  if (id == 29) { return HdrDisplay(); }
+  return true;
+}
+
 }  // namespace
 
 namespace app {
@@ -216,11 +239,12 @@ std::string Value(const Row& row) {
     return keys;
   }
   const Setting* setting = row.kind == Kind::Value ? Find(row.id) : nullptr;
+  if (setting && !Usable(row.id)) { return row.id == 29 ? "NOT SUPPORTED" : "OFF"; }
   return setting ? Text(*setting, Current(*setting)) : std::string();
 }
 
 void Step(const Row& row, int step) {
-  if (const Setting* setting = row.kind == Kind::Value && step ? Find(row.id) : nullptr) { StepSetting(*setting, step); }
+  if (const Setting* setting = row.kind == Kind::Value && step && Usable(row.id) ? Find(row.id) : nullptr) { StepSetting(*setting, step); }
 }
 
 void Defaults(int page) {
@@ -256,7 +280,7 @@ void Choose(const Row& row, int index) {
 }
 
 bool Shown(const Row&) { return true; }
-bool Enabled(const Row&) { return true; }
+bool Enabled(const Row& row) { return row.kind != Kind::Value || Usable(row.id); }
 
 }  // namespace rows
 }  // namespace app

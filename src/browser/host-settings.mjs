@@ -36,11 +36,18 @@ export const HOST_SETTINGS_FIELDS = Object.freeze([
   Object.freeze({ field: 'shadow_resolution', key: 'shadowResolution', type: 'u32', word: 21 }),
   Object.freeze({ field: 'shadow_filter', key: 'shadowFilter', type: 'u32', word: 22, values: Object.freeze(['off', 'console', 'two', 'soft']) }),
   Object.freeze({ field: 'shadow_distance', key: 'shadowDistance', type: 'u32', word: 23 }),
+  Object.freeze({ field: 'shader_model', key: 'shaderModel', type: 'u32', word: 24, values: Object.freeze(['1.1', '3.0']) }),
+  Object.freeze({ field: 'hdr_rendering', key: 'hdrRendering', type: 'bool', bit: 4 }),
+  Object.freeze({ field: 'tone_mapping', key: 'toneMapping', type: 'bool', bit: 5 }),
+  Object.freeze({ field: 'hdr_output', key: 'hdrOutput', type: 'bool', bit: 6 }),
+  Object.freeze({ field: 'hdr_headroom', key: 'hdrHeadroom', type: 'f32', word: 25, browser: true }),
+  // the page's display shows HDR and its browser takes an extended range canvas
+  Object.freeze({ field: 'hdr_display', key: 'hdrDisplay', type: 'bool', bit: 7, computed: true }),
   Object.freeze({ field: 'keys', key: 'keys', type: 'map' }),
   Object.freeze({ field: 'pad_buttons', key: 'padButtons', type: 'map' }),
   // browser settings the in-game options pages show and step (settings-rows.cpp), as host.<key>=<value> lines
   ...['scaling', 'filter', 'volume', 'showFps', 'skipIntros', 'pauseOnFocusLoss', 'sensitivity', 'weaponSensitivity',
-    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale', 'anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput', 'msaa', 'smaa', 'shadowResolution', 'shadowFilter', 'shadowDistance'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
+    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale', 'anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput', 'msaa', 'smaa', 'shadowResolution', 'shadowFilter', 'shadowDistance', 'shaderModel', 'hdrRendering', 'toneMapping', 'hdrOutput'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
 ]);
 const REVISION = 0, SCHEMA = 1, FLAGS = 2;
 const ATTEMPTS = 1 << 16;
