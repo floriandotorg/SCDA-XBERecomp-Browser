@@ -1701,6 +1701,7 @@ bool MenuBackend::ReleaseResource(uint32_t header, uint32_t data) {
   auto& item = found->second;
   if (item.views.size() > 1) { item.views.erase(header); return false; }
   impl_->collectLate(item);
+  if (item.dirty) { impl_->publish(item, impl_->readback(item), 0, uint32_t(item.uploaded.size())); }
   if (item.feedback) { impl_->send(webgpu::Opcode::Destroy, item.feedback); item.feedback = 0; }
   impl_->send(webgpu::Opcode::Destroy, item.id);
   impl_->resident -= item.residentBytes + item.late.size();
