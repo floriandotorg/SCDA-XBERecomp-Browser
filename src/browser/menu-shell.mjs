@@ -45,6 +45,7 @@ const TABS = Object.freeze([
     { setting: 'hdrRendering', label: 'HDR rendering', restart: true, unavailable: shell => shell.settings.get('shaderModel') !== '3.0' && 'Off' },
     { setting: 'toneMapping', label: 'Tone mapping', unavailable: shell => shell.settings.get('shaderModel') !== '3.0' && 'Off' },
     { setting: 'hdrOutput', label: 'HDR output', unavailable: shell => !shell.hdrDisplay() && 'Not supported' },
+    { setting: 'ambientOcclusion', label: 'Ambient occlusion', values: { off: 'Off', ssao: 'SSAO', gtao: 'GTAO' } },
     { setting: 'hdrHeadroom', label: 'HDR highlights', format: value => `${value.toFixed(1)}x`, shown: shell => shell.hdrDisplay() && shell.settings.get('hdrOutput') },
   ] },
   { id: 'audio', label: 'Audio', rows: [

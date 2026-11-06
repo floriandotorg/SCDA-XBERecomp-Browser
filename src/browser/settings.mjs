@@ -24,6 +24,7 @@ export const SETTINGS = Object.freeze({
   toneMapping: Object.freeze({ initial: false }),
   hdrOutput: Object.freeze({ initial: true }),
   hdrHeadroom: Object.freeze({ initial: 5, min: 1, max: 10, step: 0.5 }),
+  ambientOcclusion: Object.freeze({ initial: 'off', options: Object.freeze(['off', 'ssao', 'gtao']) }),
   language: Object.freeze({ initial: 'auto', options: Object.freeze(['auto', 'int', 'fra', 'deu', 'ita', 'esp']) }),
   audioOutput: Object.freeze({ initial: 'stereo', options: Object.freeze(['stereo', 'mono']) }),
   resolution: Object.freeze({ initial: 'console', options: Object.freeze(['console', 'window', 'dynamic']) }),

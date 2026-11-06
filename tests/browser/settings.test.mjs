@@ -135,3 +135,11 @@ test('shader model 3.0 renders HDR and tone maps only when asked; HDR output def
   assert.equal(settings.get('hdrHeadroom'), 1);
   assert.equal(createSettings({ storage: memory(JSON.stringify({ hdrRendering: 1, toneMapping: 'yes' })) }).get('hdrRendering'), true);
 });
+
+test('ambient occlusion is off, SSAO or GTAO, off by default', () => {
+  const settings = createSettings({ storage: memory(JSON.stringify({ ambientOcclusion: 'hbao' })) });
+  assert.equal(settings.get('ambientOcclusion'), 'off');
+  settings.set('ambientOcclusion', 'gtao');
+  assert.equal(settings.get('ambientOcclusion'), 'gtao');
+  assert.equal(createSettings({ storage: memory(JSON.stringify({ ambientOcclusion: 'ssao' })) }).get('ambientOcclusion'), 'ssao');
+});

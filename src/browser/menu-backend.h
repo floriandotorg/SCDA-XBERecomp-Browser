@@ -87,7 +87,7 @@ public:
   void FilterShadows(const gpu::State&, const float*) override;
   void ApplyShadows(const gpu::State&) override;
   // the optional effects game hooks ask for through d3d::; one not drawn is counted instead
-  bool Supports(GraphicsEffect effect) const { return effect != GraphicsEffect::Occlusion; }
+  bool Supports(GraphicsEffect) const { return true; }
   uint32_t Fence() override;
   bool FencePending(uint32_t fence) override;
   void WaitFence(uint32_t fence) override;

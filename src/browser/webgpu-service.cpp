@@ -1400,6 +1400,259 @@ void expand_frame(WGPUCommandEncoder encoder, WGPUTexture canvas, float headroom
   wgpuRenderPassEncoderDraw(render, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(render); wgpuRenderPassEncoderRelease(render);
   wgpuBindGroupRelease(group); wgpuBufferRelease(uniforms); wgpuTextureViewRelease(frame); wgpuTextureViewRelease(output);
 }
+// native's ambient occlusion (src/gpu/d3d12.cpp's kAoHlsl in WGSL): occlusion or GTAO from the scene's depth into an
+// rg16f pair (occlusion, view z), a blur across, then a blur down multiplied into the scene. Stencil bit 0 is the
+// world; where it is clear (the sky) depth counts as the far plane
+constexpr const char* kAoWgsl = R"(
+struct A { proj: vec4<f32>, zp: vec4<f32>, vp: vec4<f32>, opt: vec4<f32>, fog: vec4<f32> }
+@group(0) @binding(0) var<uniform> a: A;
+@group(0) @binding(1) var depth: DEPTH_TYPE;
+@group(0) @binding(2) var stencil: STENCIL_TYPE;
+@group(0) @binding(3) var ao: texture_2d<f32>;
+@vertex fn vs_main(@builtin(vertex_index) id: u32) -> @builtin(position) vec4<f32> {
+  return vec4<f32>(vec2<f32>(f32((id << 1u) & 2u), f32(id & 2u)) * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+}
+fn raw(p: vec2<i32>) -> f32 {
+  if ((textureLoad(stencil, p, 0).r & 1u) != 0u) { return textureLoad(depth, p, 0); }
+  return 1.0;
+}
+// view space position of a pixel. proj: 1 / scale xy, centre xy; zp: z = x / (depth - y); vp: viewport in pixels
+fn view(px: vec2<f32>) -> vec3<f32> {
+  let p = clamp(vec2<i32>(px), vec2<i32>(a.vp.xy), vec2<i32>(a.vp.xy + a.vp.zw) - vec2<i32>(1));
+  let z = a.zp.x / (raw(p) - a.zp.y);
+  let ndc = (vec2<f32>(p) + vec2<f32>(0.5) - a.vp.xy) / a.vp.zw * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+  return vec3<f32>((ndc - a.proj.zw) * a.proj.xy * z, z);
+}
+fn dither(i: i32) -> f32 {
+  let values = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+  return values[i];
+}
+// normal from the nearer neighbour each way: no bend over depth edges
+fn normal_at(px: vec2<f32>, c: vec3<f32>) -> vec3<f32> {
+  let l = view(px - vec2<f32>(1.0, 0.0));
+  let r = view(px + vec2<f32>(1.0, 0.0));
+  let u = view(px - vec2<f32>(0.0, 1.0));
+  let d = view(px + vec2<f32>(0.0, 1.0));
+  let dx = select(c - l, r - c, abs(r.z - c.z) < abs(c.z - l.z));
+  let dy = select(c - u, d - c, abs(d.z - c.z) < abs(c.z - u.z));
+  return normalize(cross(dx, dy));
+}
+// opt: world radius, most pixels it may span; out: occlusion, view z
+@fragment fn occlusion(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let c = view(pos.xy);
+  let rad = a.opt.x * 0.5 * a.vp.zw / (a.proj.xy * c.z);
+  let span = max(rad.x, rad.y);
+  if (span < 1.0) { return vec4<f32>(1.0, c.z, 0.0, 0.0); }
+  let n = normal_at(pos.xy, c);
+  let k = min(1.0, a.opt.y / span);
+  let R = a.opt.x * k;
+  let cell = vec2<i32>(pos.xy) & vec2<i32>(3);
+  let turn = dither(cell.y * 4 + cell.x) * (6.2831853 / 16.0);
+  var occluded = 0.0;
+  for (var i = 0; i < 16; i++) {
+    let f = (f32(i) + 0.5) / 16.0;
+    let t = f32(i) * 2.3999632 + turn;
+    let v = (view(pos.xy + vec2<f32>(cos(t), sin(t)) * rad * (k * f)) - c) / R;
+    let vv = dot(v, v);
+    let w = max(1.0 - vv, 0.0);
+    occluded += w * w * w * max((dot(v, n) - 0.05) / (vv + 0.01), 0.0);
+  }
+  return vec4<f32>(max(1.0 - occluded * 0.25, 0.0), c.z, 0.0, 0.0);
+}
+const kHalfPi = 1.5707963;
+// GTAO (Jimenez 2016) at XeGTAO's high preset: 3 slices, 3 steps a side, squared step spread, falloff over the outer
+// 61.5% of the radius, power 2.2
+@fragment fn gtao(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let c = view(pos.xy);
+  let rad = a.opt.x * 0.5 * a.vp.zw / (a.proj.xy * c.z);
+  let span = max(rad.x, rad.y);
+  if (span < 1.0) { return vec4<f32>(1.0, c.z, 0.0, 0.0); }
+  let n = normal_at(pos.xy, c);
+  let v = normalize(-c);
+  let k = min(1.0, a.opt.y / span);
+  let R = a.opt.x * k;
+  let cell = vec2<i32>(pos.xy) & vec2<i32>(3);
+  let slice_noise = dither(cell.y * 4 + cell.x) / 16.0;
+  let step_noise = dither(cell.x * 4 + cell.y) / 16.0;
+  var vis = 0.0;
+  for (var s = 0; s < 3; s++) {
+    let phi = (f32(s) + slice_noise) * (kHalfPi * 2.0 / 3.0);
+    let dir = vec3<f32>(cos(phi), sin(phi), 0.0);
+    // in pixels; screen y runs down, view y up
+    let omega = vec2<f32>(dir.x, -dir.y) * rad * k;
+    let ortho = dir - dot(dir, v) * v;
+    let axis = normalize(cross(ortho, v));
+    let pn = n - axis * dot(n, axis);
+    let pn_len = max(length(pn), 1e-4);
+    let cos_n = clamp(dot(pn, v) / pn_len, 0.0, 1.0);
+    let an = sign(dot(ortho, pn)) * acos(cos_n);
+    // x: the +omega side, y: the -omega side; lowest is flat along the slice's tangent
+    let low = vec2<f32>(cos(an + kHalfPi), cos(an - kHalfPi));
+    var hc = low;
+    for (var j = 0; j < 3; j++) {
+      let f = (f32(j) + step_noise) / 3.0;
+      // at least 1.3 pixels out, off the centre pixel
+      let off = omega * (f * f + 1.3 / length(omega));
+      let d0 = view(pos.xy + off) - c;
+      let d1 = view(pos.xy - off) - c;
+      let len = max(vec2<f32>(length(d0), length(d1)), vec2<f32>(1e-4));
+      let w = clamp((vec2<f32>(R) - len) / (R * 0.615), vec2<f32>(0.0), vec2<f32>(1.0));
+      let sc = vec2<f32>(dot(d0, v), dot(d1, v)) / len;
+      hc = max(hc, mix(low, sc, w));
+    }
+    let h0 = an + clamp(-acos(clamp(hc.y, -1.0, 1.0)) - an, -kHalfPi, kHalfPi);
+    let h1 = an + clamp(acos(clamp(hc.x, -1.0, 1.0)) - an, -kHalfPi, kHalfPi);
+    let sin_n = sin(an);
+    let arc0 = (cos_n + 2.0 * h0 * sin_n - cos(2.0 * h0 - an)) / 4.0;
+    let arc1 = (cos_n + 2.0 * h1 * sin_n - cos(2.0 * h1 - an)) / 4.0;
+    vis += pn_len * (arc0 + arc1);
+  }
+  return vec4<f32>(pow(clamp(vis / 3.0, 0.0, 1.0), 2.2), c.z, 0.0, 0.0);
+}
+// opt.zw: step; 5 taps average the 4 pixel dither, depth edges left out. Out: occlusion, view z
+fn smooth_ao(pos: vec2<f32>) -> vec2<f32> {
+  let p = vec2<i32>(pos);
+  let lo = vec2<i32>(a.vp.xy);
+  let hi = vec2<i32>(a.vp.xy + a.vp.zw) - vec2<i32>(1);
+  let z = textureLoad(ao, p, 0).y;
+  var sum = 0.0;
+  var count = 0.0;
+  for (var i = -2; i <= 2; i++) {
+    let s = textureLoad(ao, clamp(p + i * vec2<i32>(a.opt.zw), lo, hi), 0).xy;
+    let w = select(1.0, 0.5, abs(i) == 2) * clamp(2.0 - abs(s.y - z) / (z * 0.02), 0.0, 1.0);
+    sum += s.x * w;
+    count += w;
+  }
+  return vec2<f32>(sum / count, z);
+}
+@fragment fn occlusion_blur(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  return vec4<f32>(smooth_ao(pos.xy), 0.0, 0.0);
+}
+// fog: the game's, already blended over the scene, fades the occlusion out as it thickens
+@fragment fn occlusion_apply(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let s = smooth_ao(pos.xy);
+  let fogged = a.fog.z * clamp(a.fog.x * s.y + a.fog.y, 0.0, 1.0);
+  return vec4<f32>(vec3<f32>(mix(s.x, 1.0, fogged)), 1.0);
+}
+)";
+struct OcclusionState {
+  WGPUBindGroupLayout bindings[2]{};
+  WGPUPipelineLayout layouts[2]{};
+  std::map<uint32_t, WGPURenderPipeline> pipelines;  // pass | 4 multisampled depth | 8 4x scene | 16 HDR scene
+  WGPUTexture targets[2]{}, dummy = nullptr;
+  uint32_t width = 0, height = 0;
+} occlusion_state;
+constexpr const char* kAoEntries[4] = {"occlusion", "gtao", "occlusion_blur", "occlusion_apply"};
+WGPURenderPipeline occlusion_pipeline(uint32_t pass, bool depthMs, bool sceneMs, bool hdr) {
+  auto& state = occlusion_state;
+  const uint32_t key = pass | (depthMs ? 4 : 0) | (pass == 3 && sceneMs ? 8 : 0) | (pass == 3 && hdr ? 16 : 0);
+  if (const auto found = state.pipelines.find(key); found != state.pipelines.end()) { return found->second; }
+  if (!state.bindings[depthMs]) {
+    std::array<WGPUBindGroupLayoutEntry, 4> entries{};
+    for (uint32_t n = 0; n < entries.size(); ++n) { entries[n] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT; entries[n].binding = n; entries[n].visibility = WGPUShaderStage_Fragment; }
+    entries[0].buffer.type = WGPUBufferBindingType_Uniform;
+    entries[1].texture.sampleType = WGPUTextureSampleType_Depth; entries[1].texture.viewDimension = WGPUTextureViewDimension_2D; entries[1].texture.multisampled = depthMs;
+    entries[2].texture.sampleType = WGPUTextureSampleType_Uint; entries[2].texture.viewDimension = WGPUTextureViewDimension_2D; entries[2].texture.multisampled = depthMs;
+    entries[3].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat; entries[3].texture.viewDimension = WGPUTextureViewDimension_2D;
+    auto group = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT; group.entryCount = entries.size(); group.entries = entries.data();
+    state.bindings[depthMs] = wgpuDeviceCreateBindGroupLayout(device, &group);
+    auto layout = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT; layout.bindGroupLayoutCount = 1; layout.bindGroupLayouts = &state.bindings[depthMs];
+    state.layouts[depthMs] = wgpuDeviceCreatePipelineLayout(device, &layout);
+  }
+  std::string code = kAoWgsl;
+  for (const auto& [marker, type] : {std::pair<std::string, std::string>{"DEPTH_TYPE", depthMs ? "texture_depth_multisampled_2d" : "texture_depth_2d"},
+      std::pair<std::string, std::string>{"STENCIL_TYPE", depthMs ? "texture_multisampled_2d<u32>" : "texture_2d<u32>"}}) {
+    code.replace(code.find(marker), marker.size(), type);
+  }
+  auto source = WGPU_SHADER_SOURCE_WGSL_INIT; source.code = {code.data(), code.size()};
+  auto shader_descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT; shader_descriptor.nextInChain = &source.chain;
+  auto shader = wgpuDeviceCreateShaderModule(device, &shader_descriptor);
+  // the apply multiplies the scene's colour and keeps the alpha the game's blends read
+  auto blend = WGPU_BLEND_STATE_INIT;
+  blend.color.srcFactor = blend.alpha.srcFactor = WGPUBlendFactor_Zero;
+  blend.color.dstFactor = WGPUBlendFactor_Src; blend.alpha.dstFactor = WGPUBlendFactor_One;
+  auto target = WGPU_COLOR_TARGET_STATE_INIT;
+  target.format = pass == 3 ? (hdr ? hdr_format : WGPUTextureFormat_RGBA8Unorm) : WGPUTextureFormat_RG16Float;
+  if (pass == 3) { target.blend = &blend; }
+  auto fragment = WGPU_FRAGMENT_STATE_INIT; fragment.module = shader; fragment.entryPoint = text(kAoEntries[pass]); fragment.targetCount = 1; fragment.targets = &target;
+  auto descriptor = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT; descriptor.layout = state.layouts[depthMs]; descriptor.vertex.module = shader; descriptor.vertex.entryPoint = text("vs_main");
+  descriptor.fragment = &fragment; descriptor.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+  if (pass == 3 && sceneMs) { descriptor.multisample.count = 4; }
+  auto pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor);
+  wgpuShaderModuleRelease(shader);
+  state.pipelines.emplace(key, pipeline);
+  return pipeline;
+}
+void release_occlusion_targets() {
+  auto& state = occlusion_state;
+  for (auto& target : state.targets) { if (target) { wgpuTextureDestroy(target); wgpuTextureRelease(target); target = nullptr; } }
+  if (state.width) { texture_bytes -= uint64_t(state.width) * state.height * 8; }
+  state.width = state.height = 0;
+}
+void release_occlusion() {
+  auto& state = occlusion_state;
+  release_occlusion_targets();
+  for (auto& [key, pipeline] : state.pipelines) { wgpuRenderPipelineRelease(pipeline); }
+  state.pipelines.clear();
+  if (state.dummy) { wgpuTextureDestroy(state.dummy); wgpuTextureRelease(state.dummy); state.dummy = nullptr; }
+  for (auto& layout : state.layouts) { if (layout) { wgpuPipelineLayoutRelease(layout); layout = nullptr; } }
+  for (auto& group : state.bindings) { if (group) { wgpuBindGroupLayoutRelease(group); group = nullptr; } }
+}
+void ambient_occlusion(uint32_t resource, std::span<const uint8_t> bytes) {
+  const auto spec = packet<OcclusionPacket>(bytes); exact(bytes, 0);
+  auto& scene = texture(resource); auto& depth = texture(spec.depth);
+  const float* vp = spec.constants + 8;
+  if (scene.depth || !depth.depth || scene.width != depth.width || scene.height != depth.height || bool(scene.ms) != bool(depth.ms) || spec.gtao > 1 ||
+      !std::all_of(spec.constants, spec.constants + 20, [](float value) { return std::isfinite(value); }) || vp[0] < 0 || vp[1] < 0 || !(vp[2] >= 1) || !(vp[3] >= 1) ||
+      vp[0] + vp[2] > float(scene.width) || vp[1] + vp[3] > float(scene.height)) {
+    throw std::runtime_error("invalid ambient occlusion request");
+  }
+  auto& state = occlusion_state;
+  end_batch_pass();
+  if (state.width != scene.width || state.height != scene.height) {
+    release_occlusion_targets();
+    for (auto& target : state.targets) { target = post_texture(scene.width, scene.height, WGPUTextureFormat_RG16Float); }
+    state.width = scene.width; state.height = scene.height;
+    texture_bytes += uint64_t(scene.width) * scene.height * 8;
+  }
+  if (!state.dummy) { state.dummy = post_texture(1, 1, WGPUTextureFormat_RG16Float); }
+  const bool multisampled = bool(depth.ms);
+  auto encoder = batch_encoder ? batch_encoder : wgpuDeviceCreateCommandEncoder(device, nullptr);
+  if (multisampled) { seed(encoder, scene); }
+  auto aspect = [&](WGPUTextureAspect part) {
+    auto descriptor = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT; descriptor.aspect = part;
+    return wgpuTextureCreateView(multisampled ? depth.ms : depth.handle, &descriptor);
+  };
+  auto depthView = aspect(WGPUTextureAspect_DepthOnly), stencilView = aspect(WGPUTextureAspect_StencilOnly);
+  std::array<WGPUTextureView, 2> views{wgpuTextureCreateView(state.targets[0], nullptr), wgpuTextureCreateView(state.targets[1], nullptr)};
+  auto blank = wgpuTextureCreateView(state.dummy, nullptr);
+  const auto pass = [&](uint32_t entry, WGPUTextureView input, WGPUTextureView output, WGPUTextureView resolve, float stepX, float stepY) {
+    std::array<float, 20> constants;
+    std::copy(spec.constants, spec.constants + 20, constants.begin());
+    constants[14] = stepX; constants[15] = stepY;
+    auto uniforms = buffer({reinterpret_cast<const uint8_t*>(constants.data()), sizeof(constants)}, WGPUBufferUsage_Uniform);
+    const auto pipeline = occlusion_pipeline(entry, multisampled, bool(scene.ms), scene.hdr);
+    std::array<WGPUBindGroupEntry, 4> entries{};
+    for (uint32_t n = 0; n < entries.size(); ++n) { entries[n] = WGPU_BIND_GROUP_ENTRY_INIT; entries[n].binding = n; }
+    entries[0].buffer = uniforms; entries[0].size = sizeof(constants);
+    entries[1].textureView = depthView; entries[2].textureView = stencilView; entries[3].textureView = input;
+    auto group_descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT; group_descriptor.layout = state.bindings[multisampled]; group_descriptor.entryCount = entries.size(); group_descriptor.entries = entries.data();
+    auto group = wgpuDeviceCreateBindGroup(device, &group_descriptor);
+    auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; attachment.view = output; attachment.resolveTarget = resolve;
+    attachment.loadOp = WGPULoadOp_Load; attachment.storeOp = WGPUStoreOp_Store;
+    auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &attachment;
+    auto render = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+    wgpuRenderPassEncoderSetPipeline(render, pipeline); wgpuRenderPassEncoderSetBindGroup(render, 0, group, 0, nullptr);
+    wgpuRenderPassEncoderSetScissorRect(render, uint32_t(vp[0]), uint32_t(vp[1]), uint32_t(vp[2]), uint32_t(vp[3]));
+    wgpuRenderPassEncoderDraw(render, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(render); wgpuRenderPassEncoderRelease(render);
+    wgpuBindGroupRelease(group); wgpuBufferRelease(uniforms);
+  };
+  pass(spec.gtao ? 1 : 0, blank, views[0], nullptr, 0, 0);
+  pass(2, views[0], views[1], nullptr, 1, 0);
+  pass(3, views[1], scene.ms ? scene.msView : attachment_view(scene), scene.ms ? attachment_view(scene) : nullptr, 0, 1);
+  if (!batch_encoder) { submit(encoder); }
+  for (auto view : {depthView, stencilView, views[0], views[1], blank}) { wgpuTextureViewRelease(view); }
+}
 void clear(uint32_t resource, std::span<const uint8_t> bytes) {
       const auto spec = packet<ClearPacket>(bytes); exact(bytes, uint64_t(spec.rect_count) * 16);
       if (!spec.flags || spec.flags > 7 || spec.rect_count > 4096 || spec.stencil > 255 || !std::isfinite(spec.depth) || spec.depth < 0 || spec.depth > 1 ||
@@ -1672,6 +1925,7 @@ void release_resources() {
   release_smaa();
   release_soft();
   release_resolve();
+  release_occlusion();
   if (expand_pipeline) { wgpuRenderPipelineRelease(expand_pipeline); expand_pipeline = nullptr; }
   if (depth_upload_layout) { wgpuPipelineLayoutRelease(depth_upload_layout); depth_upload_layout = nullptr; }
   if (depth_upload_bindings) { wgpuBindGroupLayoutRelease(depth_upload_bindings); depth_upload_bindings = nullptr; }
@@ -1972,6 +2226,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
     case Opcode::SoftShadows: { soft_shadows(resource, bytes); break; }
     case Opcode::ApplyShadows: { apply_shadows(resource, bytes); break; }
     case Opcode::Resolve: { resolve_hdr(resource, bytes); break; }
+    case Opcode::Occlusion: { ambient_occlusion(resource, bytes); break; }
     case Opcode::SetGamma: {
       exact(bytes, gamma_ramp.size()); std::memcpy(gamma_ramp.data(), bytes.data(), gamma_ramp.size()); upload_gamma(); break;
     }

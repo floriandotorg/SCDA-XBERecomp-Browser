@@ -68,6 +68,7 @@ const std::vector<Setting>& Settings() {
     {27, "hdrRendering", "false", {}, true},
     {28, "toneMapping", "false", {}, true},
     {29, "hdrOutput", "true", {}, true},
+    {30, "ambientOcclusion", "off", {{"off", "OFF"}, {"ssao", "SSAO"}, {"gtao", "GTAO"}}},
   };
   return list;
 }
@@ -103,6 +104,7 @@ constexpr Row kSettingsRows[] = {
   {Kind::Value, 27, "HDR RENDERING"},
   {Kind::Value, 28, "TONE MAPPING"},
   {Kind::Value, 29, "HDR OUTPUT"},
+  {Kind::Value, 30, "AMBIENT OCCLUSION"},
   {Kind::Heading, -1, "GENERAL"},
   {Kind::Value, 3, "MASTER VOLUME"},
   {Kind::Value, 4, "SKIP INTROS"},

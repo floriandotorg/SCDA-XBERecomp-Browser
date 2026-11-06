@@ -46,6 +46,7 @@ inline constexpr uint32_t kToneMappingBit = 5;
 inline constexpr uint32_t kHdrOutputBit = 6;
 inline constexpr uint32_t kHdrHeadroomWord = 25;
 inline constexpr uint32_t kHdrDisplayBit = 7;
+inline constexpr uint32_t kAmbientOcclusionWord = 26;
 
 struct Block {
   std::array<std::atomic<uint32_t>, kWords> words{};

@@ -65,6 +65,7 @@ app::Settings Decode(const Snapshot& snapshot) {
   settings.audio_output = snapshot.words[kAudioOutputWord];
   settings.msaa = snapshot.words[kMsaaWord] == 4 ? 4 : 0;
   settings.shader_model = snapshot.words[kShaderModelWord] ? 3 : 1;
+  settings.ambient_occlusion = std::min<uint32_t>(snapshot.words[kAmbientOcclusionWord], 2);
   if (snapshot.words[kShadowResolutionWord]) { settings.shadow_resolution = std::clamp<uint32_t>(snapshot.words[kShadowResolutionWord], 512, 4096); }
   if (snapshot.words[kShadowFilterWord]) { settings.shadow_filter = snapshot.words[kShadowFilterWord] >= 3 ? 3 : 1; }
   if (snapshot.words[kShadowDistanceWord]) { settings.shadow_distance = std::clamp<uint32_t>(snapshot.words[kShadowDistanceWord], 1, 8); }

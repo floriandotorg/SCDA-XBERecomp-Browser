@@ -553,7 +553,7 @@ struct MenuBackend::Impl {
     const auto started = std::chrono::steady_clock::now();
     const bool deferred = limits.postCommands && (opcode == webgpu::Opcode::Draw || opcode == webgpu::Opcode::DrawBatch || opcode == webgpu::Opcode::ReadbackStart || opcode == webgpu::Opcode::Present ||
       opcode == webgpu::Opcode::RenderBatch || opcode == webgpu::Opcode::Clear || opcode == webgpu::Opcode::Copy || opcode == webgpu::Opcode::UploadBuffer || opcode == webgpu::Opcode::UploadDrawBatch ||
-      opcode == webgpu::Opcode::Resolve);
+      opcode == webgpu::Opcode::Resolve || opcode == webgpu::Opcode::Occlusion);
     auto result = (deferred ? post : execute)(opcode, resource, bytes);
     const uint64_t elapsed = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
     commandWaitMicroseconds += elapsed;
@@ -1948,7 +1948,31 @@ void MenuBackend::SetGamma(const uint8_t* ramp) {
   std::memcpy(impl_->guestRamp.data(), ramp, impl_->guestRamp.size());
   impl_->sendGamma();
 }
-void MenuBackend::Occlusion(const gpu::State&, const float*) { throw std::runtime_error("menu backend unsupported occlusion effect"); }
+// native's Occlusion: the frame's own scene only, its depth at its size and samples, a non-empty viewport; p is
+// HookGraphics' projection, view depth and fog
+void MenuBackend::Occlusion(const gpu::State& state, const float* p) {
+  std::lock_guard lock(impl_->mutex);
+  if (!state.rt.data || !state.zs.data) { return; }
+  const auto colour = impl_->resources.find(uint64_t(address(state.rt.data)) * 2);
+  const auto depth = impl_->resources.find(uint64_t(address(state.zs.data)) * 2 + 1);
+  if (colour == impl_->resources.end() || depth == impl_->resources.end()) { return; }
+  auto& rt = colour->second; auto& ds = depth->second;
+  if (rt.desc.width != impl_->width || rt.desc.height != impl_->height || ds.hostWidth != rt.hostWidth || ds.hostHeight != rt.hostHeight ||
+      ds.multisampled != rt.multisampled) { return; }
+  const auto& v = state.viewport;
+  const float zr = v.max_z - v.min_z;
+  const auto rect = impl_->scaledRect(rt, {int32_t(v.x), int32_t(v.y), int32_t(v.x + v.w), int32_t(v.y + v.h)});
+  const int32_t left = std::clamp(rect[0], 0, int32_t(rt.hostWidth)), top = std::clamp(rect[1], 0, int32_t(rt.hostHeight));
+  const int32_t right = std::clamp(rect[2], 0, int32_t(rt.hostWidth)), bottom = std::clamp(rect[3], 0, int32_t(rt.hostHeight));
+  if (right <= left || bottom <= top || zr <= 0) { return; }
+  constexpr float kRadius = 80, kMaxSpan = 0.15f;
+  const float height = float(bottom - top);
+  webgpu::OcclusionPacket packet{ds.id, p[9] != 0, {p[0], p[1], p[2], p[3], p[4] * zr, v.min_z + p[5] * zr, 0, 0,
+    float(left), float(top), float(right - left), height, kRadius, kMaxSpan * height, 0, 0, p[6], p[7], p[8], 0}};
+  impl_->initializeDepth(ds);
+  const auto result = impl_->sendPacket(webgpu::Opcode::Occlusion, rt.id, packet);
+  rt.dirty = true; rt.command = result.command; ++rt.version;
+}
 // native FilterShadows: the frame's own scene only, its depth at its size and samples, a non-empty viewport; the passes
 // grow with the integer render scale
 void MenuBackend::FilterShadows(const gpu::State& state, const float* p) {

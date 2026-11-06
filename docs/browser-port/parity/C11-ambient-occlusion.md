@@ -95,3 +95,35 @@ Backend (d3d12.cpp:2493-2522, then `DrawOcclusionPasses` d3d12.cpp:2471-2490):
 - HDR target formats themselves (C10).
 - Soft shadows that read the same depth (C09).
 - Any AO in versus (native hides it).
+
+## Implementation notes
+
+What C11 built.
+
+- Setting `ambientOcclusion` ('off', 'ssao', 'gtao'); host word 26 fills `ambient_occlusion` 0 to 2, read by the hook
+  on every call (live). Rows: Graphics tab "Ambient occlusion" (Off, SSAO, GTAO), in-game AMBIENT OCCLUSION.
+- `ambient_occlusion` is in the default hook list, compiled unchanged. Its `d3d::Occlusion`, the matrix check, the
+  parameters and the fog latch were already in place (hook-d3d.cpp, hook-graphics.cpp, covered by hook-d3d.test.mjs).
+- Service opcode `Occlusion` (25), `OcclusionPacket { depth, gtao, constants[20] }` (kAoHlsl's proj, zp, vp, opt,
+  fog). `kAoWgsl` is the native HLSL in WGSL with four entries (`occlusion`, `gtao`, `occlusion_blur`,
+  `occlusion_apply`): depth through a depth only view, stencil bit 0 through a stencil only `texture_2d<u32>` view,
+  multisampled variants reading sample 0 for 4x depth, rg16f pair at the scene's size, the apply multiplying colour
+  and keeping alpha into the scene (its HDR format and 4x companion when it has them). Passes cover the whole target
+  with the viewport rectangle as scissor.
+- `MenuBackend::Occlusion` replaces the throw with native's guards (the frame's own scene, depth at its host size and
+  samples, non-empty viewport, `max_z > min_z`), the rectangle in host pixels (radius 80, span 15% of its height),
+  then marks the scene drawn. The command is posted in order with the draws. `Supports` now answers true for every
+  effect.
+
+### Checked in the browser (out/parity, development start)
+
+- Off, SSAO and GTAO to world 60, and GTAO with MSAA 4x and HDR rendering: no validation errors; `drawnEffects`
+  counts the calls (about 3500 by world 60 with AO on, 0 with it off). In the cave cutscene at world 30 SSAO darkens the
+  rock creases; the sky stays as it is (stencil bit 0 is kept by the browser's depth path).
+- Perf (bench, one run each): off 16.2 / 16.4 ms mean (opening / control), SSAO 16.1 / 16.4, GTAO 16.1 / 16.4.
+
+### Not done
+
+The numeric reference against a JS port, the WGSL compile test in menu-shaders-browser.html (compiled in Chrome in the
+runs above), the MenuBackend packet sequence test (that harness already fails at HEAD), comparisons with native
+captures, and hiding the row in versus (C13).

@@ -6,7 +6,7 @@
 namespace browser::webgpu {
 constexpr uint32_t MaxBytes = 4 * 1024 * 1024;
 constexpr uint32_t ReadbackSlots = 4;
-enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17, ReadbackStart = 18, ReadbackCollect = 19, Blit = 20, Multisample = 21, SoftShadows = 22, ApplyShadows = 23, Resolve = 24 };
+enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17, ReadbackStart = 18, ReadbackCollect = 19, Blit = 20, Multisample = 21, SoftShadows = 22, ApplyShadows = 23, Resolve = 24, Occlusion = 25 };
 enum class Status : uint32_t { Ok, Error, Closed, Lost };
 struct Dimensions { uint32_t width, height; };
 // depth: 0 colour, 1 depth, 2 cube, 3 volume, 4 an empty HDR scene target (RGBA16, colour over a headroom)
@@ -60,6 +60,10 @@ static_assert(sizeof(BlitPacket) == 48);
 // what passes white, then tone mapping (tone 1) or bloom alone back to 0..1
 struct ResolvePacket { float blend; uint32_t tone; };
 static_assert(sizeof(ResolvePacket) == 8);
+// native's ambient occlusion over the scene (the resource) from its depth: kAoHlsl's proj, zp, vp (the pass's rectangle
+// in host pixels), opt and fog; SSAO, or GTAO for gtao 1
+struct OcclusionPacket { uint32_t depth, gtao; float constants[20]; };
+static_assert(sizeof(OcclusionPacket) == 88);
 // Chaos Theory's soft shadows over the scene (the resource): its depth, view z = zp.x / (depth - zp.y), the scene's
 // viewport in host pixels (vp), the copy's and the mask's sizes (sz.xy); the filtered shadow waits for ApplyShadows
 struct SoftShadowPacket {
