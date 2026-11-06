@@ -106,3 +106,16 @@ test('the simple settings pack normalises, persists and resets', () => {
   reloaded.reset();
   assert.equal(reloaded.get('frameCap'), 60);
 });
+
+test('MSAA offers off and 4x only: 2 and 8 become 4, garbage stays off; SMAA is a switch', () => {
+  const settings = createSettings({ storage: memory(JSON.stringify({ msaa: 8, smaa: 1 })) });
+  assert.equal(settings.get('msaa'), 4);
+  assert.equal(settings.get('smaa'), true);
+  settings.set('msaa', 2);
+  assert.equal(settings.get('msaa'), 4);
+  settings.set('msaa', 0);
+  assert.equal(settings.get('msaa'), 0);
+  settings.set('msaa', 'nonsense');
+  assert.equal(settings.get('msaa'), 0);
+  assert.equal(createSettings({ storage: memory(JSON.stringify({ msaa: 'x' })) }).get('msaa'), 0);
+});

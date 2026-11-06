@@ -59,6 +59,8 @@ const std::vector<Setting>& Settings() {
     {18, "anisotropy", "0", {{"0", "OFF"}, {"2", "2X"}, {"4", "4X"}, {"8", "8X"}, {"16", "16X"}}},
     {19, "language", "auto", {{"auto", "AUTOMATIC"}, {"int", "ENGLISH"}, {"fra", "FRANCAIS"}, {"deu", "DEUTSCH"}, {"ita", "ITALIANO"}, {"esp", "ESPANOL"}}},
     {20, "audioOutput", "stereo", {{"stereo", "2.0 STEREO"}, {"mono", "MONO"}}},
+    {21, "msaa", "0", {{"0", "OFF"}, {"4", "4X"}}},
+    {22, "smaa", "false", {}, true},
   };
   return list;
 }
@@ -85,6 +87,8 @@ constexpr Row kSettingsRows[] = {
   {Kind::Heading, -1, "GRAPHICS"},
   {Kind::Value, 2, "FPS COUNTER"},
   {Kind::Value, 18, "ANISOTROPIC FILTERING"},
+  {Kind::Value, 21, "MSAA"},
+  {Kind::Value, 22, "SMAA"},
   {Kind::Heading, -1, "GENERAL"},
   {Kind::Value, 3, "MASTER VOLUME"},
   {Kind::Value, 4, "SKIP INTROS"},

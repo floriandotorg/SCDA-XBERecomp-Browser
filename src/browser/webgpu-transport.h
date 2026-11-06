@@ -6,7 +6,7 @@
 namespace browser::webgpu {
 constexpr uint32_t MaxBytes = 4 * 1024 * 1024;
 constexpr uint32_t ReadbackSlots = 4;
-enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17, ReadbackStart = 18, ReadbackCollect = 19, Blit = 20 };
+enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17, ReadbackStart = 18, ReadbackCollect = 19, Blit = 20, Multisample = 21 };
 enum class Status : uint32_t { Ok, Error, Closed, Lost };
 struct Dimensions { uint32_t width, height; };
 struct TexturePacket { uint32_t width, height, depth; uint32_t levels = 1; };
@@ -16,6 +16,7 @@ struct PipelinePacket {
   uint32_t depth, depth_write, depth_compare;
   uint32_t stencil, stencil_compare, stencil_fail, stencil_depth_fail, stencil_pass, stencil_read_mask, stencil_write_mask;
   uint32_t cube_mask = 0, color_target = 1, shadow_mask = 0, vertex_mask = 0, volume_mask = 0;
+  uint32_t sample_count = 1;  // 4 when the draw's targets have multisampled companions
 };
 struct DrawPacket {
   uint32_t pipeline, texture[4], depth_target, vertex_count, index_count, index32, vertex_bytes, index_bytes, uniform_bytes;
@@ -39,7 +40,7 @@ struct DepthUploadPacket { uint32_t width, height, depth_bits, stencil_mask[8]; 
 static_assert(sizeof(DepthUploadPacket) == 44);
 struct ClearPacket { float color[4], depth; uint32_t stencil, flags, depth_target; uint32_t rect_count = 0; };
 // pillarbox: PresentPillarbox shows a 4:3 picture in the middle, PresentLinear samples the frame bilinearly
-enum : uint32_t { PresentPillarbox = 1, PresentLinear = 2 };
+enum : uint32_t { PresentPillarbox = 1, PresentLinear = 2, PresentSmaa = 4 };
 struct PresentPacket { uint32_t pillarbox; };
 // a source rectangle drawn over a destination rectangle (the resource): colour by box filtering taps x taps source
 // texels a pixel (bilinear for 0), depth by the nearest texel; force_opaque writes alpha 1 (X8 formats)
@@ -51,7 +52,7 @@ struct BlitPacket {
 static_assert(sizeof(BlitPacket) == 44);
 struct CopyPacket { uint32_t source, width, height; uint32_t source_x = 0, source_y = 0, destination_x = 0, destination_y = 0, force_opaque = 0; };
 static_assert(sizeof(CopyPacket) == 32);
-static_assert(sizeof(PipelinePacket) == 112);
+static_assert(sizeof(PipelinePacket) == 116);
 static_assert(sizeof(DrawPacket) == 252);
 static_assert(sizeof(ClearPacket) == 36);
 struct Result { Status status; uint32_t command, resource; std::vector<uint8_t> bytes; };

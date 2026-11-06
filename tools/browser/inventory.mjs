@@ -188,7 +188,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       paths.push('src/browser/render-snapshot.h', 'src/browser/render-snapshot.cpp', 'src/browser/menu-backend.h', 'src/browser/menu-backend.cpp', 'src/browser/shader-inventory.h',
         'src/browser/menu-shaders.h', 'src/browser/menu-shaders.cpp', 'src/browser/menu-pixel-shaders.h', 'src/browser/menu-pixel-shaders.cpp', 'src/browser/menu-texture.h', 'src/browser/menu-texture.cpp',
         'src/browser/menu-input.mjs', 'src/browser/gamepad-input.mjs', 'src/browser/input-bindings.mjs', 'src/browser/frame-shape.mjs', 'src/browser/console-model.mjs', 'src/browser/browser-audio.mjs', 'src/browser/audio-worklet.mjs', 'src/browser/webgpu-transport.h', 'src/browser/webgpu-transport.cpp', 'src/browser/webgpu-transport.mjs',
-        'src/browser/webgpu-service.cpp', 'src/browser/webgpu-service.mjs', 'src/browser/menu-runtime.mjs', 'src/browser/menu-shell.mjs', 'src/browser/settings.mjs',
+        'src/browser/webgpu-service.cpp', 'src/browser/webgpu-service.mjs', 'src/gpu/smaa_wgsl.h', 'src/gpu/smaa_textures.h', 'src/browser/menu-runtime.mjs', 'src/browser/menu-shell.mjs', 'src/browser/settings.mjs',
         'src/browser/menu.html', 'src/gpu/shaders.h', 'src/gpu/shaders.cpp', 'src/gpu/vertex.h');
     }
     paths.push('src/browser/virtual-memory.cpp', 'src/browser/virtual-memory.h');

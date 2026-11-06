@@ -279,6 +279,7 @@ struct MenuBackend::Impl {
     // the GPU texture's size: the guest's, or more for a screen sized target at a render scale
     uint32_t hostWidth = 0, hostHeight = 0;
     uint32_t lateSource = 0;  // the texture a late readback reads: the resource, or its console sized copy
+    bool multisampled = false;  // its GPU texture has a 4x companion the draws render into
     bool scaled() const { return hostWidth != desc.width || hostHeight != desc.height; }
   };
   Runtime& runtime;
@@ -321,7 +322,15 @@ struct MenuBackend::Impl {
   uint32_t canvasWidth = 0, canvasHeight = 0;
   std::function<MenuBackend::Output()> outputSource;
   float scale = 1;  // screen sized render targets are drawn this many times the guest's size
-  uint32_t anisotropy = 0, brightness = 50, contrast = 50;
+  uint32_t anisotropy = 0, brightness = 50, contrast = 50, msaa = 0;
+  bool smaa = false;
+  // native's MSAA rule: render targets of the back buffer's size, colour and depth, get the samples
+  void multisample(Resource& item) {
+    if (!msaa || item.multisampled || !item.renderTarget || item.desc.width != width || item.desc.height != height ||
+        item.desc.levels != 1 || item.desc.cube || item.desc.depth > 1) { return; }
+    sendPacket(webgpu::Opcode::Multisample, item.id, msaa);
+    item.multisampled = true;
+  }
   std::array<uint8_t, 768> guestRamp = [] { std::array<uint8_t, 768> ramp; for (size_t n = 0; n < ramp.size(); ++n) { ramp[n] = uint8_t(n % 256); } return ramp; }();
   void sendGamma() { send(webgpu::Opcode::SetGamma, 0, settings_pack::ComposeRamp(guestRamp.data(), brightness, contrast)); }
   std::pair<uint32_t, uint32_t> hostSize(const gpu::TextureDesc& desc, bool target) const {
@@ -358,6 +367,8 @@ struct MenuBackend::Impl {
       item.feedback = 0; item.feedbackVersion = 0; item.feedbackUsed = 0;
     }
     item.id = id; item.hostWidth = w; item.hostHeight = h; item.command = result.command; ++item.version;
+    item.multisampled = false;
+    multisample(item);
   }
   // a console sized copy of a scaled target for a readback, which the caller destroys
   uint32_t shrink(Resource& item) {
@@ -889,6 +900,7 @@ struct MenuBackend::Impl {
       resample(item, w, h);
     }
     item.renderTarget = true;
+    multisample(item);
     require(item.desc.data == address(value.data) && word(item.header, 12) == value.format && word(item.header, 16) == value.size, "menu backend stale or incompatible surface descriptor");
     return item;
   }
@@ -1160,6 +1172,7 @@ bool MenuBackend::Init(uint32_t width, uint32_t height) {
   require(width && height && width <= 4096 && height <= 4096, "menu backend target dimension budget exceeded");
   impl_->sendPacket(webgpu::Opcode::Configure, 0, webgpu::Dimensions{width, height});
   impl_->width = width; impl_->height = height; impl_->initialized = true;
+  if (impl_->outputSource) { impl_->msaa = impl_->outputSource().msaa == 4 ? 4 : 0; }
   impl_->canvasWidth = width; impl_->canvasHeight = height;
   return true;
 }
@@ -1377,6 +1390,8 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   webgpu::PipelinePacket pipeline{};
   pipeline.vertex_mask = raw ? rawMask | webgpu::ResidentVertexMask : budget.compactVertices ? regs : 0;
   pipeline.color_target = colorTarget != nullptr;
+  pipeline.sample_count = (colorTarget ? colorTarget->multisampled : depthTarget->multisampled) ? 4 : 1;
+  require(!colorTarget || !depthTarget || colorTarget->multisampled == depthTarget->multisampled, "menu backend draw targets disagree on multisampling");
   for (uint32_t n = 0; n < 4; ++n) { if (texinfo[n].kind == gpu::kTexCube) { pipeline.cube_mask |= 1u << n; } if (texinfo[n].shadow) { pipeline.shadow_mask |= 1u << n; } if (texinfo[n].kind == gpu::kTex3D) { pipeline.volume_mask |= 1u << n; } }
   pipeline.vertex_bytes = uint32_t(shaders.vertex.size()); pipeline.fragment_bytes = uint32_t(shaders.fragment.size());
   pipeline.topology = prim == 1 ? 1 : prim <= 4 ? 2 : 4;
@@ -1748,6 +1763,7 @@ void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
   const Output output = impl_->outputSource ? impl_->outputSource() : Output{};
   if (output.scale > 0) { impl_->applyScale(output.scale); }
   impl_->anisotropy = output.anisotropy;
+  impl_->smaa = output.smaa;
   if (output.brightness != impl_->brightness || output.contrast != impl_->contrast) {
     impl_->brightness = output.brightness; impl_->contrast = output.contrast;
     impl_->sendGamma();
@@ -1758,7 +1774,7 @@ void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
     impl_->canvasWidth = output.width;
     impl_->canvasHeight = output.height;
   }
-  const uint32_t flags = (pillarbox ? webgpu::PresentPillarbox : 0) | (output.linear ? webgpu::PresentLinear : 0);
+  const uint32_t flags = (pillarbox ? webgpu::PresentPillarbox : 0) | (output.linear ? webgpu::PresentLinear : 0) | (output.smaa ? webgpu::PresentSmaa : 0);
   const auto result = impl_->sendPacket(webgpu::Opcode::Present, item.id, webgpu::PresentPacket{flags});
   item.command = result.command; ++impl_->frames;
   if (impl_->metricsSink) {

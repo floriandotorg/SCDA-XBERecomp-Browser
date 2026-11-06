@@ -45,6 +45,8 @@ public:
     float scale = 1;
     uint32_t brightness = 50, contrast = 50;  // composed over the game's gamma ramp, 50 / 50 leaves it alone
     uint32_t anisotropy = 0;                  // forced anisotropic filtering, 0 as the game asks
+    uint32_t msaa = 0;                        // 4: screen sized targets multisample; taken once, at Init
+    bool smaa = false;                        // SMAA over the presented frame
   };
   void SetOutputSource(std::function<Output()> source);
   struct SnapshotData {

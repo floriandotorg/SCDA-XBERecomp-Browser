@@ -29,11 +29,14 @@ export const HOST_SETTINGS_FIELDS = Object.freeze([
   Object.freeze({ field: 'display_rate', key: 'displayRate', type: 'u32', word: 18, computed: true }),
   Object.freeze({ field: 'audio_output', key: 'audioOutput', type: 'u32', word: 19, values: Object.freeze(['auto', 'stereo', 'surround', 'mono']) }),
   Object.freeze({ field: 'language', key: 'bootLanguage', type: 'text', computed: true }),
+  // anti-aliasing (C08)
+  Object.freeze({ field: 'msaa', key: 'msaa', type: 'u32', word: 20 }),
+  Object.freeze({ field: 'smaa', key: 'smaa', type: 'bool', bit: 3 }),
   Object.freeze({ field: 'keys', key: 'keys', type: 'map' }),
   Object.freeze({ field: 'pad_buttons', key: 'padButtons', type: 'map' }),
   // browser settings the in-game options pages show and step (settings-rows.cpp), as host.<key>=<value> lines
   ...['scaling', 'filter', 'volume', 'showFps', 'skipIntros', 'pauseOnFocusLoss', 'sensitivity', 'weaponSensitivity',
-    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale', 'anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
+    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale', 'anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput', 'msaa', 'smaa'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
 ]);
 const REVISION = 0, SCHEMA = 1, FLAGS = 2;
 const ATTEMPTS = 1 << 16;

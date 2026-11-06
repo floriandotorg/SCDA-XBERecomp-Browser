@@ -19,6 +19,7 @@ constexpr BoolField kBools[] = {
   {kSkipIntrosBit, &app::Settings::skip_intros},
   {kPauseOnFocusLossBit, &app::Settings::pause_on_focus_loss},
   {kInvertMouseBit, &app::Settings::invert_mouse},
+  {kSmaaBit, &app::Settings::smaa},
 };
 struct FloatField {
   uint32_t word;
@@ -59,6 +60,7 @@ app::Settings Decode(const Snapshot& snapshot) {
   settings.contrast = std::min<uint32_t>(snapshot.words[kContrastWord], 100);
   settings.fps_cap = snapshot.words[kFpsCapWord];
   settings.audio_output = snapshot.words[kAudioOutputWord];
+  settings.msaa = snapshot.words[kMsaaWord] == 4 ? 4 : 0;
   if (snapshot.words[kRenderPercentWord]) { settings.render_percent = std::clamp<uint32_t>(snapshot.words[kRenderPercentWord], 20, 200); }
   hostValues.clear();
   std::string_view text = snapshot.text;

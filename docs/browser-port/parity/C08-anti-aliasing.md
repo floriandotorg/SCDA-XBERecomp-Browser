@@ -216,3 +216,44 @@ Then:
 - HDR rendering, tone mapping, ambient occlusion and the soft shadow filter itself (C09 uses the
   multisampled depth helper from task 9).
 - Reworking the browser front end beyond adding the two rows.
+
+## Implementation notes
+
+What C08 built.
+
+### MSAA
+
+- `msaa` (Off, 4x; 2 and 8 normalise to 4) on the new Graphics tab marked "next start", in-game GRAPHICS > MSAA;
+  host word 20, latched by `MenuBackend::Init` from the output source.
+- New service opcode `Multisample(resource, 4 | 1)` gives a texture a 4x companion (counted at 16 bytes a texel).
+  MenuBackend asks it for every render target of the back buffer's size, colour and depth, again after a C07
+  resample; `PipelinePacket::sample_count` (packet now 116 bytes) is 4 for draws into them.
+- Colour: draws and clears render into the companion with the texture as `resolveTarget`, so the single-sample
+  texture every other path reads (sampling, feedback and region copies, readbacks, presentation, SMAA) is resolved at
+  the end of each pass, rather than lazily. Depth: draws keep only the companion current and mark the texture
+  stale; any read of it (sampling, a blit source, a readback) first draws the companion's sample 0 into it
+  (`readable`).
+- Seeding: a copy, blit, depth import or the companion's creation marks the texture newer; the next pass into it
+  first draws it into every sample of the companion (`seed`), as native's blit pipelines with the target's samples.
+  Partial clears have 4x pipeline variants.
+
+### SMAA
+
+- `src/gpu/smaa_wgsl.h`: the reference SMAA ported to WGSL with native's configuration (luma edges with local
+  contrast adaptation, blending weights with diagonal search and corner detection, neighbourhood blending; licence
+  kept). Checked on a WebGPU page against the unmodified reference shader run in WebGL2 on seven synthetic images:
+  edges, weights and output byte-identical; flat areas unchanged, blended values strictly between the two colours.
+- `smaa` (Graphics tab, live; GRAPHICS > SMAA): `PresentSmaa` in the Present flags runs the three passes over the
+  presented texture at its host size into edges (rg8), weights and output (rgba8) targets kept at that size, then
+  the unchanged presentation pass applies the gamma ramp to the blended frame. Pipelines and the lookup textures are
+  made on the first enabled frame.
+
+### Checked in the browser (out/parity, development start, 1280x960)
+
+- MSAA 4x, and MSAA with SMAA: the mission and pause menu render with no validation errors; geometry edges visibly
+  smoother.
+
+### Not done
+
+- `wgpuDeviceCreateRenderPipelineAsync` for the SMAA pipelines (the first enabled frame compiles them in line).
+- Resolve and multisampled pass counters in Diagnostics; the perf harness runs; the 60 second soak.

@@ -36,6 +36,8 @@ const TABS = Object.freeze([
   ] },
   { id: 'graphics', label: 'Graphics', rows: [
     { setting: 'anisotropy', label: 'Anisotropic filtering', values: { 0: 'Off', 2: '2x', 4: '4x', 8: '8x', 16: '16x' } },
+    { setting: 'msaa', label: 'Multisampling (MSAA)', restart: true, values: { 0: 'Off', 4: '4x' } },
+    { setting: 'smaa', label: 'SMAA' },
   ] },
   { id: 'audio', label: 'Audio', rows: [
     { setting: 'volume', label: 'Master volume', format: value => `${value}%` },

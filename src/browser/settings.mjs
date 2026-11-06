@@ -14,6 +14,8 @@ export const SETTINGS = Object.freeze({
   contrast: Object.freeze({ initial: 50, min: 0, max: 100, step: 1 }),
   frameCap: Object.freeze({ initial: 60, options: Object.freeze([0, 30, 60]) }),
   anisotropy: Object.freeze({ initial: 0, options: Object.freeze([0, 2, 4, 8, 16]) }),
+  msaa: Object.freeze({ initial: 0, options: Object.freeze([0, 4]), coerce: value => Number(value) > 1 ? 4 : 0 }),
+  smaa: Object.freeze({ initial: false }),
   language: Object.freeze({ initial: 'auto', options: Object.freeze(['auto', 'int', 'fra', 'deu', 'ita', 'esp']) }),
   audioOutput: Object.freeze({ initial: 'stereo', options: Object.freeze(['stereo', 'mono']) }),
   resolution: Object.freeze({ initial: 'console', options: Object.freeze(['console', 'window', 'dynamic']) }),
@@ -37,6 +39,7 @@ export const SETTINGS = Object.freeze({
 const normalize = (name, value) => {
   const setting = SETTINGS[name];
   if (setting.map) { return value && typeof value === 'object' && !Array.isArray(value) ? Object.freeze(setting.map(value)) : undefined; }
+  if (setting.coerce && value !== undefined && value !== null && Number.isFinite(Number(value))) { return setting.coerce(value); }
   if (setting.options) { return setting.options.includes(value) ? value : undefined; }
   if (typeof setting.initial === 'boolean') { return typeof value === 'boolean' || typeof value === 'number' ? Boolean(value) : undefined; }
   const number = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
