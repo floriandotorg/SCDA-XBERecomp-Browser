@@ -4,6 +4,8 @@ import { createWasmIsoReader } from './iso-wasm.mjs';
 import { prepareDiscImage } from './iso-image.mjs';
 import { readMenuStateDiagnostic, readMenuFileDiagnostics } from './menu-state-report.mjs';
 import { createHostSettingsView, validateHostSettings, writeHostSettings, HOST_SETTINGS_SPAN, HOST_SETTINGS_WORDS } from './host-settings.mjs';
+import { KEYBOARD_INPUT } from './keyboard-input.mjs';
+import { HOST_MESSAGES_WORDS } from './host-messages.mjs';
 
 const requireBuildIdentity = (module, manifest) => {
   const reject = () => {
@@ -245,9 +247,13 @@ const readInputDescriptor = (module) => {
   if (settingsOffset && module._image_settings_words?.() !== HOST_SETTINGS_WORDS) { reject(); }
   const hookStatusOffset = span(module._image_hook_status_address?.() ?? 0, 32);
   if (hookStatusOffset && module._image_hook_status_words?.() !== 8) { reject(); }
+  const keyboardOffset = span(module._image_keyboard_address?.() ?? 0, KEYBOARD_INPUT.words * 4);
+  if (keyboardOffset && module._image_keyboard_words?.() !== KEYBOARD_INPUT.words) { reject(); }
+  const messagesOffset = span(module._image_messages_address?.() ?? 0, HOST_MESSAGES_WORDS * 4);
+  if (messagesOffset && module._image_messages_words?.() !== HOST_MESSAGES_WORDS) { reject(); }
   const spans = [[motionOffset, 20], [metricsOffset, MISSION_METRICS_WORDS * 4], [audioOffset, 32],
     [audioSamplesOffset, AUDIO_FRAMES * AUDIO_CHANNELS * 4], [gamepadOffset, 32], [settingsOffset, HOST_SETTINGS_SPAN],
-    [hookStatusOffset, 32]].filter(([offset]) => offset);
+    [hookStatusOffset, 32], [keyboardOffset, KEYBOARD_INPUT.words * 4], [messagesOffset, HOST_MESSAGES_WORDS * 4]].filter(([offset]) => offset);
   for (let n = 0; n < spans.length; ++n) {
     const [offset, size] = spans[n];
     for (const [other, bytes] of spans.slice(n + 1)) {
@@ -256,7 +262,8 @@ const readInputDescriptor = (module) => {
   }
   return { buffer, byteOffset, words, ...(motionOffset ? { motionOffset } : {}), ...(metricsOffset ? { metricsOffset } : {}),
     ...(audioOffset ? { audioOffset, audioSamplesOffset } : {}), ...(gamepadOffset ? { gamepadOffset } : {}),
-    ...(settingsOffset ? { settingsOffset } : {}), ...(hookStatusOffset ? { hookStatusOffset } : {}) };
+    ...(settingsOffset ? { settingsOffset } : {}), ...(hookStatusOffset ? { hookStatusOffset } : {}),
+    ...(keyboardOffset ? { keyboardOffset } : {}), ...(messagesOffset ? { messagesOffset } : {}) };
 };
 
 const readGameHooks = (module) => {

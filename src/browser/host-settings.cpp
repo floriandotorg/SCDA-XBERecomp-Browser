@@ -1,6 +1,8 @@
 #include "browser/host-settings.h"
 #include "app/app.h"
 #include <algorithm>
+#include <bit>
+#include <map>
 #include <cmath>
 #include <string_view>
 #include <thread>
@@ -16,7 +18,19 @@ struct BoolField {
 constexpr BoolField kBools[] = {
   {kSkipIntrosBit, &app::Settings::skip_intros},
   {kPauseOnFocusLossBit, &app::Settings::pause_on_focus_loss},
+  {kInvertMouseBit, &app::Settings::invert_mouse},
 };
+struct FloatField {
+  uint32_t word;
+  float app::Settings::*field;
+};
+constexpr FloatField kFloats[] = {
+  {kMouseSensitivityWord, &app::Settings::mouse_sensitivity},
+  {kFreeLookSensitivityWord, &app::Settings::free_look_sensitivity},
+  {kWeaponSensitivityWord, &app::Settings::weapon_sensitivity},
+  {kSniperSensitivityWord, &app::Settings::sniper_sensitivity},
+};
+thread_local std::map<std::string, std::string, std::less<>> hostValues;
 
 void ApplyLine(app::Settings& settings, std::string_view line) {
   const size_t equals = line.find('=');
@@ -26,12 +40,19 @@ void ApplyLine(app::Settings& settings, std::string_view line) {
   if (name == "language") { settings.language = value; }
   else if (name.starts_with("keys.")) { settings.keys[std::string(entry("keys."))] = value; }
   else if (name.starts_with("pad_buttons.")) { settings.pad_buttons[std::string(entry("pad_buttons."))] = value; }
+  else if (name.starts_with("host.")) { hostValues[std::string(entry("host."))] = value; }
 }
 
 app::Settings Decode(const Snapshot& snapshot) {
   app::Settings settings;
   if (snapshot.words[kSchemaWord] != kSchema) { return settings; }
   for (const auto& entry : kBools) { settings.*entry.field = (snapshot.words[kFlagsWord] >> entry.bit) & 1; }
+  // an unsent scalar is 0, which no setting takes: the default stays
+  for (const auto& entry : kFloats) {
+    const float value = std::bit_cast<float>(snapshot.words[entry.word]);
+    if (snapshot.words[entry.word] && std::isfinite(value)) { settings.*entry.field = value; }
+  }
+  hostValues.clear();
   std::string_view text = snapshot.text;
   while (!text.empty()) {
     const size_t end = text.find('\n');
@@ -40,6 +61,12 @@ app::Settings Decode(const Snapshot& snapshot) {
   }
   return settings;
 }
+}
+
+std::string HostValue(std::string_view key) {
+  app::Get();
+  const auto found = hostValues.find(key);
+  return found == hostValues.end() ? std::string() : found->second;
 }
 
 Block& Shared() {
@@ -101,6 +128,23 @@ float Aspect() { return 4.0f / 3.0f; }
 float FovScale() {
   constexpr double kRadians = 3.14159265358979323846 / 360.0;
   return float(std::tan(Get().fov * kRadians) / std::tan(75 * kRadians));
+}
+
+}
+
+namespace app {
+
+// "auto" is the browser's language when the game has it (the page sends it resolved), English otherwise
+std::string ResolveLanguage(const std::string& setting) {
+  for (const char* language : kLanguages) {
+    if (setting == language) { return setting; }
+  }
+  return "int";
+}
+
+const std::string& BootLanguage() {
+  static const std::string language = ResolveLanguage(Get().language);
+  return language;
 }
 
 }

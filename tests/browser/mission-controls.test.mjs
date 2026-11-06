@@ -10,14 +10,14 @@ const fixture = async () => {
   const words = new Int32Array(buffer, 4, 5);
   const document = new EventTarget();
   const window = new EventTarget();
-  const canvas = { focus() {}, requestPointerLock: async () => { document.pointerLockElement = canvas; document.dispatchEvent(new Event('pointerlockchange')); } };
+  const canvas = { focus() {}, requestPointerLock: async options => { canvas.options = options; document.pointerLockElement = canvas; document.dispatchEvent(new Event('pointerlockchange')); } };
   const capture = new EventTarget();
-  const settings = { sensitivity: 1, invertY: false, pauseOnFocusLoss: true };
+  const settings = { pauseOnFocusLoss: true, free: false };
   document.hidden = false;
   document.hasFocus = () => true;
   document.exitPointerLock = () => { document.pointerLockElement = null; document.dispatchEvent(new Event('pointerlockchange')); };
   let now = 100, cleared = 0;
-  const controls = createMissionControls({ buffer, byteOffset: 4, document, window, canvas, capture, sensitivity: () => settings.sensitivity, invertY: () => settings.invertY, pauseOnFocusLoss: () => settings.pauseOnFocusLoss, now: () => now, clear: () => { ++cleared; } });
+  const controls = createMissionControls({ buffer, byteOffset: 4, document, window, canvas, capture, pauseOnFocusLoss: () => settings.pauseOnFocusLoss, pointerFree: () => settings.free, now: () => now, clear: () => { ++cleared; } });
   const move = (movementX, movementY) => {
     const event = new Event('mousemove');
     Object.assign(event, { movementX, movementY });
@@ -25,29 +25,32 @@ const fixture = async () => {
   };
   return { controls, words, document, window, canvas, capture, settings, move, advance: value => { now += value; }, cleared: () => cleared };
 };
-test('relative motion needs gesture lock and sensitivity, unlock clears deltas and keyboard', async () => {
+test('a click locks the pointer for raw counts, never while a game menu frees the cursor, and unlocking clears the keyboard', async () => {
   const f = await fixture();
-  f.move(10, 20);
-  assert.deepEqual([...f.words].slice(0, 3), [0, 0, 0]);
+  f.settings.free = true;
   f.capture.dispatchEvent(new Event('click'));
   await Promise.resolve();
-  f.settings.sensitivity = 2;
-  f.move(1.5, -3);
-  assert.deepEqual([...f.words].slice(0, 2), [3000, -6000]);
+  assert.equal(f.document.pointerLockElement, undefined);
+  f.settings.free = false;
+  f.capture.dispatchEvent(new Event('click'));
+  await Promise.resolve();
+  assert.equal(f.document.pointerLockElement, f.canvas);
+  assert.deepEqual(f.canvas.options, { unadjustedMovement: true });
   f.document.exitPointerLock();
-  assert.deepEqual([...f.words].slice(0, 2), [0, 0]);
   assert.ok(f.cleared() > 0);
-  f.move(20, 20);
-  assert.equal(f.words[0], 0);
   f.controls.dispose();
 });
-test('inverted look negates vertical motion only', async () => {
+test('without raw counts the plain lock is taken', async () => {
   const f = await fixture();
+  const granted = f.canvas.requestPointerLock;
+  f.canvas.requestPointerLock = async options => {
+    if (options) { throw new Error('NotSupportedError'); }
+    await granted(options);
+  };
   f.capture.dispatchEvent(new Event('click'));
-  await Promise.resolve();
-  f.settings.invertY = true;
-  f.move(2, 3);
-  assert.deepEqual([...f.words].slice(0, 2), [2000, -3000]);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(f.document.pointerLockElement, f.canvas);
+  assert.equal(f.canvas.options, undefined);
   f.controls.dispose();
 });
 test('suspending holds the simulation like a background window and releases the pointer', async () => {
@@ -70,7 +73,6 @@ test('background duration is bounded shared state and focus resumes without repl
   const f = await fixture();
   f.capture.dispatchEvent(new Event('click'));
   await Promise.resolve();
-  f.move(1, 2);
   f.window.dispatchEvent(new Event('blur'));
   assert.equal(f.words[2], 1);
   assert.equal(f.words[3], 100);
@@ -86,8 +88,6 @@ test('background duration is bounded shared state and focus resumes without repl
   assert.equal(f.words[2], 0);
   assert.equal(f.words[4], 70000);
   assert.equal(f.document.pointerLockElement, null);
-  f.move(1, 1);
-  assert.equal(f.words[0], 0);
   f.controls.dispose();
 });
 test('denial recovers, abort removes listeners, malformed and overlapping storage rejects', async () => {
@@ -125,26 +125,12 @@ test('a late pointer lock grant cannot recapture after its controls retire', asy
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(f.document.pointerLockElement, null);
 });
-test('Escape explicitly releases pointer capture and pending movement', async () => {
-  const f = await fixture();
-  f.capture.dispatchEvent(new Event('click'));
-  await Promise.resolve();
-  f.move(3, 4);
-  const event = new Event('keydown', { cancelable: true });
-  Object.assign(event, { code: 'Escape' });
-  f.window.dispatchEvent(event);
-  assert.equal(f.document.pointerLockElement, null);
-  assert.deepEqual([...f.words].slice(0, 2), [0, 0]);
-  f.controls.dispose();
-});
 test('with pause on focus loss off a blur keeps the world running while hidden tabs and suspension still pause', async () => {
   const f = await fixture();
   f.settings.pauseOnFocusLoss = false;
   f.controls.refresh();
   f.window.dispatchEvent(new Event('blur'));
   assert.equal(f.words[2], 0);
-  f.move(5, 5);
-  assert.equal(f.words[0], 0, 'an unfocused window still delivered mouse motion');
   f.document.hidden = true;
   f.document.dispatchEvent(new Event('visibilitychange'));
   assert.equal(f.words[2], 1);

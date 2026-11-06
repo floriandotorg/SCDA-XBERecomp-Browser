@@ -7,6 +7,16 @@ export const HOST_SETTINGS_SPAN = HOST_SETTINGS_WORDS * 4 + HOST_SETTINGS_BYTES;
 export const HOST_SETTINGS_FIELDS = Object.freeze([
   Object.freeze({ field: 'skip_intros', key: 'skipIntros', type: 'bool', bit: 0 }),
   Object.freeze({ field: 'pause_on_focus_loss', key: 'pauseOnFocusLoss', type: 'bool', bit: 1 }),
+  Object.freeze({ field: 'invert_mouse', key: 'invertY', type: 'bool', bit: 2 }),
+  Object.freeze({ field: 'mouse_sensitivity', key: 'sensitivity', type: 'f32', word: 3 }),
+  Object.freeze({ field: 'free_look_sensitivity', key: 'sensitivity', type: 'f32', word: 4 }),
+  Object.freeze({ field: 'weapon_sensitivity', key: 'weaponSensitivity', type: 'f32', word: 5 }),
+  Object.freeze({ field: 'sniper_sensitivity', key: 'sniperSensitivity', type: 'f32', word: 6 }),
+  Object.freeze({ field: 'keys', key: 'keys', type: 'map' }),
+  Object.freeze({ field: 'pad_buttons', key: 'padButtons', type: 'map' }),
+  // browser settings the in-game options pages show and step (settings-rows.cpp), as host.<key>=<value> lines
+  ...['scaling', 'filter', 'volume', 'showFps', 'skipIntros', 'pauseOnFocusLoss', 'sensitivity', 'weaponSensitivity',
+    'sniperSensitivity', 'invertY'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
 ]);
 const REVISION = 0, SCHEMA = 1, FLAGS = 2;
 const ATTEMPTS = 1 << 16;
@@ -21,6 +31,7 @@ export const encodeHostSettings = values => {
   for (const entry of HOST_SETTINGS_FIELDS) {
     const value = values?.[entry.key];
     const invalid = () => fail(`Invalid host setting ${entry.key}.`);
+    if (value === undefined) { continue; }
     if (entry.type === 'bool') {
       if (typeof value !== 'boolean') { invalid(); }
       if (value) { words[FLAGS] |= 1 << entry.bit; }
@@ -32,6 +43,9 @@ export const encodeHostSettings = values => {
       words[entry.word] = new Uint32Array(Float32Array.of(value).buffer)[0];
     } else if (entry.type === 'text') {
       if (typeof value !== 'string' || /[\n=\0]/.test(value)) { invalid(); }
+      lines.push(`${entry.field}=${value}`);
+    } else if (entry.type === 'host') {
+      if (!['string', 'number', 'boolean'].includes(typeof value) || /[\n=\0]/.test(String(value))) { invalid(); }
       lines.push(`${entry.field}=${value}`);
     } else if (entry.type === 'map') {
       if (!value || typeof value !== 'object') { invalid(); }

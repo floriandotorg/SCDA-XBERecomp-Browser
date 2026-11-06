@@ -41,7 +41,7 @@ test('standard gamepad preserves signed analog sticks and original controller bu
   assert.equal(value.words[2], MENU_INPUT.confirm | MENU_INPUT.back | MENU_INPUT.x | MENU_INPUT.y | MENU_INPUT.white | MENU_INPUT.black |
     MENU_INPUT.leftTrigger | MENU_INPUT.rightTrigger | MENU_INPUT.select | MENU_INPUT.start | MENU_INPUT.leftThumb | MENU_INPUT.rightThumb | MENU_INPUT.up | MENU_INPUT.right);
   assert.deepEqual([...value.words.slice(3, 7)], [16384, 8192, -32767, -32767]);
-  assert.equal(value.words[7], 0);
+  assert.equal(value.words[7], (0xffff & ~(1 << 9) & ~(1 << 10)) | (255 << 16) | (255 << 24), 'physical buttons in kPadNames order');
   assert.equal(value.whole[0], 0x12345678);
   assert.equal(value.whole[10], 0x12345678);
   const sequence = value.words[0];

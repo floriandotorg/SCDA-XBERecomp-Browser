@@ -4,9 +4,14 @@ import { createMissionMetrics } from './mission-metrics.mjs';
 import { createMissionControls } from './mission-controls.mjs';
 import { createBrowserAudio } from './browser-audio.mjs';
 import { createSettings, SETTINGS } from './settings.mjs';
+import { ACTIONS, PAD_ACTIONS, PAD_BUTTONS, keyNamed, keyOfButton, keyOfVk, keyOfWheel, vkOfCode } from './input-actions.mjs';
+import { bind, bindPad, keyBinding, label as keyLabel, padBinding } from './input-bindings.mjs';
+import { createWheelAccumulator } from './keyboard-input.mjs';
 
 const FRAME = Object.freeze({ width: 640, height: 480 });
 const onOff = Object.freeze({ true: 'On', false: 'Off' });
+const KEEP_CAPS = new Set(['EEV', 'OPSAT', 'EMF', 'HUD', 'COOP', 'LS', 'RS', 'LB', 'RB', 'LT', 'RT']);
+const sentence = text => text.split(' ').map((word, n) => KEEP_CAPS.has(word) ? word : n ? word.toLowerCase() : word[0] + word.slice(1).toLowerCase()).join(' ');
 const TABS = Object.freeze([
   { id: 'display', label: 'Display', rows: [
     { setting: 'scaling', label: 'Picture', values: { fit: 'Fit to window', integer: 'Pixel perfect', stretch: 'Stretch' } },
@@ -15,11 +20,18 @@ const TABS = Object.freeze([
   ] },
   { id: 'audio', label: 'Audio', rows: [{ setting: 'volume', label: 'Master volume', format: value => `${value}%` }] },
   { id: 'controls', label: 'Controls', rows: [
-    { setting: 'sensitivity', label: 'Mouse sensitivity', format: value => value.toFixed(1) },
+    { setting: 'sensitivity', label: 'Free look sensitivity', format: value => value.toFixed(1) },
+    { setting: 'weaponSensitivity', label: 'Weapon sensitivity', format: value => value.toFixed(1) },
+    { setting: 'sniperSensitivity', label: 'Sniper sensitivity', format: value => value.toFixed(1) },
     { setting: 'invertY', label: 'Invert look' },
-  ], keys: [['Move', 'W A S D'], ['Look', 'Mouse'], ['Confirm', 'Space / Z'], ['Back', 'Esc / Backspace'], ['Game pause', 'Enter'],
-    ['Settings', 'F1 / P'], ['Crouch', 'C'], ['Jump', 'Shift'], ['Back to wall', 'F'], ['Scope', '1'], ['Vision and gadgets', '2 3 4 5'],
-    ['OPSAT', 'Tab'], ['X / Y', 'X / Y'], ['Black / White', 'Q / E'], ['Triggers', '[ / ]'], ['Navigate', 'Arrows']] },
+    { heading: 'Keyboard and mouse' },
+    ...ACTIONS.filter(action => !action.hidden).map(action => ({ bind: action.id, label: sentence(action.label) })),
+    { reset: 'keys', label: 'Restore defaults' },
+  ] },
+  { id: 'controller', label: 'Controller', rows: [
+    ...PAD_ACTIONS.filter(action => !action.hidden).map(action => ({ padBind: action.id, label: sentence(action.label) })),
+    { reset: 'padButtons', label: 'Restore defaults' },
+  ] },
   { id: 'game', label: 'Game', rows: [
     { setting: 'skipIntros', label: 'Skip intros' },
     { setting: 'pauseOnFocusLoss', label: 'Pause when unfocused' },
@@ -69,7 +81,10 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   let canvas = find('#game');
   let screen = 'title', panel = 'none', settingsReturn = 'none', tab = TABS[0].id;
   let presented = false, dismissed = false, quitting = false, pickToStart = false;
-  let handle, motion, audio, idleTimer, padFrame, padPrevious = new Set();
+  let handle, motion, audio, keyboard, idleTimer, padFrame, padPrevious = new Set();
+  let capture, layoutMap;
+  const captureWheel = createWheelAccumulator();
+  void globalThis.navigator?.keyboard?.getLayoutMap?.().then(map => { layoutMap = map; if (panel === 'settings') { refreshRows(); } }).catch(() => {});
   let started = 0, lastUpdated = 0, fpsFrames = 0, fpsSince = 0;
   const measurement = createMissionMetrics();
   const createEvidence = () => ({ developmentStart: settings.get('developmentStart'), renderedFrames: 0, firstPresentedFrameMilliseconds: null,
@@ -131,8 +146,24 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     settings.set(row.setting, options[(index + direction + options.length) % options.length]);
   };
   const rowsOf = () => TABS.find(entry => entry.id === tab);
+  const slotText = (row, slot) => {
+    if (capture && capture.id === (row.bind ?? row.padBind) && capture.slot === slot && capture.pad === Boolean(row.padBind)) {
+      return row.padBind ? 'Press a button' : 'Press a key';
+    }
+    if (row.padBind) {
+      const button = padBinding(settings.get('padButtons'), row.padBind);
+      return button >= 0 ? PAD_BUTTONS[button].name : 'Unbound';
+    }
+    const name = keyBinding(settings.get('keys'), row.bind)[slot];
+    return name ? keyLabel(name, layoutMap) : slot ? '' : 'Unbound';
+  };
   const refreshRows = () => {
-    for (const element of rowList.querySelectorAll('[data-row]')) {
+    for (const element of rowList.querySelectorAll('[data-slot]')) {
+      const row = rowsOf().rows[Number(element.dataset.row)];
+      element.textContent = slotText(row, Number(element.dataset.slot));
+      element.toggleAttribute('data-waiting', Boolean(capture && capture.element === element));
+    }
+    for (const element of rowList.querySelectorAll('[data-row]:not([data-slot]):not([data-reset])')) {
       const row = rowsOf().rows[Number(element.dataset.row)];
       if (row.format) {
         const setting = SETTINGS[row.setting], value = settings.get(row.setting);
@@ -154,11 +185,38 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     }));
     const current = rowsOf();
     rowList.replaceChildren(...current.rows.map((row, index) => {
-      const line = root.createElement('label');
-      line.className = 'row';
+      const line = root.createElement(row.bind || row.padBind || row.reset ? 'div' : 'label');
+      line.className = row.heading ? 'row heading' : 'row';
       const name = root.createElement('span');
-      name.textContent = row.label;
-      if (row.format) {
+      name.textContent = row.label ?? row.heading;
+      if (row.heading) {
+        line.append(name);
+      } else if (row.reset) {
+        const button = root.createElement('button');
+        Object.assign(button, { type: 'button', className: 'slot', textContent: 'Restore' });
+        button.dataset.nav = '';
+        button.dataset.row = String(index);
+        button.dataset.reset = row.reset;
+        button.addEventListener('click', () => { stopCapture(); settings.set(row.reset, {}); });
+        line.append(name, button);
+      } else if (row.bind || row.padBind) {
+        const slots = root.createElement('div');
+        slots.className = row.padBind ? 'binds single' : 'binds';
+        for (let slot = 0; slot < (row.padBind ? 1 : 2); ++slot) {
+          const button = root.createElement('button');
+          Object.assign(button, { type: 'button', className: 'slot' });
+          button.dataset.nav = '';
+          button.dataset.row = String(index);
+          button.dataset.slot = String(slot);
+          button.addEventListener('click', event => {
+            if (capture) { return; }
+            event.stopPropagation();
+            startCapture(row, slot, button);
+          });
+          slots.append(button);
+        }
+        line.append(name, slots);
+      } else if (row.format) {
         const setting = SETTINGS[row.setting];
         const holder = root.createElement('div');
         holder.className = 'slider';
@@ -185,20 +243,67 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       }
       return line;
     }));
-    if (current.keys) {
-      const list = root.createElement('div');
-      list.className = 'keys';
-      list.append(...current.keys.map(([action, keys]) => {
-        const entry = root.createElement('div');
-        const label = root.createElement('span'), key = root.createElement('kbd');
-        label.textContent = action;
-        key.textContent = keys;
-        entry.append(label, key);
-        return entry;
-      }));
-      rowList.append(list);
-    }
     refreshRows();
+  };
+  // a binding slot waits for the next key, mouse button, wheel notch or controller button; Escape cancels, Delete
+  // clears
+  const stopCapture = () => {
+    if (!capture) { return; }
+    capture = undefined;
+    refreshRows();
+  };
+  const startCapture = (row, slot, element) => {
+    capture = { id: row.bind ?? row.padBind, slot, pad: Boolean(row.padBind), element, armed: false };
+    refreshRows();
+    setTimeout(() => { if (capture) { capture.armed = true; } }, 0);
+  };
+  const answerKey = name => {
+    const current = capture;
+    stopCapture();
+    if (current.pad) {
+      if (name === '') { settings.set('padButtons', bindPad(settings.get('padButtons'), current.id, -1)); }
+      return;
+    }
+    settings.set('keys', bind(settings.get('keys'), current.id, name, current.slot));
+    current.element?.focus({ preventScroll: true });
+  };
+  const captureKey = event => {
+    if (!capture?.armed) { return false; }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (event.code === 'Escape') { stopCapture(); return true; }
+    if (event.code === 'Delete') { answerKey(''); return true; }
+    const key = keyOfVk(vkOfCode(event.code));
+    if (key && !capture.pad) { answerKey(key.name); }
+    return true;
+  };
+  const captureMouse = event => {
+    if (!capture?.armed || capture.pad) { return; }
+    const key = keyOfButton(event.button);
+    if (!key) { return; }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    answerKey(key.name);
+  };
+  const captureWheelEvent = event => {
+    if (!capture?.armed || capture.pad) { return; }
+    event.preventDefault();
+    const notches = captureWheel(event.deltaY, event.deltaMode);
+    if (notches) { answerKey(keyOfWheel(notches).name); }
+  };
+  const capturePad = pressed => {
+    if (!capture?.armed || !capture.pad) { return false; }
+    const button = PAD_BUTTONS.find(entry => pressed.has(entry.index));
+    if (!button) { return true; }
+    const current = capture;
+    stopCapture();
+    settings.set('padButtons', bindPad(settings.get('padButtons'), current.id, button.button));
+    current.element?.focus({ preventScroll: true });
+    return true;
+  };
+  const settingsPanelKey = event => {
+    const vk = vkOfCode(event.code);
+    return Boolean(vk) && keyBinding(settings.get('keys'), 'settings_panel').some(name => keyNamed(name)?.vk === vk);
   };
   const selectTab = (id, focus = true) => {
     tab = id;
@@ -234,7 +339,12 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     if (x < -0.6) { pressed.add('left'); }
     if (x > 0.6) { pressed.add('right'); }
     const fresh = (...keys) => keys.some(key => pressed.has(key) && !padPrevious.has(key));
+    const freshButtons = new Set([...pressed].filter(key => typeof key === 'number' && !padPrevious.has(key)));
     padPrevious = pressed;
+    if (capture?.pad) {
+      if (freshButtons.size) { capturePad(freshButtons); }
+      return;
+    }
     if (fresh(12, 'up')) { moveFocus(-1); }
     if (fresh(13, 'down')) { moveFocus(1); }
     if (fresh(14, 'left')) { adjust(-1, true); }
@@ -252,6 +362,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     pauseLayer.classList.toggle('shown', panel === 'pause');
     settingsLayer.classList.toggle('shown', panel === 'settings');
     fps.hidden = !(settings.get('showFps') && screen === 'game');
+    keyboard?.setHost({ panel: panel !== 'none' });
+    keyboard?.setActive(screen === 'game' && panel === 'none');
     motion?.setSuspended(screen === 'game' && panel !== 'none');
     if (activeLayer() && padFrame === undefined) { padFrame = window.requestAnimationFrame(pollPad); }
   };
@@ -282,7 +394,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     void controller.stop();
   };
   const back = () => {
-    if (panel === 'settings') { setPanel(settingsReturn); }
+    if (capture) { stopCapture(); return; }
+    if (panel === 'settings') { stopCapture(); setPanel(settingsReturn); }
     else if (panel === 'pause') { resume(); }
     else if (screen === 'error') { dismissed = true; render(controller.state); }
   };
@@ -303,8 +416,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   };
 
   const createMotion = options => {
-    motion = createMissionControls({ ...options, canvas, capture: stage,
-      sensitivity: () => settings.get('sensitivity'), invertY: () => settings.get('invertY'), pauseOnFocusLoss: () => settings.get('pauseOnFocusLoss') });
+    motion = createMissionControls({ ...options, canvas, capture: stage, pauseOnFocusLoss: () => settings.get('pauseOnFocusLoss') });
     motion.setSuspended(screen === 'game' && panel !== 'none');
     return motion;
   };
@@ -314,6 +426,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   };
   const controller = createShellController({ onChange: state => render(state), createRuntime: () => createMenuRuntime({
     developmentStart: settings.get('developmentStart'), settings, createMotion, createAudio,
+    onKeyboard: value => { keyboard = value; show(); },
     acquireCanvas: () => {
       if (!globalThis.navigator?.gpu || typeof canvas.transferControlToOffscreen !== 'function') {
         throw Object.assign(new Error('WebGPU and an offscreen canvas are required in this browser.'), { code: 'CAPABILITY' });
@@ -409,7 +522,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     else if (action === 'dismiss') { back(); }
   };
   const keydown = event => {
-    const settingsKey = event.code === 'F1' || event.code === 'KeyP';
+    if (captureKey(event)) { return; }
+    const settingsKey = settingsPanelKey(event) && !keyboard?.capturing();
     if (screen === 'game' && panel === 'none') {
       if (settingsKey) {
         event.preventDefault();
@@ -430,6 +544,11 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     } else if (event.code === 'Escape' || event.code === 'Backspace') {
       event.preventDefault();
       back();
+    } else if (event.code === 'Delete' && element?.dataset.slot !== undefined) {
+      event.preventDefault();
+      const row = rowsOf().rows[Number(element.dataset.row)];
+      if (row.padBind) { settings.set('padButtons', bindPad(settings.get('padButtons'), row.padBind, -1)); }
+      else { settings.set('keys', bind(settings.get('keys'), row.bind, '', Number(element.dataset.slot))); }
     } else if (settingsKey && screen === 'game' && element?.type !== 'range') {
       event.preventDefault();
       resume();
@@ -475,6 +594,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   root.addEventListener('fullscreenchange', fullscreen);
   window.addEventListener('keydown', keydown, true);
   window.addEventListener('keyup', keyup, true);
+  window.addEventListener('mousedown', captureMouse, true);
+  window.addEventListener('wheel', captureWheelEvent, { capture: true, passive: false });
   window.addEventListener('resize', layout);
   layout();
   showDiagnostics();
@@ -502,12 +623,15 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       root.removeEventListener('fullscreenchange', fullscreen);
       window.removeEventListener('keydown', keydown, true);
       window.removeEventListener('keyup', keyup, true);
+      window.removeEventListener('mousedown', captureMouse, true);
+      window.removeEventListener('wheel', captureWheelEvent, { capture: true, passive: false });
       window.removeEventListener('resize', layout);
       await controller.stop();
     },
     beginMeasurement: () => { measurement.begin(); },
     get measurement() { return measurement.snapshot(); },
     get evidence() { return evidence; },
+    get input() { return keyboard?.snapshot(); },
     get audio() { return audio?.snapshot(); },
   });
 };

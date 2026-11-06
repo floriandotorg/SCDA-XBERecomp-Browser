@@ -207,9 +207,6 @@ int contracts() {
     gamepad[2].store(0x80000000);
     unsafeState(0x22000, 0x20000);
     gamepad[2].store(0);
-    gamepad[7].store(1);
-    unsafeState(0x22000, 0x20000);
-    gamepad[7].store(0);
     gamepad[1].store(0);
     ctx.esp = 0xfffffff8;
     rejects([&] { input->Dispatch(ctx, base, 43); });

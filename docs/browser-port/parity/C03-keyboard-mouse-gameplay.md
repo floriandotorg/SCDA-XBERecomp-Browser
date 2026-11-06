@@ -207,3 +207,72 @@ supplies its own implementation of `src/core/input.h`.
 - Key rebinding UI, persistence and controller remapping (C05).
 - Keyboard legends and tutorial text (C04).
 - Versus (sc4_adv.xbe) mouse handling.
+
+## Implementation notes
+
+What C03 built. C05 landed in the same change and shares the input core.
+
+### Input core
+
+- `src/browser/input-core.cpp` implements all of `src/core/input.h` by porting `src/core/input.cpp` with `Down(vk)`
+  reading the page's held key bitmap and the gamepad record read from gamepad-input.mjs. Windows cursor clipping,
+  `PostMessage` and SDL are gone; the page reacts to the guest's flags instead.
+- `Pump()`, called by every reader, takes what the page delivered since the last call: wheel notches (as
+  `OnRawInput`), typed characters (as `OnChar`), Escape taps, activity for `KeyboardActive`, and the hide HUD key. It
+  writes the guest flags back (menu, pointer, text entry, map drag, movie, capture).
+- `MenuInput::SetPadSource(browser::input_core::Sample)` makes XInputGetState return `input::Poll(port)` for every
+  port; ports without the keyboard or a pad answer 1167.
+- `TakeMouse` picks the sniper sensitivity in the EEV and every scope, the weapon sensitivity while aiming, free look
+  otherwise, then applies Invert look. Movement arrives in thousandths of a count.
+- Contract test `tests/browser/input-core.cpp` (native ASan/UBSan and wasm): walking speeds and the wheel, diagonal
+  speed, ladder and pipe back key, lockpick quadrants and rest, menu, pause menu and OPSAT remaps, the cursor's left
+  button in menus, wheel routing to EEV and menus, numpad keypad buttons, per view sensitivity and invert, binds from
+  the page, a guest rebind posted to the page, the settings panel lockout, inactive page, pad binds in play and stock
+  buttons in menus.
+
+### Raw input span
+
+- `src/browser/keyboard-input.{h,mjs}` (`KEYBOARD_INPUT`, 64 words, module static, `image_keyboard_address/words`):
+  change counter, 256 bit held keys by virtual key code, wheel up and down notch counters, counted press and clicks,
+  cursor x, y, w, h in CSS pixels over the canvas, active, mouse movement, Escape taps, a 64 unit character ring, the
+  guest flags, and the host panel and console words C05 uses.
+- The cursor is published with the canvas size, so `mouse.cpp` and `keypad.cpp` map it with `app::Aspect()` exactly.
+- Wheel: 100 pixels, 3 lines or one page a notch, a turn the other way drops the part notch.
+- Clicks count only for a left press and release both made while the guest flags say menu or pointer.
+- Unit tests: `tests/browser/keyboard-input.test.mjs` (layout against the header, wheel accumulator, keys, clicks,
+  character ring, movement, Escape tap, our own lock release).
+
+### Hooks and pointer lock
+
+- Default `BROWSER_GAME_HOOKS` adds mouse, mouse_pitch, views, keypad, quick_save, opsat, interaction_list,
+  analog_keys, name_entry, whistle, console, unreal (and options_menu for C05). The include allowlist has
+  `core/input.h`, `game/console.h`, `game/unreal.h` and `app/translations.h`.
+- `sub_0004B525` moved to `src/browser/input-update.cpp`, compiled in every menu build, renamed for mouse.cpp
+  (`0004B525:input-update`); in a mission build it still samples the simulation (id 132). MissionInput no longer sends
+  axis events (`tests/browser/mission-input.cpp` checks that).
+- `src/browser/game-stubs.cpp` has weak `game::PromptsTick` (C04) and `game::ProjectModel` (C06); the chunk that
+  selects prompts.cpp or fov.cpp overrides them, nothing to delete.
+- mission-controls.mjs keeps pointer lock (raw `unadjustedMovement` first) and pause; it no longer scales movement or
+  handles Escape, and it never takes the lock while the guest frees the cursor. keyboard-input.mjs frees the lock when
+  a menu or pointer opens, retakes it after its own release when play resumes (where the browser allows it), and taps
+  Start once when the lock is lost in play by anything else (the browser's Escape).
+
+### Checked in the browser (out/parity, port 8140, development start)
+
+- Walking with W and the pause menu on Escape through the input core.
+- In the pause menu the cursor hover moved focus and clicks opened Options and its pages.
+- All 33 hook addresses bound in Diagnostics, no fault.
+
+### Not checked
+
+- Automation cannot hold real pointer lock or deliver the browser's own Escape exit, so EEV wheel zoom, sticky
+  camera, keypads, quick save and load, OPSAT key and name entry are covered only by the contract test and need the
+  user's playtest. Mouse4 and Mouse5 history navigation was not checked.
+
+### Static lifetime
+
+| Static | Restart safe because |
+| --- | --- |
+| input-core state (`g_speed`, `g_view`, flags, binds) | Set again by the hooks every input update; binds reload on the settings revision |
+| keyboard-input `Shared()` | Module static by design, the page keeps writing it |
+| mouse.cpp `g_page`, `g_clicks`, `g_point`, `g_messages` | Compared against fresh values every update; a stale page id only skips one hover |

@@ -47,6 +47,6 @@ test('a selected game hook may only include headers the browser provides', async
   assert.equal(typeof validateHookIncludes, 'function');
   const allowed = '#include <cmath>\n#include "xdk/hle.h"\n#include "app/app.h"\n#include "core/log.h"\n#include "game/magma.h"\n#include "gpu/state.h"\n#include "xdk/d3d8.h"\n#include "kernel/kernel.h"\n';
   assert.equal(validateHookIncludes({ hooks: { intro: allowed }, shadowed: ['kernel/kernel.h', 'xdk/d3d8.h'] }), 1);
-  assert.throws(() => validateHookIncludes({ hooks: { mouse: '#include "core/input.h"\n' }, shadowed: [] }), /mouse.*core\/input\.h/);
+  assert.throws(() => validateHookIncludes({ hooks: { mouse: '#include "core/input.h"\n#include "gpu/backend.h"\n' }, shadowed: [] }), /mouse.*gpu\/backend\.h/);
   assert.throws(() => validateHookIncludes({ hooks: { d3d: '#include "xdk/d3d8.h"\n#include "kernel/memory.h"\n' }, shadowed: ['xdk/d3d8.h'] }), /kernel\/memory\.h/);
 });

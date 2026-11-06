@@ -8,6 +8,14 @@ namespace browser::hooks {
 
 void Bind(Memory& memory);
 void Unbind();
+// mem::AllocSystem and AllocContiguous hand out a contiguous block the session reserved before the game ran. Hook
+// statics keep its addresses across a story restart, so the next session reserves it at the same address and gets its
+// bytes back (PoolUsed, from the old session, before it ends).
+inline constexpr uint32_t kPoolBytes = 1u << 20;
+void BindPool(uint32_t address);
+uint32_t PoolUsed();
+// dispatch::HostThunk's runtime
+void BindRuntime(Runtime* runtime);
 // counts Bind calls: hook statics outlive a story restart, a hook that must not can key them by this
 uint64_t Generation();
 uint8_t* Base();

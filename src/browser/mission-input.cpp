@@ -7,16 +7,6 @@
 #include <optional>
 #include <chrono>
 
-BROWSER_GAME_CHAIN(0004B525)
-X86_FUNC(sub_0004B525) {
-  const uint32_t viewport = ctx.ecx;
-  game_sub_0004B525(ctx, base);
-  const auto saved = ctx;
-  ctx.ecx = viewport;
-  browser::Runtime::ObserveSdkEntry(ctx, base, 132);
-  ctx = saved;
-}
-
 X86_FUNC(__imp__sub_001D2A4E);
 X86_FUNC(__imp__sub_001CDA8A);
 BROWSER_GAME_CHAIN(00039AD4)
@@ -197,56 +187,8 @@ bool MissionInput::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
   }
   if (id == 133) { Tick(ctx, base); return false; }
   if (id == 134) { Draw(ctx, base); return false; }
+  // mouse look is mouse.cpp's (input-update.cpp): this entry only samples the simulation
   ObserveSimulation(ctx);
-  const int32_t x = std::bit_cast<int32_t>((*storage_)[0].exchange(0));
-  const int32_t y = std::bit_cast<int32_t>((*storage_)[1].exchange(0));
-  if ((!x && !y) || (*storage_)[2].load()) { return false; }
-  uint32_t engine = 0, target = 0;
-  const uint32_t viewport = ctx.ecx;
-  {
-    auto lease = memory_->Borrow();
-    const auto read = [&](uint32_t address, uint32_t offset = 0) {
-      if (!address || uint64_t(address) + offset + 4 > uint64_t(UINT32_MAX) + 1) { throw Fault(ctx, address, 4, "mission input pointer overflow"); }
-      uint32_t result;
-      memory_->Read(ctx, address + offset, &result, 4);
-      return result;
-    };
-    const uint32_t client = read(viewport, 0x18);
-    if (!client) { return false; }
-    engine = read(client, 0x2c);
-    const uint32_t viewports = read(client, 0x30);
-    if (!engine || !viewports || read(viewports) != viewport) { return false; }
-    const uint32_t magma = read(0x6a6638);
-    if (magma) {
-      const uint32_t list = read(magma, 0x3c), count = read(magma, 0x40);
-      if (count > 16) { throw Fault(ctx, magma, 0x44, "mission input context budget exceeded"); }
-      const uint32_t interaction = read(viewport, 0x70);
-      const uint32_t manager = interaction ? read(interaction, 0x3c) : 0;
-      const uint32_t id = manager ? read(manager, 0xc) : 0;
-      uint32_t first = 0, page = 0;
-      for (uint32_t n = 0; list && n < count; ++n) {
-        const uint32_t context = read(list, n * 4);
-        const uint32_t stack = context ? read(context, 0x18) : 0;
-        const uint32_t begin = stack ? read(stack, 4) : 0, end = stack ? read(stack, 8) : 0;
-        if (!begin || end <= begin || end - begin > 512 || (end - begin) % 8) { continue; }
-        if (read(context, 0x1c) == id) { page = read(end - 8); break; }
-        if (!first) { first = read(end - 8); }
-      }
-      if (!page) { page = first; }
-      if (page && read(page, 0x1c) != 100 && read(page, 0x24)) { return false; }
-    }
-    target = read(read(engine), 0x78);
-    if (!runtime_.Find(target)) { throw Fault(ctx, target, 0, "mission input engine axis entry is unavailable"); }
-  }
-  const auto saved = ctx;
-  const auto axis = [&](uint32_t key, int32_t value) {
-    if (!value) { return; }
-    ctx.ecx = engine;
-    runtime_.Call(ctx, base, target, {viewport, key, 4, std::bit_cast<uint32_t>(float(value) / 1000.0f)});
-  };
-  axis(0xe4, x);
-  axis(0xe5, y);
-  ctx = saved;
   return false;
 }
 }

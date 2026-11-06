@@ -1,5 +1,6 @@
 #pragma once
 #include "browser/sdk-provider.h"
+#include <functional>
 
 namespace browser {
 
@@ -17,9 +18,13 @@ public:
   MenuInput(Runtime& runtime, PreparedImage& image, std::shared_ptr<SharedStorage> storage = {}, std::shared_ptr<GamepadStorage> gamepad = {});
   bool BelongsTo(Runtime& runtime, PreparedImage& image) const override;
   bool Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) override;
+  // a pad for each port in place of the shared mask and gamepad record (the input core); false: nothing plugged in
+  using PadSource = std::function<bool(uint32_t port, std::array<uint8_t, 18>& sample)>;
+  void SetPadSource(PadSource source) { source_ = std::move(source); }
   std::atomic<uint32_t>* SharedAddress() { return shared_.data(); }
   uint32_t SharedWords() const { return uint32_t(shared_.size()); }
   std::atomic<uint32_t>* GamepadAddress() { return gamepad_->data(); }
+  GamepadStorage& Gamepad() { return *gamepad_; }
   uint32_t GamepadWords() const { return uint32_t(gamepad_->size()); }
 private:
   struct Handle {
@@ -35,7 +40,9 @@ private:
   std::shared_ptr<SharedStorage> storage_;
   SharedStorage& shared_;
   std::shared_ptr<GamepadStorage> gamepad_;
+  PadSource source_;
   std::array<uint32_t, 7> SampleGamepad(const X86Context& ctx) const;
+  std::array<uint8_t, 18> SampleMask(const X86Context& ctx, uint32_t output) const;
   std::mutex lock_;
   std::array<Handle, 32> handles_{};
   uint32_t nextToken_ = 0xbc000000;

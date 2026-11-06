@@ -100,6 +100,14 @@
     input[type="range"]::-moz-range-track { height: 5px; border: 1px solid #3c433c; background: linear-gradient(90deg, #a9c3a2 var(--fill, 50%), #151815 var(--fill, 50%)); }
     input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: .45rem; height: .9rem; margin-top: -.3rem; background: #e4e8e2; border: 1px solid #000; }
     input[type="range"]::-moz-range-thumb { width: .45rem; height: .9rem; border: 1px solid #000; border-radius: 0; background: #e4e8e2; }
+    .binds { display: grid; grid-template-columns: 1fr 1fr; gap: .4rem; width: 13rem; }
+    .binds.single { grid-template-columns: 1fr; }
+    .slot { all: unset; cursor: pointer; padding: .05rem .3rem; text-align: center; font: inherit; text-transform: uppercase; color: var(--item);
+      border: 1px solid #3c433c; background: #101310; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .slot:focus { border-color: #e4e8e2; color: #f3f6f1; }
+    .slot[data-waiting] { color: var(--alert); }
+    .row.heading { color: var(--head); font-style: italic; padding-top: .7rem; }
+    .row.heading::before { visibility: hidden; }
     .keys { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 1.6rem; margin: .7rem 0 0; padding: .6rem .6rem 0; border-top: 1px solid var(--frame-dark); }
     .keys div { display: flex; justify-content: space-between; gap: 1rem; padding: .18rem 0; font: 700 .72rem/1.2 var(--face); text-transform: uppercase; color: var(--item-dim); }
     .keys kbd { font: inherit; color: var(--item); }

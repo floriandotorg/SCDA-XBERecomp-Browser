@@ -181,3 +181,76 @@ inside the game's own options menu so settings can be changed without leaving th
 - Versus action and pad tables.
 - Touchpad halves and non standard gamepad mappings.
 - Native F10 rows the browser has no backend for (monitor, resolution, MSAA, shadows, HDR, co-op tick rate, microphone).
+
+## Implementation notes
+
+What C05 built (together with C03, which shares the input core).
+
+### Bindings
+
+- `src/browser/input-actions.mjs` holds `ACTIONS`, `PAD_ACTIONS`, `KEY_NAMES` and `PAD_BUTTONS`;
+  `tests/browser/input-actions.test.mjs` parses `src/core/input.cpp` and checks every `kNames` entry, the story action
+  table and the pad tables. The only default that differs is quick inventory on Tab (Ctrl+W closes the tab).
+- `src/browser/input-bindings.mjs` ports `Bind`, `Unbind`, `BindPad` and `LoadBindings` over the sparse override maps.
+  Labels follow `navigator.keyboard.getLayoutMap()` where the browser has it.
+- settings.mjs has map settings `keys` and `padButtons`, normalized against the tables. They reach the guest as
+  `keys.<id>=` and `pad_buttons.<id>=` lines; the input core reloads its binds whenever the settings revision changes.
+- The guest's own copy of the tables is `kActions` / `kPadActions` in `src/browser/input-core.cpp` (story only).
+
+### Host to guest and back
+
+- `src/browser/host-messages.{h,cpp,mjs}`: two single producer, single consumer rings of 32 entries (kind, length,
+  256 bytes), module static like the host settings block, exported as `image_messages_address/words` and checked by
+  `readInputDescriptor`. Kinds: `set` and `unset` (`keys.fire=G`, `volume=80`, `padButtons.jump`), `quit` and `console`
+  (reserved for C04), `output`. menu-runtime.mjs drains the guest ring on every presented frame and applies set and
+  unset entries to settings.mjs, which persists them and pushes the next settings revision.
+- Guest posts come from the input core (`Bind`, `Unbind`, `BindPad`, `ResetBindings`, `ResetPadBindings`) and from
+  `src/browser/settings-rows.cpp` (`Step`, `Choose`, `Defaults`). A value changed in the game shows at once from a
+  pending copy until the page's revision brings it back.
+- Rows shown in the game come from `host.<key>=<value>` lines of the host settings text (a `host` schema type). Page 0
+  has DISPLAY (Picture, Upscaling), GRAPHICS (FPS counter) and GENERAL (Master volume, Skip intros, Pause on focus
+  loss); page 1 the three sensitivities, Invert mouse and every keyboard action but push to talk; page 2 the pad
+  actions but push to talk. Later chunks add their rows to `Settings()` and `kSettingsRows` in settings-rows.cpp.
+
+### Guest side
+
+- `options_menu` is in the default `BROWSER_GAME_HOOKS`. `dispatch::HostThunk` and the `mem::` functions it needs
+  (`AllocSystem`, `AllocContiguous`, `IsCommitted`) are in `src/browser/hook-compat.cpp` with a shim
+  `hook-compat/kernel/memory.h`. Allocations come from a 1 MiB contiguous pool the session reserves before the game
+  runs (`Session::Restore`); the pool's bytes are carried across `image_restart` because hook statics keep its
+  addresses (options_menu's popup vtable and text buffer).
+- `app::MenuOpen()` and `app::ConsoleOpen()` read keyboard-input words 55 and 56, which menu-shell sets while its
+  panel (or later the console) is open over the game. `app::BootLanguage()` is English until C12 sends a language;
+  `src/app/translations.cpp` is compiled for `Text()`.
+
+### Host UI
+
+- Controls tab: the three sensitivities, Invert look, then a row with two slots per visible action and Restore
+  defaults. Controller tab: one slot per pad action and Restore defaults. A slot press shows "Press a key" (or "Press
+  a button") and takes the next key, mouse button, wheel notch or controller button; Escape cancels, Delete clears.
+- The panel opens on the `settings_panel` binding (F10) or the gear, and not while an in-game capture waits
+  (keyboard-input flag 32). F1 is the OPSAT.
+- gamepad-input.mjs word 7 carries the physical buttons in `kPadNames` order and the trigger travel, which the input
+  core rebinds (`Rebind`, `ApplyPadBinds`); menus keep the stock buttons.
+
+### Changes from the plan
+
+- `menu-input.mjs` stays for `BROWSER_MENU_CAPTURE` builds, which have no input core; menu builds use
+  `keyboard-input.mjs` (C03) and the old 2 word mask is no longer read there (`MenuInput::SetPadSource`).
+- No unit test mounts menu-shell.mjs (it has no DOM fixture); the capture flow was checked in the browser.
+- Touchpad halves and player ports are left out as planned.
+
+### Checked in the browser (out/parity, port 8140)
+
+- The pause menu's Options lists Recomp Settings, Mouse and Keyboard and Controller; Recomp Settings lists the three
+  sections and Display shows Picture and Upscaling with their values.
+- Right on Free look sensitivity in the game set the host setting to 1.1 at once.
+- The host Controls tab captured G for Move forward and saved `{ move_forward: 'G' }`.
+
+### Static lifetime
+
+| Static | Restart safe because |
+| --- | --- |
+| host-messages `Shared()` | Module static by design; entries are the page's to drain |
+| settings-rows pending copies | Dropped at the next settings revision |
+| options_menu `g_take`, `g_sections`, `g_text`, `g_popup` | Its pool addresses stay valid: the pool is reserved at the same address and its bytes restored |

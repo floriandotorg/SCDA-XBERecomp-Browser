@@ -16,7 +16,6 @@ X86_FUNC(axis) {
   ctx.eax = 0xdeadbeef;
   ctx.esp += 20;
 }
-X86_FUNC(__imp__sub_0004B525) {}
 X86_FUNC(__imp__sub_001D2A4E) {}
 X86_FUNC(__imp__sub_001CDA8A) {}
 X86_FUNC(__imp__sub_00039AD4) {}
@@ -88,41 +87,21 @@ int main() {
     (*storage)[1] = uint32_t(-2500);
     const auto before = ctx;
     input.Dispatch(ctx, base, 132);
-    check(events.size() == 2 && events[0] == std::array<uint32_t, 4>{0x20000, 0xe4, 4, std::bit_cast<uint32_t>(1.25f)} &&
-      events[1] == std::array<uint32_t, 4>{0x20000, 0xe5, 4, std::bit_cast<uint32_t>(-2.5f)}, "relative counts did not reach the game axes");
-    check(ctx.ecx == before.ecx && ctx.esp == before.esp && ctx.eax == before.eax, "axis injection changed the original result");
+    check(events.empty() && (*storage)[0] == 1250, "mouse look is mouse.cpp's: the simulation entry sent axis events");
+    check(ctx.ecx == before.ecx && ctx.esp == before.esp && ctx.eax == before.eax, "sampling changed the original result");
     input.Dispatch(ctx, base, 132);
-    check(events.size() == 2 && !(*storage)[0] && !(*storage)[1], "mouse counts replayed");
-    check(samples.size() == 2 && samples[0] == std::array<float, 2>{12.5f, 1.0f / 30}, "simulation time was tied to mouse movement");
-    put(0x6a6638, 0x23000);
-    put(0x2303c, 0x23100);
-    put(0x23040, 1);
-    put(0x23100, 0x23200);
-    put(0x23218, 0x23300);
-    put(0x23304, 0x23400);
-    put(0x23308, 0x23408);
-    put(0x23400, 0x23500);
-    put(0x2351c, 1);
-    put(0x23524, 0x23600);
-    (*storage)[0] = 1000;
-    input.Dispatch(ctx, base, 132);
-    check(events.size() == 2 && !(*storage)[0], "menu motion moved the camera or queued a later jump");
-    put(0x2351c, 100);
-    (*storage)[0] = 3000;
-    input.Dispatch(ctx, base, 132);
-    check(events.size() == 3, "HUD blocked gameplay motion");
-    (*storage)[0] = 1000;
+    check(samples.size() == 2 && samples[0] == std::array<float, 2>{12.5f, 1.0f / 30}, "simulation time was not sampled");
     (*storage)[2] = 1;
     input.Dispatch(ctx, base, 132);
-    check(events.size() == 3 && !(*storage)[0], "suspended motion reached the game");
-    check(samples.size() == 4, "suspended input sampled simulation time");
+    check(samples.size() == 2, "suspended input sampled simulation time");
+    check(events.empty(), "an axis event reached the game");
     (*storage)[2] = 0;
     put(0x233bc, 0x7fc00000);
     input.Dispatch(ctx, base, 132);
-    check(samples.size() == 4, "invalid simulation time was published");
+    check(samples.size() == 2, "invalid simulation time was published");
     put(0x20034, 0);
     input.Dispatch(ctx, base, 132);
-    check(samples.size() == 4, "missing view actor was sampled");
+    check(samples.size() == 2, "missing view actor was sampled");
   });
   if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
   std::puts("mission-input-contracts-ok");

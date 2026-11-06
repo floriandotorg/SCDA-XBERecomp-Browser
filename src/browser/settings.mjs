@@ -1,9 +1,20 @@
+import { actionNamed, keyNamed, padActionNamed, padButtonNamed } from './input-actions.mjs';
+
+const normalizeKeys = value => Object.fromEntries(Object.entries(value).filter(([id, names]) => actionNamed(id) && typeof names === 'string')
+  .map(([id, names]) => [id, names.split(',').map(keyNamed).filter(Boolean).map(entry => entry.name).join(',')]));
+const normalizePads = value => Object.fromEntries(Object.entries(value).filter(([id, name]) => padActionNamed(id) && typeof name === 'string' &&
+  (name === '' || padButtonNamed(name))).map(([id, name]) => [id, name && padButtonNamed(name).name]));
+
 export const SETTINGS = Object.freeze({
   scaling: Object.freeze({ initial: 'fit', options: Object.freeze(['fit', 'integer', 'stretch']) }),
   filter: Object.freeze({ initial: 'smooth', options: Object.freeze(['smooth', 'sharp']) }),
   volume: Object.freeze({ initial: 100, min: 0, max: 100, step: 5 }),
   sensitivity: Object.freeze({ initial: 1, min: 0.1, max: 5, step: 0.1 }),
+  weaponSensitivity: Object.freeze({ initial: 1, min: 0.1, max: 5, step: 0.1 }),
+  sniperSensitivity: Object.freeze({ initial: 1, min: 0.1, max: 5, step: 0.1 }),
   invertY: Object.freeze({ initial: false }),
+  keys: Object.freeze({ initial: Object.freeze({}), map: normalizeKeys }),
+  padButtons: Object.freeze({ initial: Object.freeze({}), map: normalizePads }),
   skipIntros: Object.freeze({ initial: false }),
   pauseOnFocusLoss: Object.freeze({ initial: true }),
   developmentStart: Object.freeze({ initial: false }),
@@ -13,6 +24,7 @@ export const SETTINGS = Object.freeze({
 
 const normalize = (name, value) => {
   const setting = SETTINGS[name];
+  if (setting.map) { return value && typeof value === 'object' && !Array.isArray(value) ? Object.freeze(setting.map(value)) : undefined; }
   if (setting.options) { return setting.options.includes(value) ? value : undefined; }
   if (typeof setting.initial === 'boolean') { return typeof value === 'boolean' || typeof value === 'number' ? Boolean(value) : undefined; }
   const number = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
@@ -20,6 +32,8 @@ const normalize = (name, value) => {
   const stepped = Math.round(number / setting.step) * setting.step;
   return Math.max(setting.min, Math.min(setting.max, Number(stepped.toFixed(4))));
 };
+
+const setting = name => SETTINGS[name];
 
 const initialValues = () => Object.fromEntries(Object.entries(SETTINGS).map(([name, setting]) => [name, setting.initial]));
 
@@ -45,7 +59,7 @@ export const createSettings = ({ storage = globalThis.localStorage, key = 'scda.
   };
   const assign = (name, value) => {
     const next = normalize(name, value);
-    if (next === undefined || next === values[name]) { return false; }
+    if (next === undefined || next === values[name] || (setting(name).map && JSON.stringify(next) === JSON.stringify(values[name]))) { return false; }
     values[name] = next;
     for (const listener of listeners) { listener(name, next); }
     return true;

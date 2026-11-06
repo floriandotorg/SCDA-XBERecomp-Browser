@@ -7,6 +7,8 @@ import { MISSION_METRICS_WORDS, readMissionMetrics } from './mission-metrics.mjs
 import { createMailbox } from './webgpu-transport.mjs';
 import { startGPUWorker } from './webgpu-service.mjs';
 import { createHostSettingsWriter, encodeHostSettings, readHookStatus } from './host-settings.mjs';
+import { createKeyboardInput } from './keyboard-input.mjs';
+import { applyHostMessage, createHostMessages } from './host-messages.mjs';
 
 const waitReady = async (ready, signal, timeoutMs) => {
   signal.throwIfAborted();
@@ -25,7 +27,8 @@ const waitReady = async (ready, signal, timeoutMs) => {
 };
 
 export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRuntime, createGPU = startGPUWorker,
-  gamepad = true, createGamepad = createGamepadInput, createInput = createMenuInput, createMotion = createMissionControls, createAudio = createBrowserAudio, onPresented = () => {}, onAdapter = () => {}, onDiagnostic = () => {},
+  gamepad = true, createGamepad = createGamepadInput, createInput = createMenuInput, createKeyboard = createKeyboardInput, createMotion = createMissionControls, createAudio = createBrowserAudio, onPresented = () => {}, onAdapter = () => {}, onDiagnostic = () => {},
+  onKeyboard = () => {}, onHostMessage,
   readyTimeoutMs = 20000, settings, ...runtimeOptions } = {}) => {
   if (typeof acquireCanvas !== 'function') { throw new TypeError('A fresh owned canvas is required for each menu runtime.'); }
   if (!Number.isInteger(readyTimeoutMs) || readyTimeoutMs < 1 || readyTimeoutMs > 30000) { throw new RangeError('Invalid GPU initialization deadline.'); }
@@ -44,6 +47,7 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
     let metrics;
     let hostSettings;
     let hookStatus;
+    let messages;
     let cancelled = false;
     let disposed;
     let presenting = false;
@@ -57,6 +61,9 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
         let sample;
         try { sample = metrics ? readMissionMetrics(metrics) : undefined; }
         catch (error) { report({ generation, ok: false, code: 'METRICS_PROTOCOL', message: error.message }); return; }
+        for (const message of messages?.take() ?? []) {
+          if (onHostMessage) { onHostMessage(message); } else if (settings) { applyHostMessage(settings, message); }
+        }
         onPresented({ ...details, ...(sample ? { metrics: sample } : {}), ...(hookStatus ? { hookStatus: readHookStatus(hookStatus) } : {}) });
         if (!presenting) {
           presenting = true;
@@ -117,6 +124,7 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
             hostSettings?.dispose();
             hostSettings = undefined;
             hookStatus = undefined;
+            messages = undefined;
             void audio?.dispose();
             audio = undefined;
             motion?.dispose();
@@ -135,7 +143,10 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
             if (producer || data.words !== 2) { throw new Error('Unexpected menu input storage publication.'); }
             if (gamepad && !data.gamepadOffset) { throw new Error('Missing shared gamepad input storage.'); }
             if (gamepad) { controller = createGamepad({ buffer: data.buffer, byteOffset: data.gamepadOffset, signal }); }
-            producer = createInput({ buffer: data.buffer, byteOffset: data.byteOffset, signal });
+            producer = data.keyboardOffset ? createKeyboard({ buffer: data.buffer, byteOffset: data.keyboardOffset, signal }) :
+              createInput({ buffer: data.buffer, byteOffset: data.byteOffset, signal });
+            if (data.keyboardOffset) { onKeyboard(producer); }
+            if (data.messagesOffset) { messages = createHostMessages({ buffer: data.buffer, byteOffset: data.messagesOffset }); }
             if (data.audioOffset) {
               audio = createAudio({ buffer: data.buffer, byteOffset: data.audioOffset, samplesOffset: data.audioSamplesOffset, signal });
             }
@@ -147,6 +158,7 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
             }
             if (data.motionOffset) {
               motion = createMotion({ buffer: data.buffer, byteOffset: data.motionOffset, signal,
+                pointerFree: () => producer?.pointerFree?.() ?? false,
                 clear: () => { producer?.setActive(false); producer?.setActive(true); } });
             }
           } catch (error) {

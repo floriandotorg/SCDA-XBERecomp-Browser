@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 // Host settings from settings.mjs (host-settings.mjs holds the schema these indices mirror). The page writes the
 // block under a seqlock: word 0 is odd while a writer holds it. Byte area: name=value lines for string and map fields.
@@ -16,6 +17,11 @@ inline constexpr uint32_t kSchemaWord = 1;
 inline constexpr uint32_t kFlagsWord = 2;
 inline constexpr uint32_t kSkipIntrosBit = 0;
 inline constexpr uint32_t kPauseOnFocusLossBit = 1;
+inline constexpr uint32_t kInvertMouseBit = 2;
+inline constexpr uint32_t kMouseSensitivityWord = 3;
+inline constexpr uint32_t kFreeLookSensitivityWord = 4;
+inline constexpr uint32_t kWeaponSensitivityWord = 5;
+inline constexpr uint32_t kSniperSensitivityWord = 6;
 
 struct Block {
   std::array<std::atomic<uint32_t>, kWords> words{};
@@ -31,6 +37,9 @@ struct Snapshot {
 
 // one per module: it outlives every story session and restart
 Block& Shared();
+// a browser setting the in-game options pages show (host.<key>=<value> lines) as the calling thread's app::Get() last
+// read it, empty when the page sent none
+std::string HostValue(std::string_view key);
 // false while a writer holds the block or it changed under every attempt
 bool Read(const Block& block, Snapshot& snapshot);
 

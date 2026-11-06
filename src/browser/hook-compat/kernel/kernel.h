@@ -8,6 +8,7 @@
 
 #include "core/log.h"
 #include "cpu/x86_ops.h"
+#include "kernel/memory.h"
 
 #if !defined(X86_COMPACT_MEMORY)
 #error "native game hooks build only against browser memory"

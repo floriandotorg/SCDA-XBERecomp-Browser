@@ -18,10 +18,10 @@ test('C++ indices match the single host settings schema', async () => {
   const declared = [...header.matchAll(/constexpr uint32_t k(\w+)(Bit|Word) = (\d+);/g)]
     .filter(([, name]) => !['Revision', 'Schema', 'Flags'].includes(name))
     .map(([, name, kind, value]) => `${name}:${kind}:${value}`).sort();
-  const schema = HOST_SETTINGS_FIELDS.filter(entry => entry.type !== 'text' && entry.type !== 'map')
+  const schema = HOST_SETTINGS_FIELDS.filter(entry => !['text', 'map', 'host'].includes(entry.type))
     .map(entry => `${pascal(entry.field)}:${entry.type === 'bool' ? 'Bit' : 'Word'}:${entry.type === 'bool' ? entry.bit : entry.word}`).sort();
   assert.deepEqual(declared, schema);
-  for (const entry of HOST_SETTINGS_FIELDS) { assert.match(readFileSync('src/app/app.h', 'utf8'), new RegExp(`\\b${entry.field}\\b`)); }
+  for (const entry of HOST_SETTINGS_FIELDS.filter(item => item.type !== 'host')) { assert.match(readFileSync('src/app/app.h', 'utf8'), new RegExp(`\\b${entry.field}\\b`)); }
   const keys = new Set(HOST_SETTINGS_FIELDS.map(entry => entry.key));
   const { SETTINGS } = await import('../../src/browser/settings.mjs');
   for (const key of keys) { assert.ok(Object.hasOwn(SETTINGS, key), key); }
@@ -65,7 +65,7 @@ test('writer publishes under an even revision and follows setting changes', asyn
   f.settings.set('skipIntros', true);
   assert.equal(f.words[0], 4);
   assert.equal(f.words[2], 3);
-  f.settings.set('volume', 50);
+  f.settings.set('developmentStart', true);
   assert.equal(f.words[0], 4, 'a setting outside the schema rewrote the block');
   assert.deepEqual(writes, [2, 4]);
   assert.equal(writer.revision, 4);

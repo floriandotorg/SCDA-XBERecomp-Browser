@@ -40,6 +40,9 @@
 #include "browser/menu-backend.h"
 #include "browser/hooks.h"
 #include "browser/host-settings.h"
+#include "browser/host-messages.h"
+#include "browser/input-core.h"
+#include "browser/keyboard-input.h"
 #include "cpu/x86_ops.h"
 #include "hook_manifest.h"
 
@@ -66,6 +69,11 @@ constexpr size_t worker_capacity = 2;
 constexpr auto graphics_mode = browser::GraphicsMode::Checkpoint;
 constexpr size_t worker_capacity = 2;
 #endif
+// the game hook pool's bytes as the last session left them (Session::Restore)
+struct {
+  uint32_t address = 0;
+  std::vector<uint8_t> bytes;
+} hookPoolBytes;
 struct StoryState {
 #ifdef BROWSER_MISSION
   std::shared_ptr<browser::AudioOutput> audio = std::make_shared<browser::AudioOutput>();
@@ -94,6 +102,7 @@ struct Session {
   std::shared_ptr<StoryState> story;
   browser::ContiguousMemoryAccess restoredAllocations;
   uint32_t savedDisplay = 0;
+  uint32_t hookPool = 0;
   browser::Runtime runtime;
   std::unique_ptr<browser::PreparedImage> image;
   std::vector<browser::KernelDataExport> dataExports;
@@ -315,12 +324,24 @@ struct Session {
     graphics->Hooks().SetBackend(renderer, [renderer = renderer](browser::GraphicsEffect effect) { return renderer->Supports(effect); });
     browser::hooks::Bind(*image->memory);
     browser::hooks::BindGraphics(graphics->Hooks());
+    browser::hooks::BindRuntime(&runtime);
+    browser::input_core::BindGamepad(&input->Gamepad());
+    input->SetPadSource(browser::input_core::Sample);
 #endif
 #else
     sdkObserver = browser::InstallSdkProvider(runtime, *image, browser::SdkPolicy::UnavailableXNet, graphics, {}, {}, {}, audioProvider);
 #endif
   }
   void Restore(X86Context& context) {
+#ifdef BROWSER_MENU
+    // first, so every session reserves the hook pool at the same address
+    hookPool = restoredAllocations.allocate(context, browser::hooks::kPoolBytes, 4096);
+    if (!hookPool) { throw browser::Fault(context, 0, browser::hooks::kPoolBytes, "the game hook pool does not fit"); }
+    if (hookPoolBytes.address == hookPool && !hookPoolBytes.bytes.empty()) {
+      image->memory->Write(context, hookPool, hookPoolBytes.bytes.data(), hookPoolBytes.bytes.size());
+    }
+    browser::hooks::BindPool(hookPool);
+#endif
     if (!story || !story->launchPage) { return; }
     const auto allocate = [&](uint32_t bytes) {
       const uint32_t address = restoredAllocations.allocate(context, bytes, 4096);
@@ -341,6 +362,8 @@ struct Session {
   ~Session() {
     runtime.Stop();
 #ifdef BROWSER_MENU
+    browser::input_core::BindGamepad(nullptr);
+    browser::hooks::BindRuntime(nullptr);
     browser::hooks::UnbindGraphics();
     browser::hooks::Unbind();
 #endif
@@ -503,6 +526,11 @@ EMSCRIPTEN_KEEPALIVE int image_restart() {
   try {
 #ifdef BROWSER_MENU
     session->renderer->Retire();
+    if (session->hookPool) {
+      hookPoolBytes.address = session->hookPool;
+      hookPoolBytes.bytes.resize(browser::hooks::PoolUsed());
+      session->image->memory->Read({}, session->hookPool, hookPoolBytes.bytes.data(), hookPoolBytes.bytes.size());
+    }
 #endif
     session.reset();
     session = std::make_unique<Session>(std::move(bytes), std::span(X86FuncMappings, mappingCount),
@@ -666,6 +694,34 @@ EMSCRIPTEN_KEEPALIVE uintptr_t image_settings_address() {
 EMSCRIPTEN_KEEPALIVE uint32_t image_settings_words() {
 #ifdef BROWSER_MENU
   return browser::host_settings::kWords;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uintptr_t image_keyboard_address() {
+#ifdef BROWSER_MENU
+  return reinterpret_cast<uintptr_t>(browser::keyboard_input::Shared().data());
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_keyboard_words() {
+#ifdef BROWSER_MENU
+  return browser::keyboard_input::kWords;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uintptr_t image_messages_address() {
+#ifdef BROWSER_MENU
+  return reinterpret_cast<uintptr_t>(browser::host_messages::Shared().data());
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_messages_words() {
+#ifdef BROWSER_MENU
+  return browser::host_messages::kWords;
 #else
   return 0;
 #endif

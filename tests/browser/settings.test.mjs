@@ -65,3 +65,28 @@ test('game settings that reach the guest default to the native values and persis
   assert.equal(reloaded.get('pauseOnFocusLoss'), false);
   assert.equal(createSettings({ storage: memory(JSON.stringify({ skipIntros: 'yes' })) }).get('skipIntros'), false);
 });
+
+test('binding maps keep known actions and canonical key names, drop the rest, and persist', () => {
+  const storage = memory(JSON.stringify({ keys: { fire: 'g,Nonsense', unknown: 'W', jump: '' }, padButtons: { jump: 'b', crouch: 'Z', fire: '', none: 'A' } }));
+  const settings = createSettings({ storage });
+  assert.deepEqual(settings.get('keys'), { fire: 'G', jump: '' });
+  assert.deepEqual(settings.get('padButtons'), { jump: 'B', fire: '' });
+  const seen = [];
+  settings.subscribe(name => seen.push(name));
+  settings.set('keys', { fire: 'G', jump: '' });
+  assert.deepEqual(seen, []);
+  settings.set('keys', { fire: 'LMB' });
+  settings.set('keys', 'nonsense');
+  assert.deepEqual(seen, ['keys']);
+  assert.deepEqual(createSettings({ storage }).get('keys'), { fire: 'LMB' });
+  assert.deepEqual(createSettings({ storage: memory() }).get('padButtons'), {});
+});
+
+test('per view sensitivities share the free look range', () => {
+  const settings = createSettings({ storage: memory() });
+  assert.equal(settings.get('weaponSensitivity'), 1);
+  settings.set('sniperSensitivity', 9);
+  assert.equal(settings.get('sniperSensitivity'), 5);
+  settings.set('weaponSensitivity', 0.04);
+  assert.equal(settings.get('weaponSensitivity'), 0.1);
+});

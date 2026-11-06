@@ -77,7 +77,7 @@ std::array<uint32_t, 7> MenuInput::SampleGamepad(const X86Context& ctx) const {
     for (uint32_t n = 0; n < sample.size(); ++n) { sample[n] = (*gamepad_)[n + 1].load(); }
     if ((*gamepad_)[0].load() != sequence) { continue; }
     if (!sample[0]) { return {}; }
-    if (sample[0] != 1 || (sample[1] & ~(validButtons & ~0xf0u)) || sample[6]) {
+    if (sample[0] != 1 || (sample[1] & ~(validButtons & ~0xf0u))) {
       throw Fault(ctx, ctx.esp, 0, "gamepad shared controller record is invalid");
     }
     for (uint32_t n = 2; n < 6; ++n) {
@@ -87,6 +87,32 @@ std::array<uint32_t, 7> MenuInput::SampleGamepad(const X86Context& ctx) const {
     return sample;
   }
   return {};
+}
+
+std::array<uint8_t, 18> MenuInput::SampleMask(const X86Context& ctx, uint32_t output) const {
+  const uint32_t keyboard = shared_[0].load(std::memory_order_acquire);
+  const auto gamepad = SampleGamepad(ctx);
+  const uint32_t mask = keyboard | gamepad[1];
+  if (mask & ~validButtons) { throw Fault(ctx, output, 22, "menu input shared controller mask is invalid"); }
+  std::array<uint8_t, 18> sample{};
+  const auto put16 = [&](size_t offset, int32_t value) {
+    const uint16_t bits = uint16_t(value);
+    sample[offset] = uint8_t(bits);
+    sample[offset + 1] = uint8_t(bits >> 8);
+  };
+  put16(0, (mask & 15) | ((mask & Start) ? 0x10 : 0) | ((mask & Select) ? 0x20 : 0) |
+    ((mask & LeftThumb) ? 0x40 : 0) | ((mask & RightThumb) ? 0x80 : 0));
+  sample[2] = (mask & Confirm) ? 255 : 0;
+  sample[3] = (mask & Back) ? 255 : 0;
+  const std::array<uint32_t, 6> analogMasks{X, Y, Black, White, LeftTrigger, RightTrigger};
+  for (uint32_t n = 0; n < analogMasks.size(); ++n) { sample[4 + n] = (mask & analogMasks[n]) ? 255 : 0; }
+  put16(10, keyboard & (StrafeRight | StrafeLeft) ?
+    (int32_t(bool(keyboard & StrafeRight)) - int32_t(bool(keyboard & StrafeLeft))) * 32767 : std::bit_cast<int32_t>(gamepad[2]));
+  put16(12, keyboard & (Forward | Backward) ?
+    (int32_t(bool(keyboard & Forward)) - int32_t(bool(keyboard & Backward))) * 32767 : std::bit_cast<int32_t>(gamepad[3]));
+  put16(14, std::bit_cast<int32_t>(gamepad[4]));
+  put16(16, std::bit_cast<int32_t>(gamepad[5]));
+  return sample;
 }
 
 bool MenuInput::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
@@ -136,7 +162,9 @@ bool MenuInput::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
     return finish(0);
   }
   if (handle == handles_.end()) { return finish(6); }
-  if (handle->port != 0) { return finish(1167); }
+  std::array<uint8_t, 18> sourced{};
+  if (source_ && id == 43 && !source_(handle->port, sourced)) { return finish(1167); }
+  if (!source_ && handle->port != 0) { return finish(1167); }
   if (id == 44) {
     CheckOutput(ctx, frame[2], 70, frameBytes);
     std::array<uint8_t, 70> feedback;
@@ -150,28 +178,8 @@ bool MenuInput::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
     return finish(997);
   }
   CheckOutput(ctx, frame[2], 22, frameBytes);
-  const uint32_t keyboard = shared_[0].load(std::memory_order_acquire);
-  const auto gamepad = SampleGamepad(ctx);
-  const uint32_t mask = keyboard | gamepad[1];
-  if (mask & ~validButtons) { throw Fault(ctx, frame[2], 22, "menu input shared controller mask is invalid"); }
-  std::array<uint8_t, 18> sample{};
-  const auto put16 = [&](size_t offset, int32_t value) {
-    const uint16_t bits = uint16_t(value);
-    sample[offset] = uint8_t(bits);
-    sample[offset + 1] = uint8_t(bits >> 8);
-  };
-  put16(0, (mask & 15) | ((mask & Start) ? 0x10 : 0) | ((mask & Select) ? 0x20 : 0) |
-    ((mask & LeftThumb) ? 0x40 : 0) | ((mask & RightThumb) ? 0x80 : 0));
-  sample[2] = (mask & Confirm) ? 255 : 0;
-  sample[3] = (mask & Back) ? 255 : 0;
-  const std::array<uint32_t, 6> analogMasks{X, Y, Black, White, LeftTrigger, RightTrigger};
-  for (uint32_t n = 0; n < analogMasks.size(); ++n) { sample[4 + n] = (mask & analogMasks[n]) ? 255 : 0; }
-  put16(10, keyboard & (StrafeRight | StrafeLeft) ?
-    (int32_t(bool(keyboard & StrafeRight)) - int32_t(bool(keyboard & StrafeLeft))) * 32767 : std::bit_cast<int32_t>(gamepad[2]));
-  put16(12, keyboard & (Forward | Backward) ?
-    (int32_t(bool(keyboard & Forward)) - int32_t(bool(keyboard & Backward))) * 32767 : std::bit_cast<int32_t>(gamepad[3]));
-  put16(14, std::bit_cast<int32_t>(gamepad[4]));
-  put16(16, std::bit_cast<int32_t>(gamepad[5]));
+  std::array<uint8_t, 18> sample = sourced;
+  if (!source_) { sample = SampleMask(ctx, frame[2]); }
   const uint32_t packet = handle->packet + uint32_t(!handle->sampled || sample != handle->last);
   std::array<uint8_t, 22> output{};
   for (uint32_t n = 0; n < 4; ++n) { output[n] = uint8_t(packet >> (n * 8)); }

@@ -1,10 +1,12 @@
+// Pointer lock and pause for a mission: words 2 to 4 hold the simulation while the page is in the background or the
+// host panel is open. Mouse movement goes to the guest's input core through keyboard-input.mjs.
 const owners = new WeakMap();
 export const createMissionControls = ({ buffer, byteOffset, document = globalThis.document, window = globalThis.window,
-  canvas = document?.querySelector('#game'), capture = canvas, sensitivity = () => 1, invertY = () => false, pauseOnFocusLoss = () => true,
+  canvas = document?.querySelector('#game'), capture = canvas, pauseOnFocusLoss = () => true, pointerFree = () => false,
   clear = () => {}, now = () => performance.now(), signal } = {}) => {
   if (!(buffer instanceof SharedArrayBuffer) || buffer.growable) { throw new TypeError('Mission controls require fixed shared memory.'); }
   if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset % 4 || byteOffset > buffer.byteLength - 20) { throw new RangeError('Mission input span is out of bounds.'); }
-  if (!canvas || !capture?.addEventListener || typeof sensitivity !== 'function' || typeof invertY !== 'function' || typeof pauseOnFocusLoss !== 'function' || !document?.addEventListener || !window?.addEventListener) { throw new TypeError('Mission controls require their canvas and settings.'); }
+  if (!canvas || !capture?.addEventListener || typeof pauseOnFocusLoss !== 'function' || typeof pointerFree !== 'function' || !document?.addEventListener || !window?.addEventListener) { throw new TypeError('Mission controls require their canvas and settings.'); }
   signal?.throwIfAborted();
   const spans = owners.get(buffer) ?? new Set();
   for (const start of spans) {
@@ -37,36 +39,21 @@ export const createMissionControls = ({ buffer, byteOffset, document = globalThi
       Atomics.notify(words, 2);
     }
   };
+  // raw counts as native raw input reads them where the browser offers that, else the plain lock; a game menu keeps
+  // the cursor free, a click there is the menu's
   const request = async () => {
-    if (disposed || !focused || document.hidden || suspended || locked()) { return; }
-    try {
-      canvas.focus({ preventScroll: true });
-      if (typeof canvas.requestPointerLock !== 'function') { throw new Error('unavailable'); }
-      await canvas.requestPointerLock();
-      if (disposed && locked()) { document.exitPointerLock(); }
-    } catch {}
+    if (disposed || !focused || document.hidden || suspended || locked() || pointerFree()) { return; }
+    canvas.focus({ preventScroll: true });
+    if (typeof canvas.requestPointerLock !== 'function') { return; }
+    for (const options of [{ unadjustedMovement: true }, undefined]) {
+      try {
+        await canvas.requestPointerLock(options);
+        break;
+      } catch {}
+    }
+    if (disposed && locked()) { document.exitPointerLock(); }
   };
   const release = () => { if (locked()) { document.exitPointerLock(); } reset(); };
-  const keydown = event => {
-    if (event.code === 'Escape' && locked()) { event.preventDefault(); release(); }
-  };
-  const accumulate = (field, value) => {
-    const delta = Math.round(Math.max(-1000000, Math.min(1000000, value)) * 1000);
-    let previous = Atomics.load(words, field);
-    for (;;) {
-      const next = Math.max(-1000000000, Math.min(1000000000, previous + delta));
-      const observed = Atomics.compareExchange(words, field, previous, next);
-      if (observed === previous) { return; }
-      previous = observed;
-    }
-  };
-  const move = event => {
-    if (disposed || !locked() || !focused || document.hidden) { return; }
-    const scale = Number(sensitivity());
-    if (!Number.isFinite(scale) || scale < 0.05 || scale > 10 || !Number.isFinite(event.movementX) || !Number.isFinite(event.movementY)) { return; }
-    accumulate(0, event.movementX * scale);
-    accumulate(1, event.movementY * (invertY() ? -scale : scale));
-  };
   const blur = () => { focused = false; update(); };
   const focus = () => { focused = true; update(); };
   const failure = () => { reset(); };
@@ -81,22 +68,18 @@ export const createMissionControls = ({ buffer, byteOffset, document = globalThi
     }
     release();
     capture.removeEventListener('click', request);
-    document.removeEventListener('mousemove', move);
     document.removeEventListener('pointerlockchange', update);
     document.removeEventListener('pointerlockerror', failure);
     document.removeEventListener('visibilitychange', update);
-    window.removeEventListener('keydown', keydown);
     window.removeEventListener('blur', blur);
     window.removeEventListener('focus', focus);
     signal?.removeEventListener('abort', dispose);
     spans.delete(byteOffset);
   };
   capture.addEventListener('click', request);
-  document.addEventListener('mousemove', move);
   document.addEventListener('pointerlockchange', update);
   document.addEventListener('pointerlockerror', failure);
   document.addEventListener('visibilitychange', update);
-  window.addEventListener('keydown', keydown);
   window.addEventListener('blur', blur);
   window.addEventListener('focus', focus);
   signal?.addEventListener('abort', dispose, { once: true });

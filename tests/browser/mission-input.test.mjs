@@ -8,7 +8,7 @@ const directory = resolve('out/mission-input-tests');
 mkdirSync(directory, { recursive: true });
 writeFileSync(`${directory}/run.mjs`, "import create from './input.mjs'; await create();\n");
 for (const platform of ['native', 'wasm']) {
-  test(`${platform} relative mouse axes preserve guest ABI, focus and menu boundaries`, () => {
+  test(`${platform} the simulation entry samples level time and leaves mouse look to mouse.cpp`, () => {
     const wasm = platform === 'wasm';
     const output = `${directory}/${wasm ? 'input.mjs' : 'native'}`;
     const flags = wasm

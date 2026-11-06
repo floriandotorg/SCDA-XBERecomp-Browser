@@ -1,4 +1,5 @@
 import { MENU_INPUT } from './menu-input.mjs';
+import { PAD_BUTTONS } from './input-actions.mjs';
 
 export const GAMEPAD_INPUT = Object.freeze({ words: 8, bytes: 32 });
 
@@ -57,7 +58,14 @@ export const createGamepadInput = ({ buffer, byteOffset, target = globalThis.win
       for (let n = 0; n < buttons.length; ++n) {
         if (pad.buttons?.[n]?.pressed) { mask |= buttons[n]; }
       }
-      publish([1, mask, axis(pad.axes?.[0]), axis(-pad.axes?.[1]), axis(pad.axes?.[2]), axis(-pad.axes?.[3]), 0]);
+      // the physical buttons in kPadNames order for the input core, with the triggers' travel
+      let physical = 0;
+      for (const { button, index } of PAD_BUTTONS) {
+        if (pad.buttons?.[index]?.pressed) { physical |= 1 << button; }
+      }
+      const trigger = n => Math.round(Math.max(0, Math.min(1, Number(pad.buttons?.[n]?.value) || (pad.buttons?.[n]?.pressed ? 1 : 0))) * 255);
+      physical |= (trigger(6) << 16) | (trigger(7) << 24);
+      publish([1, mask, axis(pad.axes?.[0]), axis(-pad.axes?.[1]), axis(pad.axes?.[2]), axis(-pad.axes?.[3]), physical]);
     } else { neutral(); }
     if (!disposed) { frame = requestFrame(poll); }
   };
