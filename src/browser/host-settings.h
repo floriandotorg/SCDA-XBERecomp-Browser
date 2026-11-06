@@ -25,6 +25,10 @@ inline constexpr uint32_t kSniperSensitivityWord = 6;
 inline constexpr uint32_t kFovWord = 7;
 inline constexpr uint32_t kFmvScaleWord = 8;
 inline constexpr uint32_t kAspectWord = 9;
+inline constexpr uint32_t kResolutionWord = 10;
+inline constexpr uint32_t kRenderPercentWord = 11;
+inline constexpr uint32_t kDeviceWidthWord = 12;
+inline constexpr uint32_t kDeviceHeightWord = 13;
 
 struct Block {
   std::array<std::atomic<uint32_t>, kWords> words{};

@@ -38,9 +38,11 @@ public:
   void SetMetricsSink(std::function<void(const FrameMetrics&)> sink);
   // the page's output for the next Present, asked once a frame: the canvas size in pixels and the upscaling filter.
   // A changed size is configured before that Present's packet, in order with it.
+  // scale: screen sized render targets are drawn at this many times the guest's size (1 the console's)
   struct Output {
     uint32_t width = 0, height = 0;
     bool linear = false;
+    float scale = 1;
   };
   void SetOutputSource(std::function<Output()> source);
   struct SnapshotData {

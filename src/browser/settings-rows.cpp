@@ -51,6 +51,8 @@ const std::vector<Setting>& Settings() {
     {10, "aspect", "auto", {{"auto", "AUTO"}, {"4:3", "4:3"}, {"16:10", "16:10"}, {"16:9", "16:9"}, {"21:9", "21:9"}}},
     {11, "fov", "75", {}, false, 45, 140, 1, "%.0f"},
     {12, "fmvScale", "fill", {{"fill", "FILL"}, {"4:3", "4:3"}}},
+    {13, "resolution", "console", {{"console", "CONSOLE"}, {"window", "MATCH WINDOW"}, {"dynamic", "DYNAMIC"}}},
+    {14, "resolutionScale", "100", {}, false, 50, 200, 5, "%.0f%%"},
   };
   return list;
 }
@@ -66,6 +68,8 @@ constexpr Row kSettingsRows[] = {
   {Kind::Heading, -1, "DISPLAY"},
   {Kind::Value, 0, "PICTURE"},
   {Kind::Value, 10, "ASPECT RATIO"},
+  {Kind::Value, 13, "RENDER RESOLUTION"},
+  {Kind::Value, 14, "RESOLUTION SCALE"},
   {Kind::Value, 1, "UPSCALING"},
   {Kind::Value, 11, "FIELD OF VIEW"},
   {Kind::Value, 12, "FMV SCALE"},

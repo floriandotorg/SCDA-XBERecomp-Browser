@@ -42,6 +42,8 @@
 #include "browser/hooks.h"
 #include "browser/host-settings.h"
 #include "browser/host-messages.h"
+#include "browser/render-scale.h"
+#include <chrono>
 #include "browser/input-core.h"
 #include "browser/keyboard-input.h"
 #include "cpu/x86_ops.h"
@@ -195,9 +197,20 @@ struct Session {
     auto backend = std::make_unique<browser::MenuBackend>(runtime, *image, std::make_shared<browser::webgpu::Transport>(), rendererLimits);
     renderer = backend.get();
     // the page's shape, latched for the frame: the canvas is as wide as it at the frame's 480 rows
-    renderer->SetOutputSource([] {
-      const float aspect = browser::host_settings::LatchAspect();
-      return browser::MenuBackend::Output{uint32_t(std::lround(480 * aspect)), 480, browser::host_settings::HostValue("filter") != "sharp"};
+    // the page's shape and render scale, latched for the frame (render-scale.h)
+    renderer->SetOutputSource([dynamic = browser::render_scale::Dynamic{}, last = std::chrono::steady_clock::now()]() mutable {
+      namespace hs = browser::host_settings;
+      namespace rs = browser::render_scale;
+      const float aspect = hs::LatchAspect();
+      const auto& words = hs::Shared().words;
+      const uint32_t mode = words[hs::kResolutionWord].load(), percent = words[hs::kRenderPercentWord].load();
+      auto output = rs::Compute(mode, percent ? percent : 100, aspect, words[hs::kDeviceWidthWord].load(), words[hs::kDeviceHeightWord].load());
+      const auto now = std::chrono::steady_clock::now();
+      const double frame = std::chrono::duration<double, std::milli>(now - last).count();
+      last = now;
+      if (mode == rs::kDynamic && output.scale != 1) { output.scale = dynamic.Next(output.scale, frame); }
+      const bool linear = hs::HostValue("filter") != "sharp" || output.height != 480;
+      return browser::MenuBackend::Output{output.width, output.height, linear, output.scale};
     });
     graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), graphics_mode, std::move(backend));
     graphics->ConfigurePresentCheckpoint(BROWSER_MENU_TRACE_FRAMES);

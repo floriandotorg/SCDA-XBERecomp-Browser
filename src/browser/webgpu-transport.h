@@ -6,7 +6,7 @@
 namespace browser::webgpu {
 constexpr uint32_t MaxBytes = 4 * 1024 * 1024;
 constexpr uint32_t ReadbackSlots = 4;
-enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17, ReadbackStart = 18, ReadbackCollect = 19 };
+enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17, ReadbackStart = 18, ReadbackCollect = 19, Blit = 20 };
 enum class Status : uint32_t { Ok, Error, Closed, Lost };
 struct Dimensions { uint32_t width, height; };
 struct TexturePacket { uint32_t width, height, depth; uint32_t levels = 1; };
@@ -40,6 +40,14 @@ struct ClearPacket { float color[4], depth; uint32_t stencil, flags, depth_targe
 // pillarbox: PresentPillarbox shows a 4:3 picture in the middle, PresentLinear samples the frame bilinearly
 enum : uint32_t { PresentPillarbox = 1, PresentLinear = 2 };
 struct PresentPacket { uint32_t pillarbox; };
+// a source rectangle drawn over a destination rectangle (the resource): colour by box filtering taps x taps source
+// texels a pixel (bilinear for 0), depth by the nearest texel; force_opaque writes alpha 1 (X8 formats)
+struct BlitPacket {
+  uint32_t source;
+  float source_rect[4], destination_rect[4];
+  uint32_t taps = 0, force_opaque = 0;
+};
+static_assert(sizeof(BlitPacket) == 44);
 struct CopyPacket { uint32_t source, width, height; uint32_t source_x = 0, source_y = 0, destination_x = 0, destination_y = 0, force_opaque = 0; };
 static_assert(sizeof(CopyPacket) == 32);
 static_assert(sizeof(PipelinePacket) == 112);

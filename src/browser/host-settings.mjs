@@ -16,11 +16,16 @@ export const HOST_SETTINGS_FIELDS = Object.freeze([
   Object.freeze({ field: 'fmv_scale', key: 'fmvScale', type: 'u32', word: 8, values: Object.freeze(['fill', '4:3']) }),
   // the frame's shape the page shows (frame-shape.mjs), computed from the aspect setting and the window
   Object.freeze({ field: 'aspect', key: 'effectiveAspect', type: 'f32', word: 9, computed: true }),
+  // render scale (C07): the mode is the browser's own, the percent native's render_percent; the canvas's device pixels
+  Object.freeze({ field: 'resolution', key: 'resolution', type: 'u32', word: 10, values: Object.freeze(['console', 'window', 'dynamic']), browser: true }),
+  Object.freeze({ field: 'render_percent', key: 'resolutionScale', type: 'u32', word: 11 }),
+  Object.freeze({ field: 'device_width', key: 'deviceWidth', type: 'u32', word: 12, computed: true }),
+  Object.freeze({ field: 'device_height', key: 'deviceHeight', type: 'u32', word: 13, computed: true }),
   Object.freeze({ field: 'keys', key: 'keys', type: 'map' }),
   Object.freeze({ field: 'pad_buttons', key: 'padButtons', type: 'map' }),
   // browser settings the in-game options pages show and step (settings-rows.cpp), as host.<key>=<value> lines
   ...['scaling', 'filter', 'volume', 'showFps', 'skipIntros', 'pauseOnFocusLoss', 'sensitivity', 'weaponSensitivity',
-    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
+    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
 ]);
 const REVISION = 0, SCHEMA = 1, FLAGS = 2;
 const ATTEMPTS = 1 << 16;

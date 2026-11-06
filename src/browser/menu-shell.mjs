@@ -12,12 +12,20 @@ import { applyHostMessage, HOST_MESSAGES } from './host-messages.mjs';
 import { createConsoleModel, routeHostMessage } from './console-model.mjs';
 
 const onOff = Object.freeze({ true: 'On', false: 'Off' });
+// the render size a scale gives in Match window: the frame's 640 x 480 times the window's device rows over 480
+let deviceRows = 480;
+const renderSize = percent => {
+  const scale = Math.min(3, deviceRows * percent / 100 / 480);
+  return `${Math.floor(640 * scale)}x${Math.floor(480 * scale)}`;
+};
 const KEEP_CAPS = new Set(['EEV', 'OPSAT', 'EMF', 'HUD', 'COOP', 'LS', 'RS', 'LB', 'RB', 'LT', 'RT']);
 const sentence = text => text.split(' ').map((word, n) => KEEP_CAPS.has(word) ? word : n ? word.toLowerCase() : word[0] + word.slice(1).toLowerCase()).join(' ');
 const TABS = Object.freeze([
   { id: 'display', label: 'Display', rows: [
     { setting: 'scaling', label: 'Picture', values: { fit: 'Fit to window', integer: 'Pixel perfect', stretch: 'Stretch' } },
     { setting: 'aspect', label: 'Aspect ratio', values: { auto: 'Auto: match window', '4:3': '4:3', '16:10': '16:10', '16:9': '16:9', '21:9': '21:9' } },
+    { setting: 'resolution', label: 'Resolution', values: { console: 'Console (480 lines)', window: 'Match window', dynamic: 'Dynamic' } },
+    { setting: 'resolutionScale', label: 'Resolution scale', format: value => `${value}% (${renderSize(value)})` },
     { setting: 'filter', label: 'Upscaling', values: { smooth: 'Smooth', sharp: 'Sharp' } },
     { setting: 'fov', label: 'Field of view', format: value => value === 75 ? '75 (default)' : String(value) },
     { setting: 'fmvScale', label: 'Full screen movies', values: { fill: 'Fill', '4:3': '4:3' } },
@@ -108,6 +116,12 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     if (!diagnostic.hidden) { diagnostic.textContent = JSON.stringify(evidence, null, 2); }
   };
   let shape = { aspect: 4 / 3 }, hostSettings, layoutTimer;
+  const deviceSize = () => {
+    const ratio = window.devicePixelRatio || 1;
+    const size = { deviceWidth: Math.max(1, Math.min(8192, Math.round(shape.width * ratio))), deviceHeight: Math.max(1, Math.min(8192, Math.round(shape.height * ratio))) };
+    deviceRows = size.deviceHeight;
+    return size;
+  };
   const layout = () => {
     shape = frameShape({ aspect: settings.get('aspect'), scaling: settings.get('scaling'), width: window.innerWidth,
       height: window.innerHeight, ratio: window.devicePixelRatio || 1 });
@@ -446,7 +460,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       output: text => { consoleModel.print(text); if (consoleOpen) { showConsoleLog(); } },
       setting: value => { applyHostMessage(settings, value); },
     }, HOST_MESSAGES),
-    hostComputed: () => ({ effectiveAspect: shape.aspect }),
+    hostComputed: () => ({ effectiveAspect: shape.aspect, ...deviceSize() }),
     onHostSettings: value => { hostSettings = value; },
     acquireCanvas: () => {
       if (!globalThis.navigator?.gpu || typeof canvas.transferControlToOffscreen !== 'function') {
@@ -627,7 +641,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     void select(file, startAfter);
   };
   const stopSettings = settings.subscribe(name => {
-    if (name === 'scaling' || name === 'filter' || name === 'aspect') { layout(); }
+    if (name === 'scaling' || name === 'filter' || name === 'aspect' || name === 'resolution') { layout(); }
     if (name === 'volume') { audio?.setVolume(settings.get('volume') / 100); }
     if (name === 'showFps') { show(); }
     if (name === 'showDiagnostics') { showDiagnostics(); }

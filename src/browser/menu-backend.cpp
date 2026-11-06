@@ -1,4 +1,5 @@
 #include "browser/menu-backend.h"
+#include "browser/render-scale.h"
 #include "browser/guest-vertex.h"
 #include "browser/guest-primitives.h"
 #include "browser/menu-shaders.h"
@@ -274,6 +275,10 @@ struct MenuBackend::Impl {
     uint32_t lateSlot = 0;
     std::vector<uint8_t> delivered;
     std::optional<uint64_t> cpuVersion;
+    // the GPU texture's size: the guest's, or more for a screen sized target at a render scale
+    uint32_t hostWidth = 0, hostHeight = 0;
+    uint32_t lateSource = 0;  // the texture a late readback reads: the resource, or its console sized copy
+    bool scaled() const { return hostWidth != desc.width || hostHeight != desc.height; }
   };
   Runtime& runtime;
   PreparedImage& image;
@@ -314,6 +319,64 @@ struct MenuBackend::Impl {
   uint32_t width = 0, height = 0;
   uint32_t canvasWidth = 0, canvasHeight = 0;
   std::function<MenuBackend::Output()> outputSource;
+  float scale = 1;  // screen sized render targets are drawn this many times the guest's size
+  std::pair<uint32_t, uint32_t> hostSize(const gpu::TextureDesc& desc, bool target) const {
+    if (!target || desc.levels != 1 || desc.cube || desc.depth > 1) { return {desc.width, desc.height}; }
+    return render_scale::HostSize(desc.width, desc.height, width, height, scale);
+  }
+  static size_t feedbackBytes(const Resource& item) { return size_t(item.hostWidth) * item.hostHeight * 4; }
+  // a texture of width x height drawn over from source's rectangle: box filtered when shrinking, bilinear otherwise
+  webgpu::Result blit(uint32_t source, uint32_t destination, std::array<float, 4> from, std::array<float, 4> to, bool forceOpaque = false) {
+    webgpu::BlitPacket packet{source, {from[0], from[1], from[2], from[3]}, {to[0], to[1], to[2], to[3]}};
+    const float shrink = std::max(from[2] / to[2], from[3] / to[3]);
+    packet.taps = shrink > 1.01f ? std::min(16u, uint32_t(std::ceil(shrink))) : 0;
+    packet.force_opaque = forceOpaque;
+    return sendPacket(webgpu::Opcode::Blit, destination, packet);
+  }
+  uint32_t createEmpty(uint32_t w, uint32_t h, bool depth) {
+    const uint32_t id = newId();
+    std::vector<uint8_t> payload;
+    append(payload, webgpu::TexturePacket{w, h, depth ? 1u : 0u, 1});
+    send(webgpu::Opcode::CreateTexture, id, payload);
+    return id;
+  }
+  // the resource's texture at another size, its picture kept
+  void resample(Resource& item, uint32_t w, uint32_t h) {
+    if (item.hostWidth == w && item.hostHeight == h) { return; }
+    collectLate(item);
+    const uint32_t id = createEmpty(w, h, item.depth);
+    const auto result = blit(item.id, id, {0, 0, float(item.hostWidth), float(item.hostHeight)}, {0, 0, float(w), float(h)});
+    send(webgpu::Opcode::Destroy, item.id);
+    if (item.feedback) {
+      send(webgpu::Opcode::Destroy, item.feedback);
+      const size_t bytes = feedbackBytes(item);
+      resident -= std::min(resident, bytes); item.residentBytes -= std::min(item.residentBytes, bytes);
+      item.feedback = 0; item.feedbackVersion = 0; item.feedbackUsed = 0;
+    }
+    item.id = id; item.hostWidth = w; item.hostHeight = h; item.command = result.command; ++item.version;
+  }
+  // a console sized copy of a scaled target for a readback, which the caller destroys
+  uint32_t shrink(Resource& item) {
+    const uint32_t id = createEmpty(item.desc.width, item.desc.height, item.depth);
+    blit(item.id, id, {0, 0, float(item.hostWidth), float(item.hostHeight)}, {0, 0, float(item.desc.width), float(item.desc.height)});
+    return id;
+  }
+  // the guest rectangle in the resource's host pixels, truncated as native's ScaledRect
+  std::array<int32_t, 4> scaledRect(const Resource& item, std::array<int32_t, 4> rect) const {
+    if (!item.scaled()) { return rect; }
+    const auto x = [&](int32_t value) { return int32_t(int64_t(value) * item.hostWidth / item.desc.width); };
+    const auto y = [&](int32_t value) { return int32_t(int64_t(value) * item.hostHeight / item.desc.height); };
+    return {x(rect[0]), y(rect[1]), x(rect[2]), y(rect[3])};
+  }
+  void applyScale(float next) {
+    if (next == scale) { return; }
+    scale = next;
+    for (auto& [key, item] : resources) {
+      if (!item.renderTarget) { continue; }
+      const auto [w, h] = hostSize(item.desc, true);
+      resample(item, w, h);
+    }
+  }
   uint32_t submitted = 0, completed = 0;
   uint64_t submittedCount = 0, completedCount = 0;
   uint32_t nextFence = 0, completedFence = 0;
@@ -657,7 +720,7 @@ struct MenuBackend::Impl {
       if (oldest == resources.end()) { return; }
       auto& retired = oldest->second;
       send(webgpu::Opcode::Destroy, retired.feedback);
-      const size_t retiredBytes = size_t(retired.desc.width) * retired.desc.height * 4;
+      const size_t retiredBytes = feedbackBytes(retired);
       resident -= retiredBytes; retired.residentBytes -= retiredBytes;
       retired.feedback = 0; retired.feedbackVersion = 0; retired.feedbackUsed = 0;
     }
@@ -718,6 +781,7 @@ struct MenuBackend::Impl {
           return item;
         }
         require(!depth, "menu backend unsupported CPU depth surface upload");
+        if (item.scaled()) { return over(item, std::move(source), cpuVersion); }
         changedSource = std::move(source);
       }
     }
@@ -748,7 +812,23 @@ struct MenuBackend::Impl {
     append(payload, packet);
     if (desc.depth > 1) { append(payload, desc.depth); }
     appendBytes(payload, rgba);
-    const auto result = send(webgpu::Opcode::CreateTexture, id, payload);
+    const auto [hostWidth, hostHeight] = hostSize(desc, surface || (found != resources.end() && found->second.renderTarget));
+    webgpu::Result result;
+    if (hostWidth == desc.width && hostHeight == desc.height) {
+      result = send(webgpu::Opcode::CreateTexture, id, payload);
+    } else if (depth) {
+      payload.clear();
+      append(payload, webgpu::TexturePacket{hostWidth, hostHeight, 1u, 1});
+      result = send(webgpu::Opcode::CreateTexture, id, payload);
+    } else {
+      const uint32_t staging = newId();
+      send(webgpu::Opcode::CreateTexture, staging, payload);
+      payload.clear();
+      append(payload, webgpu::TexturePacket{hostWidth, hostHeight, 0u, 1});
+      send(webgpu::Opcode::CreateTexture, id, payload);
+      result = blit(staging, id, {0, 0, float(desc.width), float(desc.height)}, {0, 0, float(hostWidth), float(hostHeight)});
+      send(webgpu::Opcode::Destroy, staging);
+    }
     uint64_t version = 1;
     if (found != resources.end()) {
       version = found->second.version + 1;
@@ -760,7 +840,8 @@ struct MenuBackend::Impl {
     Resource item;
     item.id = id; item.version = version; item.command = result.command; item.cpuVersion = cpuVersion;
     item.desc = desc; item.headerAddress = headerAddress; item.header = std::move(header); item.uploaded = std::move(source); item.depth = depth; item.residentBytes = residentBytes;
-    if (found != resources.end() && !replacedStorage) { item.views = std::move(found->second.views); }
+    item.hostWidth = hostWidth; item.hostHeight = hostHeight;
+    if (found != resources.end() && !replacedStorage) { item.views = std::move(found->second.views); item.renderTarget = found->second.renderTarget; }
     item.views.insert(headerAddress);
     resources[key] = std::move(item);
     resident += residentBytes;
@@ -768,8 +849,41 @@ struct MenuBackend::Impl {
     observeView(stored, headerAddress);
     return stored;
   }
+  // CPU writes into a scaled target: the rows that changed are drawn over it from a console sized upload, so the rest
+  // of the high resolution picture stays (native's UploadTarget after a Sync)
+  Resource& over(Resource& item, std::vector<uint8_t> source, std::optional<uint64_t> cpuVersion) {
+    uint32_t first = 0, last = item.desc.height;
+    if (item.desc.linear && item.desc.pitch && source.size() == item.uploaded.size()) {
+      const auto differs = [&](uint32_t row) {
+        const size_t begin = size_t(row) * item.desc.pitch, end = std::min(begin + item.desc.pitch, source.size());
+        return !std::equal(source.begin() + begin, source.begin() + end, item.uploaded.begin() + begin);
+      };
+      while (first < last && !differs(first)) { ++first; }
+      while (last > first && !differs(last - 1)) { --last; }
+    }
+    if (first < last) {
+      auto decoded = menu::DecodeTexture(item.desc, source, {}, 0, 0);
+      require(decoded.supported, decoded.diagnostic.c_str());
+      const uint32_t staging = newId();
+      std::vector<uint8_t> payload;
+      append(payload, webgpu::TexturePacket{item.desc.width, item.desc.height, 0, 1});
+      appendBytes(payload, decoded.pixels);
+      send(webgpu::Opcode::CreateTexture, staging, payload);
+      const float ky = float(item.hostHeight) / item.desc.height;
+      const auto result = blit(staging, item.id, {0, float(first), float(item.desc.width), float(last - first)},
+        {0, std::floor(first * ky), float(item.hostWidth), std::ceil(last * ky) - std::floor(first * ky)});
+      send(webgpu::Opcode::Destroy, staging);
+      item.command = result.command; ++item.version;
+    }
+    item.uploaded = std::move(source); item.cpuVersion = cpuVersion;
+    return item;
+  }
   Resource& surface(const gpu::Surface& value, bool depth = false) {
     auto& item = ensure(value.header, true, depth);
+    if (!item.renderTarget) {
+      const auto [w, h] = hostSize(item.desc, true);
+      resample(item, w, h);
+    }
     item.renderTarget = true;
     require(item.desc.data == address(value.data) && word(item.header, 12) == value.format && word(item.header, 16) == value.size, "menu backend stale or incompatible surface descriptor");
     return item;
@@ -824,7 +938,7 @@ struct MenuBackend::Impl {
     require(!item.depth, "menu backend unsupported depth feedback sampling");
     require(feedbackSequence != UINT64_MAX, "menu backend feedback cache sequence exhausted");
     if (!item.feedback) {
-      const size_t bytes = size_t(item.desc.width) * item.desc.height * 4;
+      const size_t bytes = feedbackBytes(item);
       require(bytes <= limits.maxResourceBytes && bytes <= limits.maxResidentBytes, "menu backend feedback resident byte budget exceeded");
       trimFeedback(1, bytes, &item);
       require(resourceCount() < limits.maxResources, ("menu backend feedback resource count budget exceeded: originals=" + std::to_string(resources.size()) +
@@ -832,8 +946,7 @@ struct MenuBackend::Impl {
         " limit=" + std::to_string(limits.maxResources)).c_str());
       require(bytes <= limits.maxResourceBytes && bytes <= limits.maxResidentBytes && resident <= limits.maxResidentBytes - bytes, "menu backend feedback resident byte budget exceeded");
       std::vector<uint8_t> payload;
-      append(payload, webgpu::TexturePacket{item.desc.width, item.desc.height, 0});
-      payload.resize(payload.size() + bytes, 0);
+      append(payload, webgpu::TexturePacket{item.hostWidth, item.hostHeight, 0});
       const uint32_t id = newId();
       send(webgpu::Opcode::CreateTexture, id, payload);
       item.feedback = id; item.residentBytes += bytes; resident += bytes;
@@ -841,7 +954,7 @@ struct MenuBackend::Impl {
     item.feedbackUsed = ++feedbackSequence;
     feedbackPins.insert(item.feedback);
     if (item.feedbackVersion != item.version) {
-      sendPacket(webgpu::Opcode::Copy, item.feedback, webgpu::CopyPacket{item.id, item.desc.width, item.desc.height});
+      sendPacket(webgpu::Opcode::Copy, item.feedback, webgpu::CopyPacket{item.id, item.hostWidth, item.hostHeight});
       item.feedbackVersion = item.version;
     }
     return item.feedback;
@@ -883,15 +996,22 @@ struct MenuBackend::Impl {
     }
     return false;
   }
-  std::vector<uint8_t> readback(Resource& item) { return decodeReadback(item, send(webgpu::Opcode::Readback, item.id)); }
+  std::vector<uint8_t> readback(Resource& item) {
+    if (!item.scaled()) { return decodeReadback(item, send(webgpu::Opcode::Readback, item.id)); }
+    const uint32_t copy = shrink(item);
+    auto result = send(webgpu::Opcode::Readback, copy);
+    send(webgpu::Opcode::Destroy, copy);
+    return decodeReadback(item, result);
+  }
   bool startLate(Resource& item) {
     const auto free = std::find(lateSlots.begin(), lateSlots.end(), 0u);
     if (free == lateSlots.end()) { return false; }
     const uint32_t slot = uint32_t(free - lateSlots.begin());
     std::vector<uint8_t> request;
     append(request, slot);
-    send(webgpu::Opcode::ReadbackStart, item.id, request);
-    *free = item.id;
+    item.lateSource = item.scaled() ? shrink(item) : item.id;
+    send(webgpu::Opcode::ReadbackStart, item.lateSource, request);
+    *free = item.lateSource;
     item.lateStarted = true; item.lateSlot = slot;
     return true;
   }
@@ -900,7 +1020,7 @@ struct MenuBackend::Impl {
     std::vector<uint8_t> request;
     append(request, item.lateSlot); append(request, uint32_t(poll));
     const auto started = std::chrono::steady_clock::now();
-    const auto result = execute(webgpu::Opcode::ReadbackCollect, item.id, request);
+    const auto result = execute(webgpu::Opcode::ReadbackCollect, item.lateSource, request);
     const uint64_t elapsed = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
     commandWaitMicroseconds += elapsed; readbackWaitMicroseconds += elapsed;
     if (result.status != webgpu::Status::Ok) {
@@ -912,6 +1032,7 @@ struct MenuBackend::Impl {
     }
     lateSlots.at(item.lateSlot) = 0;
     item.lateStarted = false;
+    if (item.lateSource != item.id) { send(webgpu::Opcode::Destroy, item.lateSource); }
     auto bytes = decodeReadback(item, result);
     resident = resident - item.late.size() + bytes.size();
     item.late = std::move(bytes);
@@ -1162,6 +1283,12 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     require((word(header, 0) & 0x70000) == 0, "menu backend incompatible vertex buffer format");
     addRequest(RenderResourceKind::VertexBuffer, stream.vb, address(word(header, 4)), std::max(streamBytes[n], 1u), 1);
   }
+  const bool depthOnly = !input.rt.data && !input.simple[gpu::kMColorWriteEnable / 4] && input.zs.header &&
+    (input.rs[gpu::kRsZEnable] || input.rs[gpu::kRsStencilEnable]);
+  // targets first: one sampled before it was drawn to is promoted to its render scale before any texture of this draw
+  // (its feedback copy included) is bound
+  if (!depthOnly) { impl_->surface(input.rt); }
+  if (input.zs.header && (input.rs[gpu::kRsZEnable] || input.rs[gpu::kRsStencilEnable])) { impl_->surface(input.zs, true); }
   gpu::TexInfo texinfo[4]{};
   std::array<uint32_t, 4> textureFormats{};
   std::array<std::array<float, 4>, 4> texsize{};
@@ -1199,14 +1326,14 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
       std::fill_n(packet.sampler[n], 5, 1);
     }
   }
-  const bool depthOnly = !input.rt.data && !input.simple[gpu::kMColorWriteEnable / 4] && input.zs.header &&
-    (input.rs[gpu::kRsZEnable] || input.rs[gpu::kRsStencilEnable]);
+
   auto* colorTarget = depthOnly ? nullptr : &impl_->surface(input.rt);
   if (colorTarget) { addRequest(RenderResourceKind::Surface, input.rt.header, colorTarget->desc.data, uint32_t(colorTarget->uploaded.size()), colorTarget->version, colorTarget->id); }
   Impl::Resource* depthTarget = nullptr;
   if (input.zs.header && (input.rs[gpu::kRsZEnable] || input.rs[gpu::kRsStencilEnable])) {
     depthTarget = &impl_->surface(input.zs, true);
-    require(!colorTarget || (depthTarget->desc.width == colorTarget->desc.width && depthTarget->desc.height == colorTarget->desc.height), "menu backend incompatible depth target dimensions");
+    require(!colorTarget || (depthTarget->desc.width == colorTarget->desc.width && depthTarget->desc.height == colorTarget->desc.height &&
+      depthTarget->hostWidth == colorTarget->hostWidth && depthTarget->hostHeight == colorTarget->hostHeight), "menu backend incompatible depth target dimensions");
     impl_->initializeDepth(*depthTarget);
     packet.depth_target = depthTarget->id;
     addRequest(RenderResourceKind::Surface, input.zs.header, depthTarget->desc.data, uint32_t(depthTarget->uploaded.size()), depthTarget->version, depthTarget->id);
@@ -1333,7 +1460,8 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     require(std::isfinite(offset) && std::isfinite(slope) && std::isfinite(state.zscale) && state.zscale > 0, "menu backend invalid depth bias state");
     const double units = std::round(double(offset) * 16777215.0 / state.zscale);
     require(units >= INT32_MIN && units <= INT32_MAX, "menu backend depth bias exceeds signed D24 units");
-    constants.depth_bias = {float(units / 16777215.0), slope, 0, 0};
+    // the slope is per console pixel: a scaled target's pixels are smaller
+    constants.depth_bias = {float(units / 16777215.0), slope * float(target.hostWidth) / float(target.desc.width), 0, 0};
   }
   for (uint32_t n = 0; n < 4; ++n) {
     if (!state.textures[n] || (packet.sampler[n][6] == 0 && packet.sampler[n][2] == packet.sampler[n][3])) { constants.lod_bias[n] = 0; }
@@ -1341,7 +1469,7 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   packet.uniform_bytes = sizeof(constants);
   require(uint64_t(state.viewport.x) + state.viewport.w <= target.desc.width && uint64_t(state.viewport.y) + state.viewport.h <= target.desc.height && state.viewport.w && state.viewport.h, "menu backend unsupported viewport outside target");
   require(std::isfinite(state.viewport.min_z) && std::isfinite(state.viewport.max_z) && state.viewport.min_z >= 0 && state.viewport.max_z <= 1 && state.viewport.min_z <= state.viewport.max_z, "menu backend unsupported viewport depth range");
-  packet.viewport[2] = float(target.desc.width); packet.viewport[3] = float(target.desc.height);
+  packet.viewport[2] = float(target.hostWidth); packet.viewport[3] = float(target.hostHeight);
   packet.viewport[5] = 1;
   uint32_t left = state.viewport.x, top = state.viewport.y;
   uint32_t right = left + state.viewport.w, bottom = top + state.viewport.h;
@@ -1350,8 +1478,9 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     left = std::max(left, state.scissors[0]); top = std::max(top, state.scissors[1]);
     right = std::min(right, state.scissors[2]); bottom = std::min(bottom, state.scissors[3]);
   }
-  packet.scissor[0] = left; packet.scissor[1] = top;
-  packet.scissor[2] = std::max(right, left) - left; packet.scissor[3] = std::max(bottom, top) - top;
+  const auto scissor = impl_->scaledRect(target, {int32_t(left), int32_t(top), int32_t(std::max(right, left)), int32_t(std::max(bottom, top))});
+  packet.scissor[0] = uint32_t(scissor[0]); packet.scissor[1] = uint32_t(scissor[1]);
+  packet.scissor[2] = uint32_t(scissor[2] - scissor[0]); packet.scissor[3] = uint32_t(scissor[3] - scissor[1]);
   if (raw) {
     webgpu::ResidentDraw draw{};
     for (uint32_t n = 0; n < 16; ++n) {
@@ -1496,7 +1625,14 @@ void MenuBackend::Clear(const gpu::State& state, uint32_t count, const uint8_t* 
     request.flags = clearFlags;
     request.depth_target = depthTarget ? depthTarget->id : 0;
     std::vector<uint8_t> bytes;
-    append(bytes, request); appendBytes(bytes, rectangles);
+    append(bytes, request);
+    const auto& sized = colorTarget ? *colorTarget : *depthTarget;
+    for (size_t n = 0; n + 16 <= rectangles.size(); n += 16) {
+      std::array<int32_t, 4> rect;
+      std::memcpy(rect.data(), rectangles.data() + n, 16);
+      rect = impl_->scaledRect(sized, rect);
+      appendBytes(bytes, {reinterpret_cast<const uint8_t*>(rect.data()), 16});
+    }
     const auto result = impl_->send(webgpu::Opcode::Clear, colorTarget ? colorTarget->id : 0, bytes);
     for (auto* item : {colorTarget, depthTarget}) {
       if (!item) { continue; }
@@ -1504,7 +1640,7 @@ void MenuBackend::Clear(const gpu::State& state, uint32_t count, const uint8_t* 
       item->dirty = true; item->command = result.command; ++item->version;
     }
   };
-  if (target && depth && (target->desc.width != depth->desc.width || target->desc.height != depth->desc.height)) {
+  if (target && depth && (target->hostWidth != depth->hostWidth || target->hostHeight != depth->hostHeight)) {
     submit(target, nullptr, 1); submit(nullptr, depth, packet.flags & 6);
   } else { submit(target, depth, packet.flags); }
 }
@@ -1564,10 +1700,25 @@ void MenuBackend::Copy(const gpu::Surface& source, const gpu::Surface& destinati
   const auto copies = regions(1);
   if (copies.empty()) { return; }
   const uint32_t sourceId = from.id == to.id ? impl_->feedbackTexture(from) : from.id;
+  const float fx = float(from.hostWidth) / from.desc.width, fy = float(from.hostHeight) / from.desc.height;
+  const float tx = float(to.hostWidth) / to.desc.width, ty = float(to.hostHeight) / to.desc.height;
   for (auto packet : copies) {
     packet.source = sourceId;
     packet.force_opaque = colorFamily(to.desc.format) == 2;
-    const auto result = impl_->sendPacket(webgpu::Opcode::Copy, to.id, packet);
+    webgpu::Result result;
+    if (fx == tx && fy == ty) {
+      const auto source = impl_->scaledRect(from, {int32_t(packet.source_x), int32_t(packet.source_y), int32_t(packet.source_x + packet.width), int32_t(packet.source_y + packet.height)});
+      const auto destination = impl_->scaledRect(to, {int32_t(packet.destination_x), int32_t(packet.destination_y), int32_t(packet.destination_x + packet.width), int32_t(packet.destination_y + packet.height)});
+      packet.source_x = uint32_t(source[0]); packet.source_y = uint32_t(source[1]);
+      packet.destination_x = uint32_t(destination[0]); packet.destination_y = uint32_t(destination[1]);
+      packet.width = uint32_t(std::min(source[2] - source[0], destination[2] - destination[0]));
+      packet.height = uint32_t(std::min(source[3] - source[1], destination[3] - destination[1]));
+      if (!packet.width || !packet.height) { continue; }
+      result = impl_->sendPacket(webgpu::Opcode::Copy, to.id, packet);
+    } else {
+      result = impl_->blit(sourceId, to.id, {packet.source_x * fx, packet.source_y * fy, packet.width * fx, packet.height * fy},
+        {packet.destination_x * tx, packet.destination_y * ty, packet.width * tx, packet.height * ty}, packet.force_opaque);
+    }
     to.dirty = true; to.command = result.command; ++to.version;
   }
 }
@@ -1587,6 +1738,7 @@ void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
   require(impl_->initialized, "menu backend present before initialization");
   auto& item = impl_->surface(front);
   const Output output = impl_->outputSource ? impl_->outputSource() : Output{};
+  if (output.scale > 0) { impl_->applyScale(output.scale); }
   if (output.width && output.height && (output.width != impl_->canvasWidth || output.height != impl_->canvasHeight)) {
     require(output.width <= 8192 && output.height <= 8192, "menu backend canvas dimension budget exceeded");
     impl_->sendPacket(webgpu::Opcode::Configure, 0, webgpu::Dimensions{output.width, output.height});

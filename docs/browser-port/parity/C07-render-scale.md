@@ -206,3 +206,53 @@ which sends Configure and resizes resources at a Present boundary.
   three).
 - The widescreen shape itself, hooks and pillarbox (C06).
 - Anisotropic filtering and shadow resolution settings.
+
+## Implementation notes
+
+What C07 built (phase 1 of the scale rule).
+
+### Settings and sizing
+
+- settings.mjs: `resolution` (console, window, dynamic; Display tab "Resolution": Console (480 lines), Match window,
+  Dynamic) and `resolutionScale` (50 to 200 by 5, shown with the render size it gives). In-game RECOMP SETTINGS >
+  DISPLAY rows RENDER RESOLUTION and RESOLUTION SCALE.
+- Host settings words 10 (mode), 11 (`render_percent`) and 12, 13 (the frame box in device pixels, computed by
+  menu-shell's `layout()`).
+- `src/browser/render-scale.h`: `Compute` (Console keeps C06's `round(480 * aspect)` x 480 canvas at 1x; Match window
+  and Dynamic size the canvas to the device pixels and scale by `rows * percent / 100 / 480`, clamped to 0.5 to 3, so
+  a target is at most 1920 x 1440), `HostSize` (only targets of the back buffer's size scale) and `Dynamic` (a step
+  of 5% down after a second averaging above 17.5 ms, up after three seconds below 14 ms, between half the ceiling and
+  the ceiling). Contract test `tests/browser/render-scale.cpp`. boot-wasm's output source applies it once a Present.
+
+### Backend
+
+- `Resource::hostWidth/hostHeight`: screen sized render targets (colour and depth) get the scaled size; everything
+  else, the shadow map included, stays 1x. A resource first sampled as a texture is promoted (resampled) when it
+  becomes a target; Draw resolves its targets before its textures so a promotion never orphans a bound feedback copy.
+- New service opcode `Blit` (source rectangle over a destination rectangle: colour box filtered when shrinking,
+  bilinear otherwise, optional opaque alpha; depth nearest, stencil not written). CreateTexture accepts no pixels for
+  a single level colour texture (a target the backend fills itself).
+- CPU content into a scaled target: a console sized staging upload blitted up; after a readback only the rows the CPU
+  changed are drawn over (native's UploadTarget "over"). Non-uniform depth imports index the console sized values from
+  the scaled target (UploadDepth's shader takes the ratio).
+- Draw: viewport at the host size, scissor truncated as `ScaledRect`, slope scaled depth bias multiplied by the
+  scale, `surf` and `texsize` stay in guest units. Clear rectangles are scaled per target. Copies between equal scales
+  scale their regions; between different scales they blit.
+- Readbacks (`Sync`, `RecordLate`/`DeliverLate`, a dirty release) read a console sized blitted copy, so payloads keep
+  today's sizes; a scaled depth target's readback has stencil 0.
+- A scale change at a Present resamples every render target to its new size, keeping its picture (native drops them).
+
+### Checked in the browser (out/parity, 1280x720, development start)
+
+- Match window at 100%: canvas 1280 x 720, targets 960 x 720, visibly sharper edges, no validation errors.
+- Switching to 50% mid-mission resampled to 480 x 360 without a validation error, a fault or a lost picture.
+- Console mode unchanged (853 x 480 canvas, no errors).
+
+### Not done
+
+- `kTexWide` wide sampling (task 10) and `UnitTexcoords`: glow and blur chains sampling an upscaled target take
+  fewer console texels per tap, so glow and night vision may look thinner above 1x, and wrapped edge texels can show
+  on small HUD quads.
+- Rendering straight into the surface texture (task 14) and frame capture above 4 MiB (task 15): `capture()` refuses
+  canvases larger than 1024 x 1024 pixels' worth of bytes in Match window.
+- The perf harness runs, the 200% and dynamic soak, and the quick save thumbnail check were not run.

@@ -435,7 +435,7 @@ void prepare_depth_upload() {
   depth_upload_layout = wgpuDeviceCreatePipelineLayout(device, &layout_descriptor);
   auto source = WGPU_SHADER_SOURCE_WGSL_INIT;
   source.code = text(R"(
-struct Parameters { width: u32, maximum: u32, padding: vec2<u32> }
+struct Parameters { width: u32, maximum: u32, scale: vec2<f32> }
 struct Vertex { @builtin(position) position: vec4<f32>, @location(0) @interpolate(flat) stencil: u32 }
 @group(0) @binding(0) var<storage, read> pixels: array<u32>;
 @group(0) @binding(1) var<uniform> parameters: Parameters;
@@ -447,7 +447,8 @@ struct Vertex { @builtin(position) position: vec4<f32>, @location(0) @interpolat
   return result;
 }
 @fragment fn fs_main(input: Vertex) -> @builtin(frag_depth) f32 {
-  let value = pixels[u32(input.position.y) * parameters.width + u32(input.position.x)];
+  let at = vec2<u32>(floor(input.position.xy * parameters.scale));
+  let value = pixels[at.y * parameters.width + at.x];
   if ((value & 255u) != input.stencil) { discard; }
   let depth = value >> 8u;
   if (parameters.maximum == 65535u) { return unpack2x16unorm(depth).x; }
@@ -676,6 +677,148 @@ void clear(uint32_t resource, std::span<const uint8_t> bytes) {
       if (group) { wgpuBindGroupRelease(group); } if (uniforms) { wgpuBufferRelease(uniforms); }
       if (color.view) { wgpuTextureViewRelease(color.view); } if (depth.view) { wgpuTextureViewRelease(depth.view); }
 }
+WGPUBindGroupLayout blit_bindings[2];
+WGPUPipelineLayout blit_layouts[2];
+WGPURenderPipeline blit_pipelines[3];
+// 0 colour, 1 colour with alpha forced to 1, 2 depth
+WGPURenderPipeline blit_pipeline(uint32_t kind) {
+  if (blit_pipelines[kind]) { return blit_pipelines[kind]; }
+  const bool depth = kind == 2;
+  if (!blit_layouts[depth]) {
+    std::array<WGPUBindGroupLayoutEntry, 2> entries{};
+    for (uint32_t n = 0; n < entries.size(); ++n) { entries[n] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT; entries[n].binding = n; entries[n].visibility = WGPUShaderStage_Fragment; }
+    entries[0].texture.sampleType = depth ? WGPUTextureSampleType_Depth : WGPUTextureSampleType_UnfilterableFloat;
+    entries[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+    entries[1].buffer.type = WGPUBufferBindingType_Uniform;
+    auto group = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT; group.entryCount = entries.size(); group.entries = entries.data();
+    blit_bindings[depth] = wgpuDeviceCreateBindGroupLayout(device, &group);
+    auto layout_descriptor = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT; layout_descriptor.bindGroupLayoutCount = 1; layout_descriptor.bindGroupLayouts = &blit_bindings[depth];
+    blit_layouts[depth] = wgpuDeviceCreatePipelineLayout(device, &layout_descriptor);
+  }
+  std::string code = R"(
+struct Parameters { source: vec4<f32>, destination: vec4<f32>, taps: u32, opaque: u32, padding: vec2<u32> }
+@group(0) @binding(1) var<uniform> parameters: Parameters;
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+  let positions = array<vec2<f32>, 3>(vec2<f32>(-1,-1), vec2<f32>(3,-1), vec2<f32>(-1,3));
+  return vec4<f32>(positions[index], 0, 1);
+}
+fn source_at(position: vec2<f32>) -> vec2<f32> {
+  return parameters.source.xy + (position - parameters.destination.xy) * parameters.source.zw / parameters.destination.zw;
+}
+)";
+  if (depth) {
+    code += R"(
+@group(0) @binding(0) var image: texture_depth_2d;
+@fragment fn fs_main(@builtin(position) position: vec4<f32>) -> @builtin(frag_depth) f32 {
+  let last = vec2<i32>(textureDimensions(image)) - vec2<i32>(1);
+  return textureLoad(image, clamp(vec2<i32>(floor(source_at(position.xy))), vec2<i32>(0), last), 0);
+}
+)";
+  } else {
+    code += R"(
+@group(0) @binding(0) var image: texture_2d<f32>;
+fn texel(at: vec2<i32>) -> vec4<f32> {
+  return textureLoad(image, clamp(at, vec2<i32>(0), vec2<i32>(textureDimensions(image)) - vec2<i32>(1)), 0);
+}
+@fragment fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+  var color: vec4<f32>;
+  if (parameters.taps == 0u) {
+    let at = source_at(position.xy) - vec2<f32>(0.5);
+    let corner = floor(at);
+    let weight = at - corner;
+    let a = vec2<i32>(corner);
+    color = mix(mix(texel(a), texel(a + vec2<i32>(1, 0)), weight.x), mix(texel(a + vec2<i32>(0, 1)), texel(a + vec2<i32>(1, 1)), weight.x), weight.y);
+  } else {
+    let span = parameters.source.zw / parameters.destination.zw;
+    let start = source_at(position.xy - vec2<f32>(0.5));
+    let count = parameters.taps;
+    for (var y = 0u; y < count; y++) {
+      for (var x = 0u; x < count; x++) {
+        let offset = (vec2<f32>(f32(x), f32(y)) + vec2<f32>(0.5)) * span / f32(count);
+        color += texel(vec2<i32>(floor(start + offset)));
+      }
+    }
+    color /= f32(count * count);
+  }
+  if (parameters.opaque != 0u) { color.a = 1.0; }
+  return color;
+}
+)";
+  }
+  auto source = WGPU_SHADER_SOURCE_WGSL_INIT; source.code = {code.data(), code.size()};
+  auto shader_descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT; shader_descriptor.nextInChain = &source.chain;
+  auto shader = wgpuDeviceCreateShaderModule(device, &shader_descriptor);
+  auto descriptor = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+  descriptor.layout = blit_layouts[depth]; descriptor.vertex.module = shader; descriptor.vertex.entryPoint = text("vs_main");
+  descriptor.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+  auto color = WGPU_COLOR_TARGET_STATE_INIT; color.format = WGPUTextureFormat_RGBA8Unorm;
+  auto fragment = WGPU_FRAGMENT_STATE_INIT; fragment.module = shader; fragment.entryPoint = text("fs_main");
+  if (!depth) { fragment.targetCount = 1; fragment.targets = &color; }
+  descriptor.fragment = &fragment;
+  auto stencil = WGPU_DEPTH_STENCIL_STATE_INIT;
+  if (depth) {
+    stencil.format = WGPUTextureFormat_Depth24PlusStencil8; stencil.depthWriteEnabled = WGPUOptionalBool_True; stencil.depthCompare = WGPUCompareFunction_Always;
+    stencil.stencilReadMask = stencil.stencilWriteMask = 0;
+    descriptor.depthStencil = &stencil;
+  }
+  blit_pipelines[kind] = wgpuDeviceCreateRenderPipeline(device, &descriptor);
+  wgpuShaderModuleRelease(shader);
+  return blit_pipelines[kind];
+}
+void release_blits() {
+  for (auto& pipeline : blit_pipelines) { if (pipeline) { wgpuRenderPipelineRelease(pipeline); pipeline = nullptr; } }
+  for (auto& layout : blit_layouts) { if (layout) { wgpuPipelineLayoutRelease(layout); layout = nullptr; } }
+  for (auto& group : blit_bindings) { if (group) { wgpuBindGroupLayoutRelease(group); group = nullptr; } }
+}
+void blit(uint32_t resource, std::span<const uint8_t> bytes) {
+  const auto spec = packet<BlitPacket>(bytes); exact(bytes, 0);
+  auto& source = texture(spec.source); auto& target = texture(resource);
+  const auto inside = [](const float* rect, const Texture& texture) {
+    return std::all_of(rect, rect + 4, [](float value) { return std::isfinite(value) && value >= 0; }) && rect[2] > 0 && rect[3] > 0 &&
+      rect[0] + rect[2] <= float(texture.width) && rect[1] + rect[3] <= float(texture.height);
+  };
+  if (spec.source == resource || source.depth != target.depth || source.cube || target.cube || source.volumeDepth > 1 || target.volumeDepth > 1 ||
+      spec.taps > 16 || spec.force_opaque > 1 || !inside(spec.source_rect, source) || !inside(spec.destination_rect, target)) {
+    throw std::runtime_error("invalid texture blit");
+  }
+  end_batch_pass();
+  const uint32_t kind = target.depth ? 2 : spec.force_opaque;
+  const auto pipeline = blit_pipeline(kind);
+  const std::array<uint32_t, 12> parameters{std::bit_cast<uint32_t>(spec.source_rect[0]), std::bit_cast<uint32_t>(spec.source_rect[1]),
+    std::bit_cast<uint32_t>(spec.source_rect[2]), std::bit_cast<uint32_t>(spec.source_rect[3]), std::bit_cast<uint32_t>(spec.destination_rect[0]),
+    std::bit_cast<uint32_t>(spec.destination_rect[1]), std::bit_cast<uint32_t>(spec.destination_rect[2]), std::bit_cast<uint32_t>(spec.destination_rect[3]),
+    spec.taps, spec.force_opaque, 0, 0};
+  auto uniforms = buffer({reinterpret_cast<const uint8_t*>(parameters.data()), sizeof(parameters)}, WGPUBufferUsage_Uniform);
+  auto view_descriptor = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+  if (source.depth) { view_descriptor.aspect = WGPUTextureAspect_DepthOnly; }
+  auto input = wgpuTextureCreateView(source.handle, &view_descriptor);
+  std::array<WGPUBindGroupEntry, 2> entries{};
+  entries[0] = WGPU_BIND_GROUP_ENTRY_INIT; entries[0].binding = 0; entries[0].textureView = input;
+  entries[1] = WGPU_BIND_GROUP_ENTRY_INIT; entries[1].binding = 1; entries[1].buffer = uniforms; entries[1].size = sizeof(parameters);
+  auto group_descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT; group_descriptor.layout = blit_bindings[target.depth]; group_descriptor.entryCount = entries.size(); group_descriptor.entries = entries.data();
+  auto group = wgpuDeviceCreateBindGroup(device, &group_descriptor);
+  auto output = wgpuTextureCreateView(target.handle, nullptr);
+  auto color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; auto depth = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+  auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+  if (target.depth) {
+    depth.view = output; depth.depthLoadOp = depth.stencilLoadOp = WGPULoadOp_Load; depth.depthStoreOp = depth.stencilStoreOp = WGPUStoreOp_Store;
+    depth.depthClearValue = 0; depth.stencilClearValue = 0;
+    descriptor.depthStencilAttachment = &depth;
+  } else {
+    color.view = output; color.loadOp = WGPULoadOp_Load; color.storeOp = WGPUStoreOp_Store;
+    descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &color;
+  }
+  auto encoder = batch_encoder ? batch_encoder : wgpuDeviceCreateCommandEncoder(device, nullptr);
+  auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+  const auto* rect = spec.destination_rect;
+  const uint32_t x = uint32_t(rect[0]), y = uint32_t(rect[1]);
+  const uint32_t width = std::min(uint32_t(std::ceil(rect[0] + rect[2])), target.width) - x, height = std::min(uint32_t(std::ceil(rect[1] + rect[3])), target.height) - y;
+  wgpuRenderPassEncoderSetScissorRect(pass, x, y, width, height);
+  wgpuRenderPassEncoderSetPipeline(pass, pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
+  wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
+  if (!batch_encoder) { submit(encoder); }
+  wgpuTextureViewRelease(output); wgpuTextureViewRelease(input); wgpuBindGroupRelease(group); wgpuBufferRelease(uniforms);
+}
 void copy(uint32_t resource, std::span<const uint8_t> bytes) {
       auto copy = packet<CopyPacket>(bytes); exact(bytes, 0);
       auto& source = texture(copy.source); auto& target = texture(resource);
@@ -736,6 +879,7 @@ void release_resources() {
   if (partial_clear_layout) { wgpuPipelineLayoutRelease(partial_clear_layout); partial_clear_layout = nullptr; }
   if (partial_clear_bindings) { wgpuBindGroupLayoutRelease(partial_clear_bindings); partial_clear_bindings = nullptr; }
   if (depth_upload_pipeline) { wgpuRenderPipelineRelease(depth_upload_pipeline); depth_upload_pipeline = nullptr; }
+  release_blits();
   if (depth_upload_layout) { wgpuPipelineLayoutRelease(depth_upload_layout); depth_upload_layout = nullptr; }
   if (depth_upload_bindings) { wgpuBindGroupLayoutRelease(depth_upload_bindings); depth_upload_bindings = nullptr; }
   if (depth_readback_pipeline) { wgpuRenderPipelineRelease(depth_readback_pipeline); depth_readback_pipeline = nullptr; }
@@ -867,7 +1011,9 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       }
       const uint32_t faces = spec.depth == 2 ? 6 : 1;
       const uint64_t storageBytes = textureBytes(spec.width, spec.height, spec.levels, volumeDepth) * faces;
-      exact(bytes, spec.depth == 1 ? 0 : storageBytes);
+      // no pixels: a render target the backend fills itself (a scaled surface), left zero
+      const bool empty = spec.depth == 0 && spec.levels == 1 && bytes.empty();
+      exact(bytes, spec.depth == 1 || empty ? 0 : storageBytes);
       if (texture_bytes + storageBytes > TextureBudget) { throw std::runtime_error("GPU texture budget exhausted"); }
       auto descriptor = WGPU_TEXTURE_DESCRIPTOR_INIT;
       descriptor.dimension = spec.depth == 3 ? WGPUTextureDimension_3D : WGPUTextureDimension_2D;
@@ -880,7 +1026,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       Texture stored{handle, spec.width, spec.height, spec.depth == 1, spec.levels, spec.depth == 2};
       stored.volumeDepth = volumeDepth;
       textures.emplace(resource, stored); texture_bytes += storageBytes; created_resource = resource;
-      if (spec.depth != 1) {
+      if (spec.depth != 1 && !empty) {
         size_t offset = 0;
         for (uint32_t n = 0; n < spec.levels * faces; ++n) {
           const uint32_t level = n % spec.levels;
@@ -983,7 +1129,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
     case Opcode::UploadDepth: {
       const auto spec = packet<DepthUploadPacket>(bytes);
       auto& target = texture(resource);
-      if (!target.depth || spec.width != target.width || spec.height != target.height ||
+      if (!target.depth || !spec.width || !spec.height || spec.width > target.width || spec.height > target.height ||
           (spec.depth_bits != 16 && spec.depth_bits != 24)) { throw std::runtime_error("invalid depth import target or encoding"); }
       exact(bytes, uint64_t(spec.width) * spec.height * 4);
       std::array<uint32_t, 8> mask{};
@@ -996,7 +1142,9 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       if (!std::equal(mask.begin(), mask.end(), std::begin(spec.stencil_mask))) { throw std::runtime_error("depth import stencil mask does not cover its pixels"); }
       prepare_depth_upload();
       auto values = buffer(bytes, WGPUBufferUsage_Storage);
-      const std::array<uint32_t, 4> parameters{spec.width, spec.depth_bits == 24 ? 16777215u : 65535u, 0, 0};
+      // a scaled depth target takes the console sized values nearest each of its pixels
+      const std::array<uint32_t, 4> parameters{spec.width, spec.depth_bits == 24 ? 16777215u : 65535u,
+        std::bit_cast<uint32_t>(float(spec.width) / float(target.width)), std::bit_cast<uint32_t>(float(spec.height) / float(target.height))};
       auto uniforms = buffer({reinterpret_cast<const uint8_t*>(parameters.data()), sizeof(parameters)}, WGPUBufferUsage_Uniform);
       std::array<WGPUBindGroupEntry, 2> entries{};
       for (uint32_t n = 0; n < entries.size(); ++n) {
@@ -1027,6 +1175,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       break;
     }
     case Opcode::Copy: { copy(resource, bytes); break; }
+    case Opcode::Blit: { blit(resource, bytes); break; }
     case Opcode::SetGamma: {
       exact(bytes, gamma_ramp.size()); std::memcpy(gamma_ramp.data(), bytes.data(), gamma_ramp.size()); upload_gamma(); break;
     }

@@ -54,6 +54,7 @@ app::Settings Decode(const Snapshot& snapshot) {
   }
   if (snapshot.words[kFovWord]) { settings.fov = std::clamp<uint32_t>(snapshot.words[kFovWord], 45, 140); }
   settings.fmv_scale = snapshot.words[kFmvScaleWord] ? 1 : 0;
+  if (snapshot.words[kRenderPercentWord]) { settings.render_percent = std::clamp<uint32_t>(snapshot.words[kRenderPercentWord], 20, 200); }
   hostValues.clear();
   std::string_view text = snapshot.text;
   while (!text.empty()) {

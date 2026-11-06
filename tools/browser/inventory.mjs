@@ -224,7 +224,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       'src/browser/input-core.h', 'src/browser/input-core.cpp', 'src/browser/input-update.cpp', 'src/browser/keyboard-input.h',
       'src/browser/keyboard-input.mjs', 'src/browser/input-actions.mjs', 'src/browser/settings-rows.cpp', 'src/browser/host-messages.h',
       'src/browser/host-messages.cpp', 'src/browser/host-messages.mjs', 'src/browser/game-stubs.cpp', 'src/browser/loading-screen.cpp',
-      'src/browser/loading-input.cpp', 'src/browser/exit-menu.cpp',
+      'src/browser/loading-input.cpp', 'src/browser/exit-menu.cpp', 'src/browser/render-scale.h',
       'src/game/loading.h', 'src/gpu/backend.h',
       'src/app/translations.h', 'src/app/translations.cpp', 'src/core/input.h', 'src/game/console.h', 'src/game/unreal.h',
       'src/xdk/hle.h', 'src/xdk/d3d8.h', 'src/app/app.h', 'src/core/log.h');

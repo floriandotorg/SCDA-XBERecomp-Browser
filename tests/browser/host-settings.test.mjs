@@ -21,7 +21,7 @@ test('C++ indices match the single host settings schema', async () => {
   const schema = HOST_SETTINGS_FIELDS.filter(entry => !['text', 'map', 'host'].includes(entry.type))
     .map(entry => `${pascal(entry.field)}:${entry.type === 'bool' ? 'Bit' : 'Word'}:${entry.type === 'bool' ? entry.bit : entry.word}`).sort();
   assert.deepEqual(declared, schema);
-  for (const entry of HOST_SETTINGS_FIELDS.filter(item => item.type !== 'host' && !item.computed)) { assert.match(readFileSync('src/app/app.h', 'utf8'), new RegExp(`\\b${entry.field}\\b`)); }
+  for (const entry of HOST_SETTINGS_FIELDS.filter(item => item.type !== 'host' && !item.computed && !item.browser)) { assert.match(readFileSync('src/app/app.h', 'utf8'), new RegExp(`\\b${entry.field}\\b`)); }
   const keys = new Set(HOST_SETTINGS_FIELDS.map(entry => entry.key));
   const { SETTINGS } = await import('../../src/browser/settings.mjs');
   for (const key of new Set(HOST_SETTINGS_FIELDS.filter(entry => !entry.computed).map(entry => entry.key))) { assert.ok(Object.hasOwn(SETTINGS, key), key); }
