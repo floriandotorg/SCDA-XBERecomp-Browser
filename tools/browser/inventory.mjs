@@ -107,6 +107,13 @@ export const validateHookOverrides = ({ browser, hooks, renames, symbols }) => {
   return entries;
 };
 
+// Game hooks live in src/game; CRT fixes the native build links from src/xdk are selected the same way.
+export const hookSource = (root, name) => {
+  const source = ['game', 'xdk'].map((directory) => `src/${directory}/${name}.cpp`).find((path) => existsSync(resolve(root, path)));
+  if (!source) { throw new Error(`hook ${name} has no source in src/game or src/xdk`); }
+  return source;
+};
+
 const hookHeaders = ['xdk/hle.h', 'xdk/d3d8.h', 'gpu/state.h', 'app/app.h', 'core/log.h', 'game/magma.h'];
 
 export const validateHookIncludes = ({ hooks, shadowed }) => {
@@ -215,12 +222,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       'src/browser/hook-d3d.cpp', 'src/browser/host-settings.h', 'src/browser/host-settings.cpp',
       'src/xdk/hle.h', 'src/xdk/d3d8.h', 'src/app/app.h', 'src/core/log.h');
     if (hooks.length) {
-      const sources = Object.fromEntries(hooks.map((name) => [name, read(`src/game/${name}.cpp`).toString()]));
+      const sources = Object.fromEntries(hooks.map((name) => [name, read(hookSource(root, name)).toString()]));
       validateHookIncludes({ hooks: sources, shadowed: compat });
       const browserSources = Object.fromEntries([...new Set(paths)].filter((path) => /^src\/browser\/[^/]+\.(cpp|h)$/.test(path)).map((path) => [path, read(path).toString()]));
       hookEntries = validateHookOverrides({ browser: browserSources, hooks: sources, renames: option('hook-renames').split(',').filter(Boolean),
         symbols: read('generated/game/image_symbols.h').toString() });
-      paths.push(...hooks.map((name) => `src/game/${name}.cpp`), 'src/game/magma.h');
+      paths.push(...hooks.map((name) => hookSource(root, name)), 'src/game/magma.h');
     }
   } else if (hooks.length) {
     throw new Error('Game hooks require menu mode.');
