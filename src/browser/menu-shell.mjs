@@ -20,6 +20,10 @@ const TABS = Object.freeze([
   ], keys: [['Move', 'W A S D'], ['Look', 'Mouse'], ['Confirm', 'Space / Z'], ['Back', 'Esc / Backspace'], ['Game pause', 'Enter'],
     ['Settings', 'F1 / P'], ['Crouch', 'C'], ['Jump', 'Shift'], ['Back to wall', 'F'], ['Scope', '1'], ['Vision and gadgets', '2 3 4 5'],
     ['OPSAT', 'Tab'], ['X / Y', 'X / Y'], ['Black / White', 'Q / E'], ['Triggers', '[ / ]'], ['Navigate', 'Arrows']] },
+  { id: 'game', label: 'Game', rows: [
+    { setting: 'skipIntros', label: 'Skip intros' },
+    { setting: 'pauseOnFocusLoss', label: 'Pause when unfocused' },
+  ] },
   { id: 'developer', label: 'Developer', rows: [
     { setting: 'developmentStart', label: 'Skip to first mission' },
     { setting: 'showFps', label: 'Frame rate' },
@@ -300,7 +304,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
 
   const createMotion = options => {
     motion = createMissionControls({ ...options, canvas, capture: stage,
-      sensitivity: () => settings.get('sensitivity'), invertY: () => settings.get('invertY') });
+      sensitivity: () => settings.get('sensitivity'), invertY: () => settings.get('invertY'), pauseOnFocusLoss: () => settings.get('pauseOnFocusLoss') });
     motion.setSuspended(screen === 'game' && panel !== 'none');
     return motion;
   };
@@ -309,7 +313,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     return audio;
   };
   const controller = createShellController({ onChange: state => render(state), createRuntime: () => createMenuRuntime({
-    developmentStart: settings.get('developmentStart'), createMotion, createAudio,
+    developmentStart: settings.get('developmentStart'), settings, createMotion, createAudio,
     acquireCanvas: () => {
       if (!globalThis.navigator?.gpu || typeof canvas.transferControlToOffscreen !== 'function') {
         throw Object.assign(new Error('WebGPU and an offscreen canvas are required in this browser.'), { code: 'CAPABILITY' });
@@ -332,6 +336,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       ++evidence.renderedFrames;
       evidence.resources = details.resources;
       evidence.lastCompletedCommand = details.command;
+      if (details.hookStatus) { evidence.hookStatus = details.hookStatus; }
       if (evidence.firstPresentedFrameMilliseconds === null) {
         evidence.firstPresentedFrameMilliseconds = time - started;
         presented = true;
@@ -348,6 +353,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       if (details.io) { evidence.io = details.io; }
       else if (details.guest) { evidence.guest = details.guest; }
       else if (details.runtime) { evidence.runtime = details.runtime; }
+      else if (details.hooks) { evidence.hooks = details.hooks; }
+      else if (details.settings) { evidence.settings = details.settings; }
       else {
         evidence.validationErrors.push(details);
         if (evidence.validationErrors.length > 16) { evidence.validationErrors.shift(); }
@@ -454,6 +461,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     if (name === 'volume') { audio?.setVolume(settings.get('volume') / 100); }
     if (name === 'showFps') { show(); }
     if (name === 'showDiagnostics') { showDiagnostics(); }
+    if (name === 'pauseOnFocusLoss') { motion?.refresh(); }
     if (panel === 'settings') { refreshRows(); }
   });
 

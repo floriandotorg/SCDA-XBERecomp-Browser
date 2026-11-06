@@ -71,6 +71,54 @@ export const validateSymbols = (header, partitions, mapping) => {
   return entries.size;
 };
 
+const symbolTable = (symbols) => new Map([...symbols.matchAll(/^#define SYM_(\w+) ([\dA-Fa-f]+)$/gm)].map((match) => [match[1], match[2].toUpperCase().padStart(8, '0')]));
+
+const guestOverrides = (text, address) => [
+  ...[...text.matchAll(/^X86_FUNC\(sub_([\dA-Fa-f]{8})\)\s*\{/gm)].map((match) => match[1].toUpperCase()),
+  ...[...text.matchAll(/^\s*X86_FUNC\(\w*GUEST\((\w+)\)\)\s*\{/gm)].map((match) => address(match[1])),
+  ...[...text.matchAll(/^(?:HLE_STDCALL|HLE_FASTCALL|HLE_CDECL|\w+_BOUNDARY)\((\w+)\b/gm)].map((match) => address(match[1])),
+  ...[...text.matchAll(/^\s*X\((\w+), \d+, \d+\)/gm)].map((match) => address(match[1])),
+].filter(Boolean);
+
+// A strong sub_X from a selected game hook replaces the same weak alias a browser override does: the two would collide
+// at link, so the hook must be renamed to game_sub_X and chained from the browser override.
+export const validateHookOverrides = ({ browser, hooks, renames, symbols }) => {
+  const table = symbolTable(symbols);
+  const owners = new Map();
+  for (const [path, text] of Object.entries(browser)) {
+    for (const address of guestOverrides(text, (name) => table.get(name))) { owners.set(address, path); }
+  }
+  const renamed = new Set(renames.map((address) => address.toUpperCase().padStart(8, '0')));
+  const entries = [];
+  const claimed = new Map();
+  for (const [hook, text] of Object.entries(hooks).sort(([left], [right]) => left.localeCompare(right))) {
+    const address = (name) => {
+      if (!table.has(name)) { throw new Error(`hook ${hook} names unknown guest symbol ${name}`); }
+      return table.get(name);
+    };
+    for (const guest of [...new Set(guestOverrides(text, address))].sort()) {
+      if (claimed.has(guest)) { throw new Error(`sub_${guest} is hooked by both ${claimed.get(guest)} and ${hook}`); }
+      claimed.set(guest, hook);
+      const owner = owners.get(guest);
+      if (owner && !renamed.has(guest)) { throw new Error(`sub_${guest} from hook ${hook} collides with ${owner}; add it to the hook renames`); }
+      entries.push({ hook, address: guest, renamed: Boolean(owner) });
+    }
+  }
+  return entries;
+};
+
+const hookHeaders = ['xdk/hle.h', 'xdk/d3d8.h', 'gpu/state.h', 'app/app.h', 'core/log.h', 'game/magma.h'];
+
+export const validateHookIncludes = ({ hooks, shadowed }) => {
+  const allowed = new Set([...hookHeaders, ...shadowed]);
+  for (const [hook, text] of Object.entries(hooks)) {
+    for (const [, header] of text.matchAll(/^\s*#\s*include\s+"([^"]+)"/gm)) {
+      if (!allowed.has(header)) { throw new Error(`hook ${hook} includes ${header}, which the browser does not provide`); }
+    }
+  }
+  return Object.keys(hooks).length;
+};
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const [root, output, toolchain, configuration, generationRecord, optimizerTool] = process.argv.slice(2);
   const actualTailCalls = configuration.split(';').includes('actual-tail-calls=ON');
@@ -107,14 +155,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const declarations = readdirSync(resolve(root, 'src/kernel')).filter((name) => name.endsWith('.cpp')).sort().map((name) => `src/kernel/${name}`);
     kernelExports = exportCatalog(declarations.map((path) => ({ path, text: read(path).toString() })));
     paths.push('tools/browser/export-catalog.mjs', ...declarations);
-    paths.push(...['boot-worker', 'boot-session', 'menu-state-report', 'boot-controller', 'boot-runtime', 'boot-shell', 'wasm-capabilities', 'boot-worker-broker', 'boot-worker-host', 'iso-reader', 'iso-mailbox', 'iso-wasm', 'iso-io-service', 'iso-io-worker'].map((name) => `src/browser/${name}.mjs`));
+    paths.push(...['boot-worker', 'boot-session', 'menu-state-report', 'boot-controller', 'boot-runtime', 'boot-shell', 'wasm-capabilities', 'boot-worker-broker', 'boot-worker-host', 'iso-reader', 'iso-mailbox', 'iso-wasm', 'iso-io-service', 'iso-io-worker', 'host-settings'].map((name) => `src/browser/${name}.mjs`));
     paths.push('src/browser/boot.html');
     paths.push('src/browser/platform-profile.cpp', 'src/browser/platform-profile.h');
     paths.push('src/browser/shutdown-provider.cpp', 'src/browser/shutdown-provider.h');
     paths.push('src/browser/dpc-provider.cpp', 'src/browser/dpc-provider.h');
     paths.push('src/browser/timer-provider.cpp', 'src/browser/timer-provider.h');
     paths.push('src/browser/sdk-provider.cpp', 'src/browser/sdk-provider.h',
-      'src/browser/diagnostic-graphics.cpp', 'src/browser/diagnostic-graphics.h', 'src/browser/diagnostic-shaders.cpp', 'src/browser/diagnostic-shaders.h', 'src/browser/push-state.cpp', 'src/browser/push-state.h', 'src/gpu/backend.h', 'src/gpu/state.h',
+      'src/browser/diagnostic-graphics.cpp', 'src/browser/diagnostic-graphics.h', 'src/browser/hook-graphics.cpp', 'src/browser/hook-graphics.h', 'src/browser/diagnostic-shaders.cpp', 'src/browser/diagnostic-shaders.h', 'src/browser/push-state.cpp', 'src/browser/push-state.h', 'src/gpu/backend.h', 'src/gpu/state.h',
       'src/browser/silent-audio.cpp', 'src/browser/silent-audio.h', 'src/audio/output.h', 'src/browser/audio-transport.mjs',
       'src/browser/audio-entries.h', 'src/browser/audio-provider.h', 'src/browser/audio-provider.cpp',
       'src/browser/audio-core.h', 'src/browser/audio-core.cpp', 'src/browser/audio-effects.h', 'src/browser/audio-effects.cpp',
@@ -158,6 +206,25 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       discIdentity.requiredStoryFiles.push({ path: 'Default/DataXb/LMaps/x01_Iceland_a/x01_Iceland_a.lin', minBytes: 13681301 });
     }
   }
+  const option = (name) => configuration.split(';').find((entry) => entry.startsWith(`${name}=`))?.slice(name.length + 1) ?? '';
+  const hooks = option('hooks').split(',').filter(Boolean);
+  let hookEntries = [];
+  if (configuration.split(';').includes('menu=ON')) {
+    const compat = readdirSync(resolve(root, 'src/browser/hook-compat'), { recursive: true }).map(String).filter((name) => name.endsWith('.h')).sort();
+    paths.push(...compat.map((name) => `src/browser/hook-compat/${name}`), 'src/browser/hooks.h', 'src/browser/hook-compat.cpp', 'src/browser/hook-log.cpp',
+      'src/browser/hook-d3d.cpp', 'src/browser/host-settings.h', 'src/browser/host-settings.cpp',
+      'src/xdk/hle.h', 'src/xdk/d3d8.h', 'src/app/app.h', 'src/core/log.h');
+    if (hooks.length) {
+      const sources = Object.fromEntries(hooks.map((name) => [name, read(`src/game/${name}.cpp`).toString()]));
+      validateHookIncludes({ hooks: sources, shadowed: compat });
+      const browserSources = Object.fromEntries([...new Set(paths)].filter((path) => /^src\/browser\/[^/]+\.(cpp|h)$/.test(path)).map((path) => [path, read(path).toString()]));
+      hookEntries = validateHookOverrides({ browser: browserSources, hooks: sources, renames: option('hook-renames').split(',').filter(Boolean),
+        symbols: read('generated/game/image_symbols.h').toString() });
+      paths.push(...hooks.map((name) => `src/game/${name}.cpp`), 'src/game/magma.h');
+    }
+  } else if (hooks.length) {
+    throw new Error('Game hooks require menu mode.');
+  }
   if (generationRecord) { paths.push(...generationInputs, ...generationOutputs); }
   const inputs = Object.fromEntries([...new Set(paths)].map((path) => [path, hash(read(path))]));
   const manifest = { schema: 1, wasmOptimization, wasmRequirements, compatibility: (configuration.includes('full-cpu=ON') || configuration.includes('boot=ON')) ? 'wasm-compact-leased-v1' : 'wasm-weak-alias-v1', toolchain, configuration, partitionCount: count, functionCount, namedSymbolCount, ranges, ...discIdentity, ...(kernelExports ? { kernelExports } : {}), inputs };
@@ -172,5 +239,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     if (!generationRecord) { throw new Error('Boot requires trusted generation evidence'); }
     emit('boot-manifest.mjs', `export default ${JSON.stringify({ identity, ...manifest })};\n`);
   }
-  emit('build_identity.h', `#pragma once\n#define BROWSER_BUILD_ID "${identity}"\n#define BROWSER_FUNCTION_COUNT ${functionCount}u\n#define BROWSER_TOOLCHAIN "${toolchain}"\n`);
+  emit('hook_manifest.h', `#pragma once\n#define BROWSER_GAME_HOOKS(X)${hookEntries.map(({ hook, address }) => ` \\\n  X(${hook}, ${address})`).join('')}\n`);
+  emit('build_identity.h',`#pragma once\n#define BROWSER_BUILD_ID "${identity}"\n#define BROWSER_FUNCTION_COUNT ${functionCount}u\n#define BROWSER_TOOLCHAIN "${toolchain}"\n`);
 }

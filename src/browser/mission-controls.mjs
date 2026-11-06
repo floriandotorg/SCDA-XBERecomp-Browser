@@ -1,10 +1,10 @@
 const owners = new WeakMap();
 export const createMissionControls = ({ buffer, byteOffset, document = globalThis.document, window = globalThis.window,
-  canvas = document?.querySelector('#game'), capture = canvas, sensitivity = () => 1, invertY = () => false,
+  canvas = document?.querySelector('#game'), capture = canvas, sensitivity = () => 1, invertY = () => false, pauseOnFocusLoss = () => true,
   clear = () => {}, now = () => performance.now(), signal } = {}) => {
   if (!(buffer instanceof SharedArrayBuffer) || buffer.growable) { throw new TypeError('Mission controls require fixed shared memory.'); }
   if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset % 4 || byteOffset > buffer.byteLength - 20) { throw new RangeError('Mission input span is out of bounds.'); }
-  if (!canvas || !capture?.addEventListener || typeof sensitivity !== 'function' || typeof invertY !== 'function' || !document?.addEventListener || !window?.addEventListener) { throw new TypeError('Mission controls require their canvas and settings.'); }
+  if (!canvas || !capture?.addEventListener || typeof sensitivity !== 'function' || typeof invertY !== 'function' || typeof pauseOnFocusLoss !== 'function' || !document?.addEventListener || !window?.addEventListener) { throw new TypeError('Mission controls require their canvas and settings.'); }
   signal?.throwIfAborted();
   const spans = owners.get(buffer) ?? new Set();
   for (const start of spans) {
@@ -23,7 +23,7 @@ export const createMissionControls = ({ buffer, byteOffset, document = globalThi
   const locked = () => document.pointerLockElement === canvas;
   const update = () => {
     reset();
-    const paused = !focused || document.hidden || suspended;
+    const paused = (!focused && pauseOnFocusLoss()) || document.hidden || suspended;
     const time = Math.floor(now());
     if (paused && pausedAt === undefined) {
       pausedAt = time;
@@ -107,5 +107,6 @@ export const createMissionControls = ({ buffer, byteOffset, document = globalThi
     update();
   };
   update();
-  return Object.freeze({ dispose, setSuspended, release });
+  const refresh = () => { if (!disposed) { update(); } };
+  return Object.freeze({ dispose, setSuspended, release, refresh });
 };

@@ -52,3 +52,16 @@ test('reset restores defaults and notifies changed values', () => {
   assert.equal(settings.get('volume'), 100);
   assert.deepEqual(seen, [['volume', 100]]);
 });
+
+test('game settings that reach the guest default to the native values and persist', () => {
+  const storage = memory();
+  const settings = createSettings({ storage });
+  assert.equal(settings.get('skipIntros'), false);
+  assert.equal(settings.get('pauseOnFocusLoss'), true);
+  settings.set('skipIntros', true);
+  settings.set('pauseOnFocusLoss', 0);
+  const reloaded = createSettings({ storage });
+  assert.equal(reloaded.get('skipIntros'), true);
+  assert.equal(reloaded.get('pauseOnFocusLoss'), false);
+  assert.equal(createSettings({ storage: memory(JSON.stringify({ skipIntros: 'yes' })) }).get('skipIntros'), false);
+});

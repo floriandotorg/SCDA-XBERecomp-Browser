@@ -1,5 +1,6 @@
 #pragma once
 #include "browser/contiguous-memory.h"
+#include "browser/hook-graphics.h"
 #include "browser/sdk-provider.h"
 #include "gpu/backend.h"
 #include <optional>
@@ -68,6 +69,7 @@ public:
   gpu::Backend& Backend();
   gpu::State State() const;
   gpu::State SnapshotState() const;
+  HookGraphics& Hooks() { return hooks_; }
 private:
   class Recorder;
   Runtime& runtime_;
@@ -79,6 +81,7 @@ private:
   std::unique_ptr<Recorder> backend_;
   std::unique_ptr<gpu::Backend> renderer_;
   gpu::State state_;
+  HookGraphics hooks_{state_, lock_};
   std::vector<Resource> resources_;
   std::vector<uint32_t> allocationsOwned_;
   std::unordered_set<uint32_t> gpuWritten_;

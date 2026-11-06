@@ -38,10 +38,25 @@
 #endif
 #ifdef BROWSER_MENU
 #include "browser/menu-backend.h"
+#include "browser/hooks.h"
+#include "browser/host-settings.h"
+#include "cpu/x86_ops.h"
+#include "hook_manifest.h"
+
+#define BROWSER_HOOK_DECLARE(hook, address) X86_EXTERN_FUNC(sub_##address);
+BROWSER_GAME_HOOKS(BROWSER_HOOK_DECLARE)
 #endif
 
 namespace {
 #ifdef BROWSER_MENU
+struct GameHook {
+  const char* name;
+  uint32_t address;
+  X86Func* function;
+};
+#define BROWSER_HOOK_ENTRY(hook, address) {#hook, 0x##address, sub_##address},
+constexpr GameHook gameHooks[] = {BROWSER_GAME_HOOKS(BROWSER_HOOK_ENTRY) {nullptr, 0, nullptr}};
+constexpr uint32_t gameHookCount = std::size(gameHooks) - 1;
 constexpr auto graphics_mode = browser::GraphicsMode::Rendering;
 constexpr size_t worker_capacity = browser::kImageThreadCapacity;
 #elif defined(BROWSER_MENU_CAPTURE)
@@ -296,6 +311,11 @@ struct Session {
     if (story->developmentStart) { missionControls->ConfigureDevelopmentStart(); }
 #endif
     sdkObserver = browser::InstallSdkProvider(runtime, *image, browser::SdkPolicy::UnavailableXNet, graphics, controls, launcher, route, audioProvider);
+#ifdef BROWSER_MENU
+    graphics->Hooks().SetBackend(renderer, [renderer = renderer](browser::GraphicsEffect effect) { return renderer->Supports(effect); });
+    browser::hooks::Bind(*image->memory);
+    browser::hooks::BindGraphics(graphics->Hooks());
+#endif
 #else
     sdkObserver = browser::InstallSdkProvider(runtime, *image, browser::SdkPolicy::UnavailableXNet, graphics, {}, {}, {}, audioProvider);
 #endif
@@ -320,6 +340,10 @@ struct Session {
   }
   ~Session() {
     runtime.Stop();
+#ifdef BROWSER_MENU
+    browser::hooks::UnbindGraphics();
+    browser::hooks::Unbind();
+#endif
     if (graphics) { graphics->Shutdown(); }
   }
 };
@@ -628,6 +652,62 @@ EMSCRIPTEN_KEEPALIVE uintptr_t image_motion_address() {
 EMSCRIPTEN_KEEPALIVE uint32_t image_input_words() {
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
   return session && session->input ? session->input->SharedWords() : 0;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uintptr_t image_settings_address() {
+#ifdef BROWSER_MENU
+  return reinterpret_cast<uintptr_t>(browser::host_settings::Shared().words.data());
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_settings_words() {
+#ifdef BROWSER_MENU
+  return browser::host_settings::kWords;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uintptr_t image_hook_status_address() {
+#ifdef BROWSER_MENU
+  return reinterpret_cast<uintptr_t>(browser::HookStatus().data());
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_hook_status_words() {
+#ifdef BROWSER_MENU
+  return browser::kHookStatusWords;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_hook_count() {
+#ifdef BROWSER_MENU
+  return gameHookCount;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_hook_address(uint32_t index) {
+#ifdef BROWSER_MENU
+  return index < gameHookCount ? gameHooks[index].address : 0;
+#else
+  return 0;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE const char* image_hook_name(uint32_t index) {
+#ifdef BROWSER_MENU
+  return index < gameHookCount ? gameHooks[index].name : nullptr;
+#else
+  return nullptr;
+#endif
+}
+EMSCRIPTEN_KEEPALIVE uint32_t image_hook_bound(uint32_t index) {
+#ifdef BROWSER_MENU
+  return session && index < gameHookCount && session->runtime.Find(gameHooks[index].address) == gameHooks[index].function;
 #else
   return 0;
 #endif

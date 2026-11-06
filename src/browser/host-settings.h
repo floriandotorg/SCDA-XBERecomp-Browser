@@ -1,0 +1,37 @@
+#pragma once
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <string>
+
+// Host settings from settings.mjs (host-settings.mjs holds the schema these indices mirror). The page writes the
+// block under a seqlock: word 0 is odd while a writer holds it. Byte area: name=value lines for string and map fields.
+namespace browser::host_settings {
+
+inline constexpr uint32_t kSchema = 1;
+inline constexpr uint32_t kWords = 64;
+inline constexpr uint32_t kBytes = 4096;
+inline constexpr uint32_t kRevisionWord = 0;
+inline constexpr uint32_t kSchemaWord = 1;
+inline constexpr uint32_t kFlagsWord = 2;
+inline constexpr uint32_t kSkipIntrosBit = 0;
+inline constexpr uint32_t kPauseOnFocusLossBit = 1;
+
+struct Block {
+  std::array<std::atomic<uint32_t>, kWords> words{};
+  std::array<std::atomic<uint32_t>, kBytes / 4> text{};
+};
+static_assert(sizeof(Block) == kWords * 4 + kBytes && std::atomic<uint32_t>::is_always_lock_free);
+
+struct Snapshot {
+  uint32_t revision = 0;
+  std::array<uint32_t, kWords> words{};
+  std::string text;
+};
+
+// one per module: it outlives every story session and restart
+Block& Shared();
+// false while a writer holds the block or it changed under every attempt
+bool Read(const Block& block, Snapshot& snapshot);
+
+}

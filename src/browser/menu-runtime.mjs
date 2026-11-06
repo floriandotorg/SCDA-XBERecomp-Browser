@@ -6,6 +6,7 @@ import { createBrowserAudio } from './browser-audio.mjs';
 import { MISSION_METRICS_WORDS, readMissionMetrics } from './mission-metrics.mjs';
 import { createMailbox } from './webgpu-transport.mjs';
 import { startGPUWorker } from './webgpu-service.mjs';
+import { createHostSettingsWriter, encodeHostSettings, readHookStatus } from './host-settings.mjs';
 
 const waitReady = async (ready, signal, timeoutMs) => {
   signal.throwIfAborted();
@@ -25,10 +26,11 @@ const waitReady = async (ready, signal, timeoutMs) => {
 
 export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRuntime, createGPU = startGPUWorker,
   gamepad = true, createGamepad = createGamepadInput, createInput = createMenuInput, createMotion = createMissionControls, createAudio = createBrowserAudio, onPresented = () => {}, onAdapter = () => {}, onDiagnostic = () => {},
-  readyTimeoutMs = 20000, ...runtimeOptions } = {}) => {
+  readyTimeoutMs = 20000, settings, ...runtimeOptions } = {}) => {
   if (typeof acquireCanvas !== 'function') { throw new TypeError('A fresh owned canvas is required for each menu runtime.'); }
   if (!Number.isInteger(readyTimeoutMs) || readyTimeoutMs < 1 || readyTimeoutMs > 30000) { throw new RangeError('Invalid GPU initialization deadline.'); }
-  return createRuntime({ ...runtimeOptions, observeIo: true, createServices: async ({ generation, signal, owned, report }) => {
+  return createRuntime({ ...runtimeOptions, ...(settings ? { hostSettings: encodeHostSettings(settings.snapshot()) } : {}),
+    observeIo: true, createServices: async ({ generation, signal, owned, report }) => {
     signal.throwIfAborted();
     const canvas = await acquireCanvas();
     signal.throwIfAborted();
@@ -40,6 +42,8 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
     let audio;
     let audioClosing;
     let metrics;
+    let hostSettings;
+    let hookStatus;
     let cancelled = false;
     let disposed;
     let presenting = false;
@@ -53,7 +57,7 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
         let sample;
         try { sample = metrics ? readMissionMetrics(metrics) : undefined; }
         catch (error) { report({ generation, ok: false, code: 'METRICS_PROTOCOL', message: error.message }); return; }
-        onPresented({ ...details, ...(sample ? { metrics: sample } : {}) });
+        onPresented({ ...details, ...(sample ? { metrics: sample } : {}), ...(hookStatus ? { hookStatus: readHookStatus(hookStatus) } : {}) });
         if (!presenting) {
           presenting = true;
           report({ generation, phase: 'running', executing: true });
@@ -70,6 +74,7 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
       if (cancelled) { return; }
       cancelled = true;
       audioClosing = audio?.dispose();
+      hostSettings?.dispose();
       motion?.dispose();
       controller?.dispose();
       producer?.dispose();
@@ -100,7 +105,18 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
             } else { onDiagnostic({ runtime: { restarts: data.restarts } }); }
             return true;
           }
+          if (data.phase === 'hooks') {
+            if (live()) { onDiagnostic({ hooks: data.hooks }); }
+            return true;
+          }
+          if (data.phase === 'log') {
+            if (live()) { console.info(data.text); }
+            return true;
+          }
           if (data.phase === 'restarting' && live()) {
+            hostSettings?.dispose();
+            hostSettings = undefined;
+            hookStatus = undefined;
             void audio?.dispose();
             audio = undefined;
             motion?.dispose();
@@ -124,6 +140,11 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
               audio = createAudio({ buffer: data.buffer, byteOffset: data.audioOffset, samplesOffset: data.audioSamplesOffset, signal });
             }
             if (data.metricsOffset) { metrics = new Uint32Array(data.buffer, data.metricsOffset, MISSION_METRICS_WORDS); }
+            if (data.hookStatusOffset) { hookStatus = new Uint32Array(data.buffer, data.hookStatusOffset, 8); }
+            if (settings && data.settingsOffset) {
+              hostSettings = createHostSettingsWriter({ buffer: data.buffer, byteOffset: data.settingsOffset, settings,
+                onWrite: revision => { if (live()) { onDiagnostic({ settings: { revision } }); } } });
+            }
             if (data.motionOffset) {
               motion = createMotion({ buffer: data.buffer, byteOffset: data.motionOffset, signal,
                 clear: () => { producer?.setActive(false); producer?.setActive(true); } });

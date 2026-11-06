@@ -1,8 +1,9 @@
 #include "browser/cpu_runtime.h"
+#include "browser/hooks.h"
 #include "cpu/x86_ops.h"
 #include <array>
 
-X86_FUNC(__imp__sub_004B8EC0);
+BROWSER_GAME_CHAIN(004B8EC0)
 X86_FUNC(sub_004B8EC0) {
   browser::Memory::PauseExecution pause;
   auto& runtime = browser::Runtime::From(ctx);
@@ -33,5 +34,5 @@ X86_FUNC(sub_004B8EC0) {
     ctx.esp += 12;
     return;
   }
-  __imp__sub_004B8EC0(ctx, base);
+  game_sub_004B8EC0(ctx, base);
 }

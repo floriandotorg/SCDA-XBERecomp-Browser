@@ -1,0 +1,115 @@
+// The one schema of settings that reach the guest: app::Settings field, its place in the shared block, and the
+// settings.mjs key it comes from. src/browser/host-settings.h carries the matching indices.
+export const HOST_SETTINGS_SCHEMA = 1;
+export const HOST_SETTINGS_WORDS = 64;
+export const HOST_SETTINGS_BYTES = 4096;
+export const HOST_SETTINGS_SPAN = HOST_SETTINGS_WORDS * 4 + HOST_SETTINGS_BYTES;
+export const HOST_SETTINGS_FIELDS = Object.freeze([
+  Object.freeze({ field: 'skip_intros', key: 'skipIntros', type: 'bool', bit: 0 }),
+  Object.freeze({ field: 'pause_on_focus_loss', key: 'pauseOnFocusLoss', type: 'bool', bit: 1 }),
+]);
+const REVISION = 0, SCHEMA = 1, FLAGS = 2;
+const ATTEMPTS = 1 << 16;
+const keys = new Set(HOST_SETTINGS_FIELDS.map(entry => entry.key));
+
+const fail = message => { throw Object.assign(new Error(message), { code: 'HOST_SETTINGS' }); };
+
+export const encodeHostSettings = values => {
+  const words = new Uint32Array(HOST_SETTINGS_WORDS);
+  words[SCHEMA] = HOST_SETTINGS_SCHEMA;
+  const lines = [];
+  for (const entry of HOST_SETTINGS_FIELDS) {
+    const value = values?.[entry.key];
+    const invalid = () => fail(`Invalid host setting ${entry.key}.`);
+    if (entry.type === 'bool') {
+      if (typeof value !== 'boolean') { invalid(); }
+      if (value) { words[FLAGS] |= 1 << entry.bit; }
+    } else if (entry.type === 'u32') {
+      if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) { invalid(); }
+      words[entry.word] = value;
+    } else if (entry.type === 'f32') {
+      if (!Number.isFinite(value)) { invalid(); }
+      words[entry.word] = new Uint32Array(Float32Array.of(value).buffer)[0];
+    } else if (entry.type === 'text') {
+      if (typeof value !== 'string' || /[\n=\0]/.test(value)) { invalid(); }
+      lines.push(`${entry.field}=${value}`);
+    } else if (entry.type === 'map') {
+      if (!value || typeof value !== 'object') { invalid(); }
+      for (const [name, item] of Object.entries(value)) {
+        if (typeof item !== 'string' || /[\n=\0]/.test(name + item)) { invalid(); }
+        lines.push(`${entry.field}.${name}=${item}`);
+      }
+    }
+  }
+  const text = new TextEncoder().encode(lines.map(line => `${line}\n`).join(''));
+  if (text.length >= HOST_SETTINGS_BYTES) { fail('Host settings text exceeds its block.'); }
+  const bytes = new Uint8Array(HOST_SETTINGS_BYTES);
+  bytes.set(text);
+  return { words, bytes };
+};
+
+export const validateHostSettings = encoded => {
+  if (!(encoded?.words instanceof Uint32Array) || encoded.words.length !== HOST_SETTINGS_WORDS ||
+      !(encoded.bytes instanceof Uint8Array) || encoded.bytes.length !== HOST_SETTINGS_BYTES) {
+    fail('Invalid host settings.');
+  }
+  if (encoded.words[SCHEMA] !== HOST_SETTINGS_SCHEMA) { fail('Host settings schema mismatch.'); }
+  return encoded;
+};
+
+export const createHostSettingsView = (buffer, byteOffset) => {
+  if (!(buffer instanceof SharedArrayBuffer)) { fail('Host settings require shared memory.'); }
+  if (!Number.isSafeInteger(byteOffset) || byteOffset <= 0 || byteOffset % 4 || byteOffset > buffer.byteLength - HOST_SETTINGS_SPAN) {
+    fail('Host settings span is out of bounds.');
+  }
+  return { words: new Uint32Array(buffer, byteOffset, HOST_SETTINGS_WORDS),
+    bytes: new Uint8Array(buffer, byteOffset + HOST_SETTINGS_WORDS * 4, HOST_SETTINGS_BYTES) };
+};
+
+export const writeHostSettings = ({ words, bytes }, encoded, { attempts = ATTEMPTS } = {}) => {
+  validateHostSettings(encoded);
+  let revision;
+  for (let n = 0; ; ++n) {
+    revision = Atomics.load(words, REVISION);
+    if (!(revision & 1) && Atomics.compareExchange(words, REVISION, revision, (revision + 1) >>> 0) === revision) { break; }
+    if (n === attempts) { fail('Host settings block stayed locked.'); }
+  }
+  for (let n = 1; n < HOST_SETTINGS_WORDS; ++n) { Atomics.store(words, n, encoded.words[n]); }
+  for (let n = 0; n < HOST_SETTINGS_BYTES; ++n) {
+    if (Atomics.load(bytes, n) !== encoded.bytes[n]) { Atomics.store(bytes, n, encoded.bytes[n]); }
+  }
+  const next = (revision + 2) >>> 0;
+  Atomics.store(words, REVISION, next);
+  return next;
+};
+
+export const readHostSettings = ({ words, bytes }, { attempts = ATTEMPTS } = {}) => {
+  for (let n = 0; n < attempts; ++n) {
+    const revision = Atomics.load(words, REVISION);
+    if (revision & 1) { continue; }
+    const copy = { revision, words: Uint32Array.from(words), bytes: Uint8Array.from(bytes) };
+    if (Atomics.load(words, REVISION) === revision) { return copy; }
+  }
+  return undefined;
+};
+
+export const createHostSettingsWriter = ({ buffer, byteOffset, settings, onWrite = () => {} }) => {
+  if (typeof settings?.snapshot !== 'function' || typeof settings.subscribe !== 'function') { fail('Host settings writer requires settings.'); }
+  const view = createHostSettingsView(buffer, byteOffset);
+  let revision;
+  const write = () => {
+    revision = writeHostSettings(view, encodeHostSettings(settings.snapshot()));
+    onWrite(revision);
+  };
+  write();
+  const unsubscribe = settings.subscribe(name => { if (keys.has(name)) { write(); } });
+  return Object.freeze({ dispose: unsubscribe, get revision() { return revision; } });
+};
+
+// hook-graphics.h kHookStatusWords: fog latched by the last presented frame, optional effects left undrawn and the
+// frame's fog passes
+export const readHookStatus = words => {
+  const floats = new Float32Array(Uint32Array.from(words.subarray(0, 3)).buffer);
+  return { fog: { slope: floats[0], offset: floats[1], amount: floats[2], passes: Atomics.load(words, 4), ramps: Atomics.load(words, 5) },
+    unsupportedEffects: Atomics.load(words, 3) };
+};

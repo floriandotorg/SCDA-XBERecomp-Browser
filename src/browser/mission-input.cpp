@@ -1,15 +1,16 @@
 #include "browser/mission-input.h"
 #include "browser/mission-clock.h"
+#include "browser/hooks.h"
 #include "cpu/x86_ops.h"
 #include <bit>
 #include <cmath>
 #include <optional>
 #include <chrono>
 
-X86_FUNC(__imp__sub_0004B525);
+BROWSER_GAME_CHAIN(0004B525)
 X86_FUNC(sub_0004B525) {
   const uint32_t viewport = ctx.ecx;
-  __imp__sub_0004B525(ctx, base);
+  game_sub_0004B525(ctx, base);
   const auto saved = ctx;
   ctx.ecx = viewport;
   browser::Runtime::ObserveSdkEntry(ctx, base, 132);
@@ -18,9 +19,9 @@ X86_FUNC(sub_0004B525) {
 
 X86_FUNC(__imp__sub_001D2A4E);
 X86_FUNC(__imp__sub_001CDA8A);
-X86_FUNC(__imp__sub_00039AD4);
+BROWSER_GAME_CHAIN(00039AD4)
 X86_FUNC(sub_00039AD4) {
-  if (browser::Runtime::ObserveSdkEntry(ctx, base, 135)) { __imp__sub_00039AD4(ctx, base); }
+  if (browser::Runtime::ObserveSdkEntry(ctx, base, 135)) { game_sub_00039AD4(ctx, base); }
 }
 X86_FUNC(sub_001D2A4E) {
   if (browser::Runtime::ObserveSdkEntry(ctx, base, 133)) { __imp__sub_001D2A4E(ctx, base); }

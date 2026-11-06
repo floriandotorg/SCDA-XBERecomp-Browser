@@ -403,6 +403,7 @@ DiagnosticGraphics::DiagnosticGraphics(Runtime& runtime, PreparedImage& image, C
   if (!memory_ || !allocations_.allocate || !allocations_.release || image.importsBound || image.boundRuntime || runtime.HasPublishedImage() || runtime.ActiveWorkers() || Memory::HasBorrow()) {
     throw Fault({}, device, 0, "diagnostic graphics requires its cold owned image and allocator");
   }
+  hooks_.SetBackend(renderer_.get(), {});
 }
 DiagnosticGraphics::~DiagnosticGraphics() = default;
 void DiagnosticGraphics::ConfigurePresentCheckpoint(uint32_t frames) {
@@ -572,9 +573,7 @@ void DiagnosticGraphics::CaptureState(const X86Context& ctx, bool forceViewport)
 }
 void DiagnosticGraphics::UpdateViewportConstants() {
   state_.zscale = state_.zs.header && (((state_.zs.format >> 8) & 255) == 44 || ((state_.zs.format >> 8) & 255) == 48) ? 65535.0f : 16777215.0f;
-  const auto& v = state_.viewport;
-  state_.vsc[58] = {v.w * 0.5f, -float(v.h) * 0.5f, (v.max_z - v.min_z) * state_.zscale, 0};
-  state_.vsc[59] = {v.x + state_.ss_offset_x + v.w * 0.5f, v.y + state_.ss_offset_y + v.h * 0.5f, v.min_z * state_.zscale, 0};
+  hooks_.ViewportConstants();
 }
 void DiagnosticGraphics::Reference(X86Context& ctx, uint8_t* base, uint32_t resource, bool add) {
   if (!resource) { return; }
@@ -1245,6 +1244,11 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
         indices.resize(size_t(count) * 2);
         memory_->Read(ctx, frame[3], indices.data(), indices.size());
       }
+      if (hooks_.FogBlend() && state_.textures[3]) {
+        std::array<uint32_t, 5> ramp;
+        memory_->Read(ctx, state_.textures[3], ramp.data(), sizeof(ramp));
+        hooks_.LatchFog(ramp);
+      }
       renderer_->IndexSource(indices.empty() ? 0 : frame[3]);
       renderer_->Draw(state_, frame[1], id == 20 ? 0 : frame[2], count, indices.empty() ? nullptr : indices.data());
       if (state_.rt.header) { gpuWritten_.insert(0x80000000 | (state_.rt.data & 0x3ffffff)); }
@@ -1281,6 +1285,8 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
       uint32_t count;
       memory_->Read(ctx, device + 0x2478, &count, 4);
       renderer_->Present(front, false);
+      PublishHookStatus(hooks_, hooks_.Fog());
+      hooks_.ClearFog();
       for (uint32_t n = 0; n < payload.size(); ++n) {
         const auto& next = payload[1 - n];
         memory_->Write(ctx, resources_[n].header + 4, next.data(), sizeof(next));

@@ -1,8 +1,10 @@
 import { createWorkerBroker } from './boot-worker-broker.mjs';
 import { createIsoMailbox, finishIsoRead, isoMailboxHeader } from './iso-mailbox.mjs';
+import { validateHostSettings } from './host-settings.mjs';
 
-export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createWorkerBroker, createServices, observeIo = false, developmentStart = false } = {}) => {
+export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createWorkerBroker, createServices, observeIo = false, developmentStart = false, hostSettings } = {}) => {
   if (typeof developmentStart !== 'boolean') { throw new TypeError('Invalid development start option.'); }
+  if (hostSettings !== undefined) { validateHostSettings(hostSettings); }
   const broker = createBroker({ WorkerClass });
   const pending = new Map();
   const ports = new Set();
@@ -132,7 +134,7 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
       }
       const guest = broker.create(new URL('./boot-worker.mjs', import.meta.url), { type: 'module', name: 'story-boot' }, publish, workerError);
       guest.postMessage({ port: channel.port2, mailbox, generation, ownership, size: source.size,
-        developmentStart,
+        developmentStart, ...(hostSettings ? { hostSettings } : {}),
         ...(services?.webgpuMailbox ? { webgpuMailbox: services.webgpuMailbox } : {}) }, [channel.port2]);
       if (observeIo) {
         ioTimer = setInterval(() => { sample?.(); }, 1000);

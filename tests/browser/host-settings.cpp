@@ -1,0 +1,64 @@
+#include "app/app.h"
+#include "browser/host-settings.h"
+#include <cstdio>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
+namespace settings = browser::host_settings;
+
+const auto check = [](bool value, const char* reason) {
+  if (!value) { throw std::runtime_error(reason); }
+};
+
+void Publish(settings::Block& block, bool skip, const std::string& language) {
+  auto& revision = block.words[settings::kRevisionWord];
+  uint32_t current = revision.load();
+  while ((current & 1) || !revision.compare_exchange_weak(current, current + 1)) { current &= ~1u; }
+  block.words[settings::kSchemaWord].store(settings::kSchema);
+  block.words[settings::kFlagsWord].store((skip ? 1u << settings::kSkipIntrosBit : 0) | (skip ? 0 : 1u << settings::kPauseOnFocusLossBit));
+  const std::string text = "language=" + language + "\nkeys.fire=Mouse1\n";
+  for (uint32_t n = 0; n < block.text.size(); ++n) {
+    uint32_t word = 0;
+    for (uint32_t byte = 0; byte < 4; ++byte) {
+      const size_t at = n * 4 + byte;
+      if (at < text.size()) { word |= uint32_t(uint8_t(text[at])) << (byte * 8); }
+    }
+    block.text[n].store(word);
+  }
+  revision.store(current + 2);
+}
+
+int main() {
+  auto& block = settings::Shared();
+  check(!app::Get().skip_intros && app::Get().pause_on_focus_loss && app::Get().language == "auto", "an unwritten block did not give defaults");
+  check(app::SettingsRevision() == 0 && app::Aspect() == 4.0f / 3.0f && app::FovScale() == 1.0f, "fixed frame shape or fov");
+  Publish(block, true, "fra");
+  check(app::Get().skip_intros && !app::Get().pause_on_focus_loss && app::Get().language == "fra", "a published block was not read");
+  check(app::Get().keys.at("fire") == "Mouse1" && app::SettingsRevision() == 1, "map fields or revision");
+  constexpr uint32_t writes = 20000;
+  std::atomic<bool> done = false;
+  std::atomic<uint32_t> torn = 0, observed = 0;
+  std::vector<std::thread> readers;
+  for (uint32_t n = 0; n < 2; ++n) {
+    readers.emplace_back([&] {
+      uint32_t previous = 0;
+      while (!done.load()) {
+        const auto& current = app::Get();
+        if (current.skip_intros != (current.language == "fra") || current.skip_intros == current.pause_on_focus_loss) { ++torn; }
+        const uint32_t revision = app::SettingsRevision();
+        if (revision < previous) { ++torn; }
+        previous = revision;
+        ++observed;
+      }
+    });
+  }
+  for (uint32_t n = 0; n < writes; ++n) { Publish(block, n % 2 == 0, n % 2 == 0 ? "fra" : "deu"); }
+  done = true;
+  for (auto& reader : readers) { reader.join(); }
+  check(torn == 0, "a reader saw a torn settings write");
+  check(observed > 0, "readers never ran");
+  Publish(block, true, "fra");
+  check(app::Get().skip_intros && app::Get().language == "fra", "the final write was not read");
+  std::puts("host-settings-contracts-ok");
+}

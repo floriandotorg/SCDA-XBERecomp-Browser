@@ -1,10 +1,11 @@
 #include "browser/menu-route.h"
+#include "browser/hooks.h"
 #include "cpu/x86_ops.h"
 #include <algorithm>
 
-X86_FUNC(__imp__sub_0018697A);
+BROWSER_GAME_CHAIN(0018697A)
 X86_FUNC(sub_0018697A) {
-  if (browser::Runtime::ObserveSdkEntry(ctx, base, 65)) { __imp__sub_0018697A(ctx, base); }
+  if (browser::Runtime::ObserveSdkEntry(ctx, base, 65)) { game_sub_0018697A(ctx, base); }
 }
 
 namespace browser {

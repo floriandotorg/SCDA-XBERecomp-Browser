@@ -1,4 +1,5 @@
 #pragma once
+#include "browser/hook-graphics.h"
 #include "browser/image.h"
 #include "browser/shader-inventory.h"
 #include "browser/webgpu-transport.h"
@@ -65,6 +66,8 @@ public:
   void Occlusion(const gpu::State&, const float*) override;
   void FilterShadows(const gpu::State&, const float*) override;
   void ApplyShadows(const gpu::State&) override;
+  // the optional effects game hooks ask for through d3d::; none is drawn yet, so a hook's request is counted instead
+  bool Supports(GraphicsEffect) const { return false; }
   uint32_t Fence() override;
   bool FencePending(uint32_t fence) override;
   void WaitFence(uint32_t fence) override;

@@ -107,7 +107,7 @@ for (const platform of ['native', 'wasm']) {
       : ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'];
     const output = `${directory}/${wasm ? 'graphics.mjs' : 'native'}`;
     const env = { ...process.env, TMPDIR: directory };
-    const build = spawnSync(wasm ? 'em++' : 'clang++', ['-std=c++20', '-O1', '-g', '-pthread', '-DX86_PORTABLE_RUNTIME', '-DX86_COMPACT_MEMORY', `-I${directory}`, '-Isrc', 'tests/browser/diagnostic-graphics.cpp', `${directory}/original.cpp`, `${directory}/retained.cpp`, 'src/browser/diagnostic-graphics.cpp', 'src/browser/diagnostic-shaders.cpp', 'src/browser/push-state.cpp', 'src/browser/sdk-provider.cpp', 'src/browser/contiguous-memory.cpp', 'src/browser/image.cpp', 'src/browser/cpu_runtime.cpp', ...flags, '-o', output], { encoding: 'utf8', timeout: 120000, env });
+    const build = spawnSync(wasm ? 'em++' : 'clang++', ['-std=c++20', '-O1', '-g', '-pthread', '-DX86_PORTABLE_RUNTIME', '-DX86_COMPACT_MEMORY', `-I${directory}`, '-Isrc', 'tests/browser/diagnostic-graphics.cpp', `${directory}/original.cpp`, `${directory}/retained.cpp`, 'src/browser/diagnostic-graphics.cpp', 'src/browser/hook-graphics.cpp', 'src/browser/diagnostic-shaders.cpp', 'src/browser/push-state.cpp', 'src/browser/sdk-provider.cpp', 'src/browser/contiguous-memory.cpp', 'src/browser/image.cpp', 'src/browser/cpu_runtime.cpp', ...flags, '-o', output], { encoding: 'utf8', timeout: 120000, env });
     assert.equal(build.status, 0, build.stderr);
     const run = spawnSync(wasm ? process.execPath : output, wasm ? [`${directory}/run.mjs`] : [], { encoding: 'utf8', timeout: 30000, env });
     assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);

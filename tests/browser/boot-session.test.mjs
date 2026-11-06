@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createBootSession } from '../../src/browser/boot-session.mjs';
 import { createIsoMailbox } from '../../src/browser/iso-mailbox.mjs';
+import { encodeHostSettings, HOST_SETTINGS_SPAN } from '../../src/browser/host-settings.mjs';
 
 const buildIdentity = 'a1'.repeat(32);
 
@@ -850,4 +851,84 @@ test('gamepad input publication validates both exports and every shared span bef
     if (valid) { assert.equal(progress.find(message => message.phase === 'input').gamepadOffset, offset); }
     else { assert.equal(messages[0].code, 'INPUT_PROTOCOL'); }
   }
+});
+
+const hookFixture = () => {
+  const result = executedFixture();
+  const heap = new Uint8Array(new SharedArrayBuffer(16384));
+  heap.set(result.module.HEAPU8);
+  result.module.HEAPU8 = heap;
+  Object.assign(result.module, {
+    _image_input_address: () => 112, _image_input_words: () => 2,
+    _image_settings_address: () => 4096, _image_settings_words: () => 64,
+    _image_hook_status_address: () => 9216, _image_hook_status_words: () => 8,
+  });
+  const progress = [];
+  result.options.onProgress = message => { progress.push(message); result.calls.push(message.phase); };
+  return { ...result, heap, progress };
+};
+
+test('host settings are validated and written into their shared block before guest binding', async () => {
+  const { options, data, module, heap, progress, calls } = hookFixture();
+  const block = new Uint32Array(heap.buffer, 4096, 64);
+  module._image_bind = () => {
+    calls.push('bind');
+    assert.equal(block[0], 2);
+    assert.equal(block[2], 1);
+    return 1;
+  };
+  await createBootSession(options)({ data: { ...data, hostSettings: encodeHostSettings({ skipIntros: true, pauseOnFocusLoss: false }) } });
+  assert.ok(calls.includes('bind'));
+  const input = progress.find(message => message.phase === 'input');
+  assert.equal(input.settingsOffset, 4096);
+  assert.equal(input.hookStatusOffset, 9216);
+  for (const hostSettings of [{ words: [], bytes: new Uint8Array(4096) }, { words: new Uint32Array(64), bytes: new Uint8Array(4096) }, 'on']) {
+    const rejected = hookFixture();
+    rejected.module._image_execute = () => { throw new Error('entry must not run'); };
+    await createBootSession(rejected.options)({ data: { ...rejected.data, hostSettings } });
+    assert.equal(rejected.messages[0].code, 'HOST_SETTINGS');
+  }
+});
+
+test('host settings and hook status spans cannot overlap other shared storage', async () => {
+  for (const [settings, status, valid] of [[4096, 9216, true], [4098, 9216, false], [16384 - HOST_SETTINGS_SPAN + 4, 9216, false],
+    [4096, 4096 + HOST_SETTINGS_SPAN - 4, false], [100, 9216, false], [4096, 112, false]]) {
+    const { options, data, module, messages, progress } = hookFixture();
+    module._image_settings_address = () => settings;
+    module._image_hook_status_address = () => status;
+    let executions = 0;
+    module._image_execute = () => { ++executions; return 1; };
+    await createBootSession(options)({ data });
+    assert.equal(executions, valid ? 1 : 0, `${settings} ${status}`);
+    if (valid) { assert.equal(progress.find(message => message.phase === 'input').settingsOffset, settings); }
+    else { assert.equal(messages[0].code, 'INPUT_PROTOCOL'); }
+  }
+});
+
+test('game hook bindings and game log lines reach the page while the guest runs', async () => {
+  const { options, data, module, heap, progress, calls } = hookFixture();
+  const names = ['magma_time', 'intro'];
+  names.forEach((name, n) => heap.set(new TextEncoder().encode(`${name}\0`), 12000 + n * 32));
+  Object.assign(module, {
+    _image_hook_count: () => 2, _image_hook_name: n => 12000 + n * 32,
+    _image_hook_address: n => [0x2303af, 0x39ad4][n], _image_hook_bound: n => n === 0 ? 1 : 0,
+  });
+  options.create = async ({ printErr }) => {
+    module._image_execute = () => {
+      assert.ok(calls.includes('hooks'));
+      printErr('[game] intro: skipped the logos video');
+      printErr('[browser-memory-fault] not for the page');
+      return 1;
+    };
+    return module;
+  };
+  await createBootSession(options)({ data });
+  assert.deepEqual(progress.find(message => message.phase === 'hooks').hooks,
+    [{ name: 'magma_time', address: 0x2303af, bound: true }, { name: 'intro', address: 0x39ad4, bound: false }]);
+  assert.deepEqual(progress.filter(message => message.phase === 'log').map(message => message.text), ['[game] intro: skipped the logos video']);
+  const malformed = hookFixture();
+  Object.assign(malformed.module, { _image_hook_count: () => 1, _image_hook_name: () => 0, _image_hook_address: () => 1, _image_hook_bound: () => 1 });
+  malformed.module._image_execute = () => { throw new Error('entry must not run'); };
+  await createBootSession(malformed.options)({ data: malformed.data });
+  assert.equal(malformed.messages[0].code, 'HOOK_PROTOCOL');
 });

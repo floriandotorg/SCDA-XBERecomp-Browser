@@ -3,6 +3,7 @@ import { AUDIO_FRAMES, AUDIO_CHANNELS } from './audio-transport.mjs';
 import { createWasmIsoReader } from './iso-wasm.mjs';
 import { prepareDiscImage } from './iso-image.mjs';
 import { readMenuStateDiagnostic, readMenuFileDiagnostics } from './menu-state-report.mjs';
+import { createHostSettingsView, validateHostSettings, writeHostSettings, HOST_SETTINGS_SPAN, HOST_SETTINGS_WORDS } from './host-settings.mjs';
 
 const requireBuildIdentity = (module, manifest) => {
   const reject = () => {
@@ -240,8 +241,13 @@ const readInputDescriptor = (module) => {
     gamepadOffset = span(module._image_gamepad_address(), 32);
     if (!gamepadOffset || module._image_gamepad_words() !== 8) { reject(); }
   }
+  const settingsOffset = span(module._image_settings_address?.() ?? 0, HOST_SETTINGS_SPAN);
+  if (settingsOffset && module._image_settings_words?.() !== HOST_SETTINGS_WORDS) { reject(); }
+  const hookStatusOffset = span(module._image_hook_status_address?.() ?? 0, 32);
+  if (hookStatusOffset && module._image_hook_status_words?.() !== 8) { reject(); }
   const spans = [[motionOffset, 20], [metricsOffset, MISSION_METRICS_WORDS * 4], [audioOffset, 32],
-    [audioSamplesOffset, AUDIO_FRAMES * AUDIO_CHANNELS * 4], [gamepadOffset, 32]].filter(([offset]) => offset);
+    [audioSamplesOffset, AUDIO_FRAMES * AUDIO_CHANNELS * 4], [gamepadOffset, 32], [settingsOffset, HOST_SETTINGS_SPAN],
+    [hookStatusOffset, 32]].filter(([offset]) => offset);
   for (let n = 0; n < spans.length; ++n) {
     const [offset, size] = spans[n];
     for (const [other, bytes] of spans.slice(n + 1)) {
@@ -249,7 +255,24 @@ const readInputDescriptor = (module) => {
     }
   }
   return { buffer, byteOffset, words, ...(motionOffset ? { motionOffset } : {}), ...(metricsOffset ? { metricsOffset } : {}),
-    ...(audioOffset ? { audioOffset, audioSamplesOffset } : {}), ...(gamepadOffset ? { gamepadOffset } : {}) };
+    ...(audioOffset ? { audioOffset, audioSamplesOffset } : {}), ...(gamepadOffset ? { gamepadOffset } : {}),
+    ...(settingsOffset ? { settingsOffset } : {}), ...(hookStatusOffset ? { hookStatusOffset } : {}) };
+};
+
+const readGameHooks = (module) => {
+  if (module._image_hook_count === undefined) { return undefined; }
+  const reject = () => { throw Object.assign(new Error('Invalid game hook binding report.'), { code: 'HOOK_PROTOCOL' }); };
+  if (['_image_hook_count', '_image_hook_name', '_image_hook_address', '_image_hook_bound'].some(name => typeof module[name] !== 'function')) { reject(); }
+  const count = module._image_hook_count();
+  if (!Number.isInteger(count) || count < 0 || count > 256) { reject(); }
+  return Array.from({ length: count }, (_, n) => {
+    const start = module._image_hook_name(n) >>> 0;
+    const end = start ? module.HEAPU8.indexOf(0, start) : -1;
+    const name = end > start && end - start <= 64 ? new TextDecoder().decode(module.HEAPU8.slice(start, end)) : '';
+    const address = module._image_hook_address(n) >>> 0;
+    if (!/^\w+$/.test(name) || !address) { reject(); }
+    return { name, address, bound: module._image_hook_bound(n) === 1 };
+  });
 };
 
 const readLaunchRequest = (module) => {
@@ -303,7 +326,7 @@ export const readMissionDiagnostic = (module) => {
 
 export const createBootSession = ({ create, manifest, postMessage, prepare = prepareDiscImage, onProgress = () => {} }) => {
   let started = false;
-  return async ({ data: { port, mailbox, generation, ownership, size, webgpuMailbox, developmentStart = false } }) => {
+  return async ({ data: { port, mailbox, generation, ownership, size, webgpuMailbox, developmentStart = false, hostSettings } }) => {
     if (started) {
       port?.close();
       postMessage({ ok: false, generation, code: 'SESSION', message: 'A boot worker owns one session only.' });
@@ -329,6 +352,7 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
     };
     try {
       if (typeof developmentStart !== 'boolean') { throw Object.assign(new Error('Invalid development start option.'), { code: 'DEVELOPMENT_START' }); }
+      if (hostSettings !== undefined) { validateHostSettings(hostSettings); }
       const read = createWasmIsoReader({ port, mailbox, generation, ownership, getHeap: () => module.HEAPU8 });
       ownershipChecked = true;
       signal.throwIfAborted();
@@ -345,6 +369,7 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
         },
         printErr: (text) => {
           if (!diagnosticsActive || signal.aborted || typeof text !== 'string') { return; }
+          if (text.startsWith('[game] ')) { onProgress({ generation, phase: 'log', text: text.slice(0, 512) }); }
           if (text.startsWith('[browser-pthread-crash] ') && pthreadFailure.length < 6) { pthreadFailure.push(text.slice(0, 512)); }
           if (text.length > 512) { stderrTruncated = true; }
           if (stderr.length === 16) { stderr.shift(); stderrTruncated = true; }
@@ -388,6 +413,11 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
         }
       }
       signal.throwIfAborted();
+      const settingsAddress = module._image_settings_address?.() ?? 0;
+      if (hostSettings && settingsAddress) {
+        writeHostSettings(createHostSettingsView(module.HEAPU8.buffer, settingsAddress), hostSettings);
+      }
+      signal.throwIfAborted();
       const bound = module._image_bind() === 1;
       signal.throwIfAborted();
       const catalog = new Map(manifest.kernelExports.map((entry) => [entry.ordinal, entry]));
@@ -413,6 +443,9 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
           onProgress({ generation, phase: 'progress', buffer, address: address >>> 0 });
           signal.throwIfAborted();
           const input = readInputDescriptor(module);
+          signal.throwIfAborted();
+          const hooks = readGameHooks(module);
+          if (hooks) { onProgress({ generation, phase: 'hooks', hooks }); }
           signal.throwIfAborted();
           if (input) { onProgress({ generation, phase: 'input', ...input }); }
           signal.throwIfAborted();

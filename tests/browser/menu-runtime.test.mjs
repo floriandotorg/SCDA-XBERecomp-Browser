@@ -172,3 +172,52 @@ test('mission gamepad publication is required and retires polling before runtime
   assert.equal(missing.events.find(event => event[0] === 'report')[1].code, 'INPUT_PROTOCOL');
   await other.dispose();
 });
+
+test('host settings: boot snapshot beside development start, a live writer per runtime, hook diagnostics and game log', async () => {
+  const listeners = new Set();
+  const values = { skipIntros: true, pauseOnFocusLoss: false, volume: 100 };
+  const settings = { snapshot: () => ({ ...values }), subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
+    set: (name, value) => { values[name] = value; for (const listener of listeners) { listener(name, value); } } };
+  let runtimeOptions;
+  const events = [], presented = [];
+  const abort = new AbortController();
+  let gpu;
+  createMenuRuntime({ gamepad: false, settings, developmentStart: true, acquireCanvas: () => ({}),
+    createRuntime: options => { runtimeOptions = options; return {}; },
+    createGPU: options => { gpu = options; return { ready: Promise.resolve(), cancel() {}, dispose: async () => {} }; },
+    createInput: () => ({ dispose() {} }), onDiagnostic: details => events.push(details), onPresented: details => presented.push(details) });
+  assert.equal(runtimeOptions.developmentStart, true);
+  assert.deepEqual([...runtimeOptions.hostSettings.words.slice(1, 3)], [1, 1]);
+  const log = [];
+  const info = console.info;
+  console.info = text => log.push(text);
+  try {
+    const services = await runtimeOptions.createServices({ generation: 3, signal: abort.signal, owned: () => true, report: data => events.push(['report', data]) });
+    const buffer = new SharedArrayBuffer(8192);
+    const words = new Uint32Array(buffer, 1024, 64);
+    const status = new Uint32Array(buffer, 6000, 8);
+    status[0] = new Uint32Array(Float32Array.of(0.25).buffer)[0];
+    status[3] = 5;
+    assert.equal(services.handle({ generation: 3, phase: 'input', buffer, byteOffset: 8, words: 2, settingsOffset: 1024, hookStatusOffset: 6000 }), true);
+    assert.equal(words[0], 2);
+    assert.equal(words[2], 1);
+    settings.set('pauseOnFocusLoss', true);
+    assert.equal(words[2], 3);
+    assert.deepEqual(events.filter(event => event.settings).map(event => event.settings.revision), [2, 4]);
+    assert.equal(services.handle({ generation: 3, phase: 'hooks', hooks: [{ name: 'intro', address: 0x39ad4, bound: true }] }), true);
+    assert.deepEqual(events.find(event => event.hooks).hooks, [{ name: 'intro', address: 0x39ad4, bound: true }]);
+    assert.equal(services.handle({ generation: 3, phase: 'log', text: '[game] intro: skipped the logos video' }), true);
+    assert.deepEqual(log, ['[game] intro: skipped the logos video']);
+    gpu.onPresented({ command: 1 });
+    assert.deepEqual(presented[0].hookStatus, { fog: { slope: 0.25, offset: 0, amount: 0, passes: 0, ramps: 0 }, unsupportedEffects: 5 });
+    services.handle({ generation: 3, phase: 'restarting' });
+    settings.set('skipIntros', false);
+    assert.equal(words[0], 4, 'a retired runtime still wrote host settings');
+    services.handle({ generation: 3, phase: 'input', buffer, byteOffset: 8, words: 2, settingsOffset: 1024 });
+    assert.equal(words[0], 6);
+    assert.equal(words[2], 2);
+    services.cancel();
+    settings.set('skipIntros', true);
+    assert.equal(words[0], 6, 'a cancelled runtime still wrote host settings');
+  } finally { console.info = info; }
+});

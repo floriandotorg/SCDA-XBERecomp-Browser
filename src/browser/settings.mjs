@@ -4,6 +4,8 @@ export const SETTINGS = Object.freeze({
   volume: Object.freeze({ initial: 100, min: 0, max: 100, step: 5 }),
   sensitivity: Object.freeze({ initial: 1, min: 0.1, max: 5, step: 0.1 }),
   invertY: Object.freeze({ initial: false }),
+  skipIntros: Object.freeze({ initial: false }),
+  pauseOnFocusLoss: Object.freeze({ initial: true }),
   developmentStart: Object.freeze({ initial: false }),
   showFps: Object.freeze({ initial: false }),
   showDiagnostics: Object.freeze({ initial: false }),

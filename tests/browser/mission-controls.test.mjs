@@ -12,12 +12,12 @@ const fixture = async () => {
   const window = new EventTarget();
   const canvas = { focus() {}, requestPointerLock: async () => { document.pointerLockElement = canvas; document.dispatchEvent(new Event('pointerlockchange')); } };
   const capture = new EventTarget();
-  const settings = { sensitivity: 1, invertY: false };
+  const settings = { sensitivity: 1, invertY: false, pauseOnFocusLoss: true };
   document.hidden = false;
   document.hasFocus = () => true;
   document.exitPointerLock = () => { document.pointerLockElement = null; document.dispatchEvent(new Event('pointerlockchange')); };
   let now = 100, cleared = 0;
-  const controls = createMissionControls({ buffer, byteOffset: 4, document, window, canvas, capture, sensitivity: () => settings.sensitivity, invertY: () => settings.invertY, now: () => now, clear: () => { ++cleared; } });
+  const controls = createMissionControls({ buffer, byteOffset: 4, document, window, canvas, capture, sensitivity: () => settings.sensitivity, invertY: () => settings.invertY, pauseOnFocusLoss: () => settings.pauseOnFocusLoss, now: () => now, clear: () => { ++cleared; } });
   const move = (movementX, movementY) => {
     const event = new Event('mousemove');
     Object.assign(event, { movementX, movementY });
@@ -135,5 +135,32 @@ test('Escape explicitly releases pointer capture and pending movement', async ()
   f.window.dispatchEvent(event);
   assert.equal(f.document.pointerLockElement, null);
   assert.deepEqual([...f.words].slice(0, 2), [0, 0]);
+  f.controls.dispose();
+});
+test('with pause on focus loss off a blur keeps the world running while hidden tabs and suspension still pause', async () => {
+  const f = await fixture();
+  f.settings.pauseOnFocusLoss = false;
+  f.controls.refresh();
+  f.window.dispatchEvent(new Event('blur'));
+  assert.equal(f.words[2], 0);
+  f.move(5, 5);
+  assert.equal(f.words[0], 0, 'an unfocused window still delivered mouse motion');
+  f.document.hidden = true;
+  f.document.dispatchEvent(new Event('visibilitychange'));
+  assert.equal(f.words[2], 1);
+  f.document.hidden = false;
+  f.document.dispatchEvent(new Event('visibilitychange'));
+  assert.equal(f.words[2], 0);
+  f.controls.setSuspended(true);
+  assert.equal(f.words[2], 1);
+  f.controls.setSuspended(false);
+  assert.equal(f.words[2], 0);
+  f.settings.pauseOnFocusLoss = true;
+  f.controls.refresh();
+  assert.equal(f.words[2], 1, 'turning the setting back on did not pause the background window');
+  f.advance(300);
+  f.window.dispatchEvent(new Event('focus'));
+  assert.equal(f.words[2], 0);
+  assert.equal(f.words[4], 300);
   f.controls.dispose();
 });
