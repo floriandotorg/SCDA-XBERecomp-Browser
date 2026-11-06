@@ -81,7 +81,10 @@ void HookGraphics::ViewScale(float xy) {
 }
 
 bool HookGraphics::Supported(GraphicsEffect effect) {
-  if (supports_ && supports_(effect)) { return true; }
+  if (supports_ && supports_(effect)) {
+    drawn_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
   unsupported_.fetch_add(1, std::memory_order_relaxed);
   return false;
 }
@@ -119,6 +122,7 @@ void PublishHookStatus(const HookGraphics& graphics, FogLatch presented) {
   const auto passes = graphics.FogPasses();
   words[4].store(passes[0], std::memory_order_relaxed);
   words[5].store(passes[1], std::memory_order_relaxed);
+  words[6].store(uint32_t(std::min<uint64_t>(graphics.DrawnEffects(), UINT32_MAX)), std::memory_order_relaxed);
 }
 
 }

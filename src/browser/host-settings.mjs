@@ -32,11 +32,15 @@ export const HOST_SETTINGS_FIELDS = Object.freeze([
   // anti-aliasing (C08)
   Object.freeze({ field: 'msaa', key: 'msaa', type: 'u32', word: 20 }),
   Object.freeze({ field: 'smaa', key: 'smaa', type: 'bool', bit: 3 }),
+  // shadows (C09): shadow_filter is native's 1 (console) or 3 (shader model 3 soft)
+  Object.freeze({ field: 'shadow_resolution', key: 'shadowResolution', type: 'u32', word: 21 }),
+  Object.freeze({ field: 'shadow_filter', key: 'shadowFilter', type: 'u32', word: 22, values: Object.freeze(['off', 'console', 'two', 'soft']) }),
+  Object.freeze({ field: 'shadow_distance', key: 'shadowDistance', type: 'u32', word: 23 }),
   Object.freeze({ field: 'keys', key: 'keys', type: 'map' }),
   Object.freeze({ field: 'pad_buttons', key: 'padButtons', type: 'map' }),
   // browser settings the in-game options pages show and step (settings-rows.cpp), as host.<key>=<value> lines
   ...['scaling', 'filter', 'volume', 'showFps', 'skipIntros', 'pauseOnFocusLoss', 'sensitivity', 'weaponSensitivity',
-    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale', 'anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput', 'msaa', 'smaa'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
+    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale', 'anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput', 'msaa', 'smaa', 'shadowResolution', 'shadowFilter', 'shadowDistance'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
 ]);
 const REVISION = 0, SCHEMA = 1, FLAGS = 2;
 const ATTEMPTS = 1 << 16;
@@ -147,5 +151,5 @@ export const createHostSettingsWriter = ({ buffer, byteOffset, settings, compute
 export const readHookStatus = words => {
   const floats = new Float32Array(Uint32Array.from(words.subarray(0, 3)).buffer);
   return { fog: { slope: floats[0], offset: floats[1], amount: floats[2], passes: Atomics.load(words, 4), ramps: Atomics.load(words, 5) },
-    unsupportedEffects: Atomics.load(words, 3) };
+    unsupportedEffects: Atomics.load(words, 3), drawnEffects: Atomics.load(words, 6) };
 };

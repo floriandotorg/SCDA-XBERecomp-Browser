@@ -1,6 +1,8 @@
 #include "browser/hook-compat/xdk/d3d8.h"
 #include "browser/cpu_runtime.h"
 #include "browser/hook-graphics.h"
+#include <algorithm>
+#include <array>
 
 namespace browser::hooks {
 namespace {
@@ -22,9 +24,24 @@ namespace d3d {
 
 gpu::State& State() { return browser::hooks::Graphics().State(); }
 std::recursive_mutex& Lock() { return browser::hooks::Graphics().Lock(); }
-void Occlusion(const float* m, bool gtao) { browser::hooks::Graphics().Occlusion(m, gtao); }
-void FilterShadows(const float* m) { browser::hooks::Graphics().FilterShadows(m); }
-void ApplyShadows() { browser::hooks::Graphics().ApplyShadows(); }
+// the backend talks to the GPU worker and may wait, which a guest worker does outside its execution lease, as every
+// guest D3D call reaches it
+void Occlusion(const float* m, bool gtao) {
+  std::array<float, 16> matrix;
+  std::copy_n(m, 16, matrix.begin());
+  browser::Memory::PauseExecution pause;
+  browser::hooks::Graphics().Occlusion(matrix.data(), gtao);
+}
+void FilterShadows(const float* m) {
+  std::array<float, 16> matrix;
+  std::copy_n(m, 16, matrix.begin());
+  browser::Memory::PauseExecution pause;
+  browser::hooks::Graphics().FilterShadows(matrix.data());
+}
+void ApplyShadows() {
+  browser::Memory::PauseExecution pause;
+  browser::hooks::Graphics().ApplyShadows();
+}
 void ViewScale(float xy) { browser::hooks::Graphics().ViewScale(xy); }
 
 }

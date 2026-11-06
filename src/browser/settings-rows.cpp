@@ -61,6 +61,9 @@ const std::vector<Setting>& Settings() {
     {20, "audioOutput", "stereo", {{"stereo", "2.0 STEREO"}, {"mono", "MONO"}}},
     {21, "msaa", "0", {{"0", "OFF"}, {"4", "4X"}}},
     {22, "smaa", "false", {}, true},
+    {23, "shadowResolution", "512", {{"512", "512"}, {"1024", "1024"}, {"2048", "2048"}, {"4096", "4096"}}},
+    {24, "shadowFilter", "console", {{"console", "CONSOLE"}, {"soft", "SM3 SOFT"}}},
+    {25, "shadowDistance", "1", {{"1", "1X"}, {"2", "2X"}, {"4", "4X"}, {"8", "8X"}}},
   };
   return list;
 }
@@ -89,6 +92,9 @@ constexpr Row kSettingsRows[] = {
   {Kind::Value, 18, "ANISOTROPIC FILTERING"},
   {Kind::Value, 21, "MSAA"},
   {Kind::Value, 22, "SMAA"},
+  {Kind::Value, 23, "SHADOW RESOLUTION"},
+  {Kind::Value, 24, "SHADOW FILTER"},
+  {Kind::Value, 25, "SHADOW DISTANCE"},
   {Kind::Heading, -1, "GENERAL"},
   {Kind::Value, 3, "MASTER VOLUME"},
   {Kind::Value, 4, "SKIP INTROS"},

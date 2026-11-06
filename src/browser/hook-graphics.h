@@ -40,6 +40,7 @@ public:
   void FilterShadows(const float* m);
   void ApplyShadows();
   uint64_t UnsupportedEffects() const { return unsupported_.load(std::memory_order_relaxed); }
+  uint64_t DrawnEffects() const { return drawn_.load(std::memory_order_relaxed); }
   // AvGetSavedDataAddress: the display a story restart kept, shown until the title presents its own (native Swap
   // clears it)
   void SetSavedDisplay(uint32_t surface) { savedDisplay_.store(surface, std::memory_order_release); }
@@ -59,6 +60,7 @@ private:
   uint32_t fogRamps_ = 0;
   float viewScale_ = 1;
   std::atomic<uint64_t> unsupported_ = 0;
+  std::atomic<uint64_t> drawn_ = 0;
 };
 
 // Words the page reads for Diagnostics: the fog latched by the last presented frame (f32 slope, offset, amount), the

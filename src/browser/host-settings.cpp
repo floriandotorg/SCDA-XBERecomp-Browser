@@ -61,6 +61,9 @@ app::Settings Decode(const Snapshot& snapshot) {
   settings.fps_cap = snapshot.words[kFpsCapWord];
   settings.audio_output = snapshot.words[kAudioOutputWord];
   settings.msaa = snapshot.words[kMsaaWord] == 4 ? 4 : 0;
+  if (snapshot.words[kShadowResolutionWord]) { settings.shadow_resolution = std::clamp<uint32_t>(snapshot.words[kShadowResolutionWord], 512, 4096); }
+  if (snapshot.words[kShadowFilterWord]) { settings.shadow_filter = snapshot.words[kShadowFilterWord] >= 3 ? 3 : 1; }
+  if (snapshot.words[kShadowDistanceWord]) { settings.shadow_distance = std::clamp<uint32_t>(snapshot.words[kShadowDistanceWord], 1, 8); }
   if (snapshot.words[kRenderPercentWord]) { settings.render_percent = std::clamp<uint32_t>(snapshot.words[kRenderPercentWord], 20, 200); }
   hostValues.clear();
   std::string_view text = snapshot.text;

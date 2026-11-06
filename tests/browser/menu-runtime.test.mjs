@@ -209,7 +209,7 @@ test('host settings: boot snapshot beside development start, a live writer per r
     assert.equal(services.handle({ generation: 3, phase: 'log', text: '[game] intro: skipped the logos video' }), true);
     assert.deepEqual(log, ['[game] intro: skipped the logos video']);
     gpu.onPresented({ command: 1 });
-    assert.deepEqual(presented[0].hookStatus, { fog: { slope: 0.25, offset: 0, amount: 0, passes: 0, ramps: 0 }, unsupportedEffects: 5 });
+    assert.deepEqual(presented[0].hookStatus, { fog: { slope: 0.25, offset: 0, amount: 0, passes: 0, ramps: 0 }, unsupportedEffects: 5, drawnEffects: 0 });
     services.handle({ generation: 3, phase: 'restarting' });
     settings.set('skipIntros', false);
     assert.equal(words[0], 4, 'a retired runtime still wrote host settings');

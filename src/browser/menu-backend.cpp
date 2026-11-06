@@ -323,6 +323,7 @@ struct MenuBackend::Impl {
   std::function<MenuBackend::Output()> outputSource;
   float scale = 1;  // screen sized render targets are drawn this many times the guest's size
   uint32_t anisotropy = 0, brightness = 50, contrast = 50, msaa = 0;
+  uint32_t softScene = 0;  // the scene a soft shadow waits to be applied to
   bool smaa = false;
   // native's MSAA rule: render targets of the back buffer's size, colour and depth, get the samples
   void multisample(Resource& item) {
@@ -333,8 +334,13 @@ struct MenuBackend::Impl {
   }
   std::array<uint8_t, 768> guestRamp = [] { std::array<uint8_t, 768> ramp; for (size_t n = 0; n < ramp.size(); ++n) { ramp[n] = uint8_t(n % 256); } return ramp; }();
   void sendGamma() { send(webgpu::Opcode::SetGamma, 0, settings_pack::ComposeRamp(guestRamp.data(), brightness, contrast)); }
+  uint32_t shadowResolution = 512;
   std::pair<uint32_t, uint32_t> hostSize(const gpu::TextureDesc& desc, bool target) const {
     if (!target || desc.levels != 1 || desc.cube || desc.depth > 1) { return {desc.width, desc.height}; }
+    // the shadow map the game's shadows.cpp hook found: the shadow resolution in place of the render scale
+    if (gpu::g_shadow.map && desc.data == address(gpu::g_shadow.map) && desc.width == 512 && desc.height == 512) {
+      return {shadowResolution, shadowResolution};
+    }
     return render_scale::HostSize(desc.width, desc.height, width, height, scale);
   }
   static size_t feedbackBytes(const Resource& item) { return size_t(item.hostWidth) * item.hostHeight * 4; }
@@ -1764,6 +1770,14 @@ void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
   if (output.scale > 0) { impl_->applyScale(output.scale); }
   impl_->anisotropy = output.anisotropy;
   impl_->smaa = output.smaa;
+  if (const uint32_t edge = std::clamp(output.shadowResolution, 512u, 4096u); edge != impl_->shadowResolution) {
+    impl_->shadowResolution = edge;
+    for (auto& [key, resource] : impl_->resources) {
+      if (!resource.renderTarget) { continue; }
+      const auto [w, h] = impl_->hostSize(resource.desc, true);
+      impl_->resample(resource, w, h);
+    }
+  }
   if (output.brightness != impl_->brightness || output.contrast != impl_->contrast) {
     impl_->brightness = output.brightness; impl_->contrast = output.contrast;
     impl_->sendGamma();
@@ -1839,8 +1853,40 @@ void MenuBackend::SetGamma(const uint8_t* ramp) {
   impl_->sendGamma();
 }
 void MenuBackend::Occlusion(const gpu::State&, const float*) { throw std::runtime_error("menu backend unsupported occlusion effect"); }
-void MenuBackend::FilterShadows(const gpu::State&, const float*) { throw std::runtime_error("menu backend unsupported shadow filtering"); }
-void MenuBackend::ApplyShadows(const gpu::State&) { throw std::runtime_error("menu backend unsupported shadow application"); }
+// native FilterShadows: the frame's own scene only, its depth at its size and samples, a non-empty viewport; the passes
+// grow with the integer render scale
+void MenuBackend::FilterShadows(const gpu::State& state, const float* p) {
+  std::lock_guard lock(impl_->mutex);
+  impl_->softScene = 0;
+  if (!state.rt.data || !state.zs.data) { return; }
+  const auto colour = impl_->resources.find(uint64_t(address(state.rt.data)) * 2);
+  const auto depth = impl_->resources.find(uint64_t(address(state.zs.data)) * 2 + 1);
+  if (colour == impl_->resources.end() || depth == impl_->resources.end()) { return; }
+  auto& rt = colour->second; auto& ds = depth->second;
+  if (rt.desc.width != impl_->width || rt.desc.height != impl_->height || ds.hostWidth != rt.hostWidth || ds.hostHeight != rt.hostHeight ||
+      ds.multisampled != rt.multisampled) { return; }
+  const auto& v = state.viewport;
+  const float zr = v.max_z - v.min_z;
+  const auto rect = impl_->scaledRect(rt, {int32_t(v.x), int32_t(v.y), int32_t(v.x + v.w), int32_t(v.y + v.h)});
+  const int32_t left = std::clamp(rect[0], 0, int32_t(rt.hostWidth)), top = std::clamp(rect[1], 0, int32_t(rt.hostHeight));
+  const int32_t right = std::clamp(rect[2], 0, int32_t(rt.hostWidth)), bottom = std::clamp(rect[3], 0, int32_t(rt.hostHeight));
+  if (right <= left || bottom <= top || zr <= 0) { return; }
+  const uint32_t scale = std::max(1u, uint32_t(std::lround(float(rt.hostHeight) / float(impl_->height))));
+  webgpu::SoftShadowPacket packet{ds.id, {p[0] * zr, v.min_z + p[1] * zr, 0, 0}, {float(left), float(top), float(right - left), float(bottom - top)},
+    {float(256 * scale), float(128 * scale), 0, 0}};
+  impl_->initializeDepth(ds);
+  impl_->sendPacket(webgpu::Opcode::SoftShadows, rt.id, packet);
+  impl_->softScene = rt.desc.data;
+}
+void MenuBackend::ApplyShadows(const gpu::State& state) {
+  std::lock_guard lock(impl_->mutex);
+  const bool pending = impl_->softScene && state.rt.data && address(state.rt.data) == impl_->softScene;
+  impl_->softScene = 0;
+  if (!pending) { return; }
+  auto& rt = impl_->resources.at(uint64_t(address(state.rt.data)) * 2);
+  const auto result = impl_->send(webgpu::Opcode::ApplyShadows, rt.id);
+  rt.dirty = true; rt.command = result.command; ++rt.version;
+}
 uint32_t MenuBackend::Fence() {
   std::lock_guard lock(impl_->mutex);
   impl_->flushDraws();

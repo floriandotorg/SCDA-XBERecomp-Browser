@@ -47,6 +47,7 @@ public:
     uint32_t anisotropy = 0;                  // forced anisotropic filtering, 0 as the game asks
     uint32_t msaa = 0;                        // 4: screen sized targets multisample; taken once, at Init
     bool smaa = false;                        // SMAA over the presented frame
+    uint32_t shadowResolution = 512;          // the game's shadow map edge (gpu::g_shadow), 512 the console's
   };
   void SetOutputSource(std::function<Output()> source);
   struct SnapshotData {
@@ -79,8 +80,8 @@ public:
   void Occlusion(const gpu::State&, const float*) override;
   void FilterShadows(const gpu::State&, const float*) override;
   void ApplyShadows(const gpu::State&) override;
-  // the optional effects game hooks ask for through d3d::; none is drawn yet, so a hook's request is counted instead
-  bool Supports(GraphicsEffect) const { return false; }
+  // the optional effects game hooks ask for through d3d::; one not drawn is counted instead
+  bool Supports(GraphicsEffect effect) const { return effect != GraphicsEffect::Occlusion; }
   uint32_t Fence() override;
   bool FencePending(uint32_t fence) override;
   void WaitFence(uint32_t fence) override;

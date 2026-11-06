@@ -37,6 +37,9 @@ inline constexpr uint32_t kDisplayRateWord = 18;
 inline constexpr uint32_t kAudioOutputWord = 19;
 inline constexpr uint32_t kMsaaWord = 20;
 inline constexpr uint32_t kSmaaBit = 3;
+inline constexpr uint32_t kShadowResolutionWord = 21;
+inline constexpr uint32_t kShadowFilterWord = 22;
+inline constexpr uint32_t kShadowDistanceWord = 23;
 
 struct Block {
   std::array<std::atomic<uint32_t>, kWords> words{};

@@ -95,7 +95,7 @@ endif()
 if(BROWSER_BOOT)
     file(GLOB kernel_declarations CONFIGURE_DEPENDS ${root}/src/kernel/*.cpp)
 endif()
-set(BROWSER_GAME_HOOKS "magma_time;intro;fpsfixes;camera_shake;root_motion;mouse;mouse_pitch;views;keypad;quick_save;opsat;interaction_list;analog_keys;name_entry;whistle;console;unreal;options_menu;fov;hud;movie_aspect;prompts;text;xbox_live" CACHE STRING "Native game hooks from src/game compiled into a menu story module")
+set(BROWSER_GAME_HOOKS "magma_time;intro;fpsfixes;camera_shake;root_motion;mouse;mouse_pitch;views;keypad;quick_save;opsat;interaction_list;analog_keys;name_entry;whistle;console;unreal;options_menu;fov;hud;movie_aspect;prompts;text;xbox_live;shadows;light_distance" CACHE STRING "Native game hooks from src/game compiled into a menu story module")
 # A guest address a browser source already overrides, and that source: a selected hook at the same address is compiled
 # as game_sub_<address>, which the browser override calls in place of the recompiled body.
 set(browser_hook_renames 00039AD4:mission-input 0004B525:input-update 004B8EC0:loading-io 0018697A:menu-route)

@@ -886,6 +886,259 @@ void multisample(uint32_t resource, std::span<const uint8_t> bytes) {
   texture_bytes += bytesNeeded;
   target.seed = true; target.stale = false;
 }
+
+// Chaos Theory's shader model 3 soft shadows (src/gpu/d3d12.cpp's kSoftShadowHlsl in WGSL): a 256x256 copy of view
+// depth and shadow, a 128x128 quarter and penumbra mask, the masked pixels filtered by a depth aware disk of 8 taps,
+// both grown with the integer render scale; then ApplyShadows writes the result over the scene's alpha
+constexpr const char* kSoftShadowWgsl = R"(
+struct Frame { zp: vec4<f32>, vp: vec4<f32>, sz: vec4<f32> }
+@group(0) @binding(0) var<uniform> frame: Frame;
+@group(0) @binding(1) var depth: DEPTH_TYPE;
+@group(0) @binding(2) var scene: texture_2d<f32>;
+@group(0) @binding(3) var small: texture_2d<f32>;
+@group(0) @binding(4) var quarter: texture_2d<f32>;
+@group(0) @binding(5) var bilinear: sampler;
+const kDepthRadius = 0.02;
+const kDiskRadius = 3.2;
+const kDiskDepthScale = 0.6;
+const kDiskDepthBias = -0.4;
+const kBlendDepthScale = 1.2;
+const kBlendDepthBias = -0.3;
+const kNearOffset = 0.1;
+const kCentreWeight = 0.001;
+const kPenumbraLow = 0.000784;
+const kPenumbraHigh = 0.99922;
+const kDisk = array<vec2<f32>, 8>(vec2<f32>(0, 0), vec2<f32>(0.527837, -0.085868), vec2<f32>(-0.040088, 0.536087),
+  vec2<f32>(-0.670445, -0.179949), vec2<f32>(-0.419418, -0.616039), vec2<f32>(0.440453, -0.639399),
+  vec2<f32>(-0.757088, 0.349334), vec2<f32>(0.574619, 0.685879));
+const kCorners = array<vec2<f32>, 4>(vec2<f32>(-1, -1), vec2<f32>(1, -1), vec2<f32>(-1, 1), vec2<f32>(1, 1));
+const kDiskWeight = array<f32, 8>(1, 0.7140148, 0.7110037, 0.5181218, 0.4445845, 0.3971701, 0.3047835, 0.1993830);
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+  let positions = array<vec2<f32>, 3>(vec2<f32>(-1,-1), vec2<f32>(3,-1), vec2<f32>(-1,3));
+  return vec4<f32>(positions[index], 0, 1);
+}
+fn inside(p: vec2<i32>) -> vec2<i32> { return clamp(p, vec2<i32>(frame.vp.xy), vec2<i32>(frame.vp.xy + frame.vp.zw) - vec2<i32>(1)); }
+fn view_depth(p: vec2<i32>) -> f32 {
+  let z = frame.zp.x / (textureLoad(depth, inside(p), 0) - frame.zp.y);
+  return saturate(z * 0.0010001 - 0.00010001);
+}
+fn depth_shadow(p: vec2<i32>) -> vec2<f32> { return vec2<f32>(view_depth(p), textureLoad(scene, inside(p), 0).a); }
+fn bilinear_at(at: vec2<f32>) -> vec2<f32> {
+  let f = at - vec2<f32>(0.5);
+  let i = vec2<i32>(floor(f));
+  let t = f - floor(f);
+  let top = mix(depth_shadow(i), depth_shadow(i + vec2<i32>(1, 0)), t.x);
+  let bottom = mix(depth_shadow(i + vec2<i32>(0, 1)), depth_shadow(i + vec2<i32>(1, 1)), t.x);
+  return mix(top, bottom, t.y);
+}
+@fragment fn shadow_small(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let at = frame.vp.xy + pos.xy / frame.sz.x * frame.vp.zw;
+  let tap = 0.4 / 256.0 * frame.vp.zw;
+  var sum = vec2<f32>(0);
+  for (var i = 0; i < 4; i++) { sum += bilinear_at(at + kCorners[i] * tap); }
+  let mean = sum * 0.25;
+  return vec4<f32>(mean.x / kDepthRadius, mean.y, 0, 0);
+}
+@fragment fn shadow_quarter(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  var s = 0.0;
+  for (var i = 0; i < 4; i++) { s += textureSampleLevel(small, bilinear, pos.xy / frame.sz.y + kCorners[i] * 0.5 / 256.0, 0.0).y; }
+  return vec4<f32>(s * 0.25);
+}
+@fragment fn shadow_penumbra(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  var s = 0.0;
+  for (var i = 0; i < 4; i++) { s += textureSampleLevel(quarter, bilinear, pos.xy / frame.sz.y + kCorners[i] * 0.5 / 128.0, 0.0).x; }
+  s *= 0.25;
+  return vec4<f32>(select(0.0, 1.0, s >= kPenumbraLow && s < kPenumbraHigh));
+}
+@fragment fn shadow_filter(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let p = vec2<i32>(pos.xy);
+  let uv = (pos.xy - frame.vp.xy) / frame.vp.zw;
+  let lit = textureLoad(scene, p, 0).a;
+  let cell = min(vec2<i32>(uv * frame.sz.y), vec2<i32>(i32(frame.sz.y) - 1));
+  let plain = lit * textureSampleLevel(small, bilinear, uv, 0.0).y;
+  let d = view_depth(p);
+  let nearness = 1.0 / (d + kNearOffset);
+  let radius = saturate(nearness * kDiskDepthScale + kDiskDepthBias) * kDiskRadius / 256.0;
+  let blend = saturate(nearness * kBlendDepthScale + kBlendDepthBias);
+  let own = d / kDepthRadius;
+  var sum = lit * kCentreWeight;
+  var weights = kCentreWeight;
+  for (var i = 0; i < 8; i++) {
+    let tap = textureSampleLevel(small, bilinear, uv + kDisk[i] * radius, 0.0).xy;
+    let apart = tap.x - own;
+    let w = saturate(kDiskWeight[i] - apart * apart);
+    sum += tap.y * w;
+    weights += w;
+  }
+  return vec4<f32>(select(mix(lit, sum / weights, blend), plain, textureLoad(quarter, cell, 0).x <= 0.5));
+}
+@fragment fn shadow_apply(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  return vec4<f32>(0, 0, 0, textureLoad(scene, vec2<i32>(pos.xy), 0).x);
+}
+)";
+struct SoftShadowState {
+  WGPUBindGroupLayout bindings[2]{};
+  WGPUPipelineLayout layouts[2]{};
+  std::map<std::pair<uint32_t, uint32_t>, WGPURenderPipeline> pipelines;  // (pass, multisampled depth or 4x target)
+  WGPUTexture targets[4]{};  // small, quarter, penumbra, filtered
+  WGPUSampler sampler = nullptr;
+  WGPUTexture dummy = nullptr, dummyDepth[2]{};
+  uint32_t width = 0, height = 0, scale = 1;
+  uint32_t scene = 0;  // the scene the filtered shadow is for, 0 when none waits
+  float rect[4]{};
+} soft_state;
+constexpr WGPUTextureFormat kSoftFormats[4] = {WGPUTextureFormat_RG16Float, WGPUTextureFormat_R16Float, WGPUTextureFormat_R16Float, WGPUTextureFormat_R16Float};
+constexpr const char* kSoftEntries[5] = {"shadow_small", "shadow_quarter", "shadow_penumbra", "shadow_filter", "shadow_apply"};
+WGPURenderPipeline soft_pipeline(uint32_t pass, bool multisampled) {
+  auto& state = soft_state;
+  const auto key = std::pair{pass, uint32_t(multisampled)};
+  if (const auto found = state.pipelines.find(key); found != state.pipelines.end()) { return found->second; }
+  const bool depthMs = multisampled && pass != 4;
+  if (!state.bindings[depthMs]) {
+    std::array<WGPUBindGroupLayoutEntry, 6> entries{};
+    for (uint32_t n = 0; n < entries.size(); ++n) { entries[n] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT; entries[n].binding = n; entries[n].visibility = WGPUShaderStage_Fragment; }
+    entries[0].buffer.type = WGPUBufferBindingType_Uniform;
+    entries[1].texture.sampleType = WGPUTextureSampleType_Depth; entries[1].texture.viewDimension = WGPUTextureViewDimension_2D; entries[1].texture.multisampled = depthMs;
+    for (uint32_t n = 2; n < 5; ++n) { entries[n].texture.sampleType = WGPUTextureSampleType_Float; entries[n].texture.viewDimension = WGPUTextureViewDimension_2D; }
+    entries[5].sampler.type = WGPUSamplerBindingType_Filtering;
+    auto group = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT; group.entryCount = entries.size(); group.entries = entries.data();
+    state.bindings[depthMs] = wgpuDeviceCreateBindGroupLayout(device, &group);
+    auto layout = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT; layout.bindGroupLayoutCount = 1; layout.bindGroupLayouts = &state.bindings[depthMs];
+    state.layouts[depthMs] = wgpuDeviceCreatePipelineLayout(device, &layout);
+  }
+  std::string code = std::string(kSoftShadowWgsl);
+  const std::string marker = "DEPTH_TYPE";
+  code.replace(code.find(marker), marker.size(), depthMs ? "texture_depth_multisampled_2d" : "texture_depth_2d");
+  auto source = WGPU_SHADER_SOURCE_WGSL_INIT; source.code = {code.data(), code.size()};
+  auto shader_descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT; shader_descriptor.nextInChain = &source.chain;
+  auto shader = wgpuDeviceCreateShaderModule(device, &shader_descriptor);
+  auto target = WGPU_COLOR_TARGET_STATE_INIT; target.format = pass == 4 ? WGPUTextureFormat_RGBA8Unorm : kSoftFormats[pass];
+  if (pass == 4) { target.writeMask = WGPUColorWriteMask_Alpha; }
+  auto fragment = WGPU_FRAGMENT_STATE_INIT; fragment.module = shader; fragment.entryPoint = text(kSoftEntries[pass]); fragment.targetCount = 1; fragment.targets = &target;
+  auto descriptor = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT; descriptor.layout = state.layouts[depthMs]; descriptor.vertex.module = shader; descriptor.vertex.entryPoint = text("vs_main");
+  descriptor.fragment = &fragment; descriptor.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+  if (pass == 4 && multisampled) { descriptor.multisample.count = 4; }
+  auto pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor);
+  wgpuShaderModuleRelease(shader);
+  state.pipelines.emplace(key, pipeline);
+  return pipeline;
+}
+void release_soft_targets() {
+  for (auto& target : soft_state.targets) { if (target) { wgpuTextureDestroy(target); wgpuTextureRelease(target); target = nullptr; } }
+  soft_state.width = soft_state.height = 0;
+}
+void release_soft() {
+  release_soft_targets();
+  for (auto& [key, pipeline] : soft_state.pipelines) { wgpuRenderPipelineRelease(pipeline); }
+  soft_state.pipelines.clear();
+  for (auto& layout : soft_state.layouts) { if (layout) { wgpuPipelineLayoutRelease(layout); layout = nullptr; } }
+  for (auto& group : soft_state.bindings) { if (group) { wgpuBindGroupLayoutRelease(group); group = nullptr; } }
+  for (auto* texture : {&soft_state.dummy, &soft_state.dummyDepth[0], &soft_state.dummyDepth[1]}) { if (*texture) { wgpuTextureDestroy(*texture); wgpuTextureRelease(*texture); *texture = nullptr; } }
+  if (soft_state.sampler) { wgpuSamplerRelease(soft_state.sampler); soft_state.sampler = nullptr; }
+  soft_state.scene = 0;
+}
+WGPUTexture post_texture(uint32_t width, uint32_t height, WGPUTextureFormat format, uint32_t samples = 1) {
+  auto descriptor = WGPU_TEXTURE_DESCRIPTOR_INIT; descriptor.size = {width, height, 1}; descriptor.format = format; descriptor.sampleCount = samples;
+  descriptor.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+  return wgpuDeviceCreateTexture(device, &descriptor);
+}
+// one fullscreen pass of the soft shadow module into output (scissored to rect when given)
+void soft_pass(WGPUCommandEncoder encoder, uint32_t pass, bool multisampled, WGPUBuffer uniforms, WGPUTextureView depth, WGPUTextureView scene,
+               WGPUTextureView small, WGPUTextureView quarter, WGPUTextureView output, WGPUTextureView resolve, const float* rect, bool load) {
+  auto& state = soft_state;
+  const auto pipeline = soft_pipeline(pass, multisampled);
+  std::array<WGPUBindGroupEntry, 6> entries{};
+  for (uint32_t n = 0; n < entries.size(); ++n) { entries[n] = WGPU_BIND_GROUP_ENTRY_INIT; entries[n].binding = n; }
+  entries[0].buffer = uniforms; entries[0].size = 48;
+  entries[1].textureView = depth; entries[2].textureView = scene; entries[3].textureView = small; entries[4].textureView = quarter;
+  entries[5].sampler = state.sampler;
+  auto group_descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT; group_descriptor.layout = state.bindings[multisampled && pass != 4]; group_descriptor.entryCount = entries.size(); group_descriptor.entries = entries.data();
+  auto group = wgpuDeviceCreateBindGroup(device, &group_descriptor);
+  auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; attachment.view = output; attachment.resolveTarget = resolve;
+  attachment.loadOp = load ? WGPULoadOp_Load : WGPULoadOp_Clear; attachment.storeOp = WGPUStoreOp_Store; attachment.clearValue = {0, 0, 0, 0};
+  auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &attachment;
+  auto render = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+  wgpuRenderPassEncoderSetPipeline(render, pipeline); wgpuRenderPassEncoderSetBindGroup(render, 0, group, 0, nullptr);
+  if (rect) { wgpuRenderPassEncoderSetScissorRect(render, uint32_t(rect[0]), uint32_t(rect[1]), uint32_t(rect[2]), uint32_t(rect[3])); }
+  wgpuRenderPassEncoderDraw(render, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(render); wgpuRenderPassEncoderRelease(render);
+  wgpuBindGroupRelease(group);
+}
+WGPUTextureView dummy_view(bool depth, bool multisampled) {
+  auto& state = soft_state;
+  if (!state.dummy) {
+    state.dummy = post_texture(1, 1, WGPUTextureFormat_RGBA8Unorm);
+    state.dummyDepth[0] = post_texture(1, 1, WGPUTextureFormat_Depth24PlusStencil8);
+    state.dummyDepth[1] = post_texture(1, 1, WGPUTextureFormat_Depth24PlusStencil8, 4);
+  }
+  return depth ? depth_only(state.dummyDepth[multisampled]) : wgpuTextureCreateView(state.dummy, nullptr);
+}
+void soft_shadows(uint32_t resource, std::span<const uint8_t> bytes) {
+  const auto spec = packet<SoftShadowPacket>(bytes); exact(bytes, 0);
+  auto& scene = texture(resource); auto& depth = texture(spec.depth);
+  if (scene.depth || !depth.depth || scene.width != depth.width || scene.height != depth.height || bool(scene.ms) != bool(depth.ms) ||
+      !(spec.vp[2] > 0) || !(spec.vp[3] > 0) || spec.sz[0] < 1 || spec.sz[1] < 1 || spec.sz[0] > 4096 || spec.sz[1] > 4096) {
+    throw std::runtime_error("invalid soft shadow request");
+  }
+  auto& state = soft_state;
+  end_batch_pass();
+  const uint32_t copy = uint32_t(spec.sz[0]), mask = uint32_t(spec.sz[1]);
+  if (state.width != scene.width || state.height != scene.height || state.scale != copy) {
+    release_soft_targets();
+    state.targets[0] = post_texture(copy, copy, kSoftFormats[0]);
+    state.targets[1] = post_texture(mask, mask, kSoftFormats[1]);
+    state.targets[2] = post_texture(mask, mask, kSoftFormats[2]);
+    state.targets[3] = post_texture(scene.width, scene.height, kSoftFormats[3]);
+    state.width = scene.width; state.height = scene.height; state.scale = copy;
+  }
+  if (!state.sampler) {
+    auto descriptor = WGPU_SAMPLER_DESCRIPTOR_INIT; descriptor.magFilter = descriptor.minFilter = WGPUFilterMode_Linear;
+    state.sampler = wgpuDeviceCreateSampler(device, &descriptor);
+  }
+  const bool multisampled = bool(depth.ms);
+  std::array<float, 12> frame{};
+  std::copy(std::begin(spec.zp), std::end(spec.zp), frame.begin());
+  std::copy(std::begin(spec.vp), std::end(spec.vp), frame.begin() + 4);
+  std::copy(std::begin(spec.sz), std::end(spec.sz), frame.begin() + 8);
+  auto uniforms = buffer({reinterpret_cast<const uint8_t*>(frame.data()), sizeof(frame)}, WGPUBufferUsage_Uniform);
+  auto encoder = batch_encoder ? batch_encoder : wgpuDeviceCreateCommandEncoder(device, nullptr);
+  auto depthView = depth_only(multisampled ? depth.ms : depth.handle);
+  auto sceneView = wgpuTextureCreateView(scene.handle, nullptr);
+  std::array<WGPUTextureView, 4> views{};
+  for (uint32_t n = 0; n < 4; ++n) { views[n] = wgpuTextureCreateView(state.targets[n], nullptr); }
+  auto blank = dummy_view(false, false);
+  soft_pass(encoder, 0, multisampled, uniforms, depthView, sceneView, blank, blank, views[0], nullptr, nullptr, false);
+  auto blankDepth = dummy_view(true, multisampled);
+  soft_pass(encoder, 1, multisampled, uniforms, blankDepth, blank, views[0], blank, views[1], nullptr, nullptr, false);
+  soft_pass(encoder, 2, multisampled, uniforms, blankDepth, blank, blank, views[1], views[2], nullptr, nullptr, false);
+  soft_pass(encoder, 3, multisampled, uniforms, depthView, sceneView, views[0], views[2], views[3], nullptr, spec.vp, false);
+  if (!batch_encoder) { submit(encoder); }
+  for (auto view : views) { wgpuTextureViewRelease(view); }
+  wgpuTextureViewRelease(depthView); wgpuTextureViewRelease(sceneView); wgpuTextureViewRelease(blank); wgpuTextureViewRelease(blankDepth);
+  wgpuBufferRelease(uniforms);
+  state.scene = resource;
+  std::copy(std::begin(spec.vp), std::end(spec.vp), state.rect);
+}
+void apply_shadows(uint32_t resource, std::span<const uint8_t> bytes) {
+  exact(bytes, 0);
+  auto& state = soft_state;
+  auto& scene = texture(resource);
+  const bool pending = state.scene == resource && scene.width == state.width && scene.height == state.height;
+  state.scene = 0;
+  if (!pending) { return; }
+  end_batch_pass();
+  const bool multisampled = bool(scene.ms);
+  std::array<float, 12> frame{};
+  auto uniforms = buffer({reinterpret_cast<const uint8_t*>(frame.data()), sizeof(frame)}, WGPUBufferUsage_Uniform);
+  auto encoder = batch_encoder ? batch_encoder : wgpuDeviceCreateCommandEncoder(device, nullptr);
+  if (multisampled) { seed(encoder, scene); }
+  auto filtered = wgpuTextureCreateView(state.targets[3], nullptr);
+  auto blank = dummy_view(false, false), blankDepth = dummy_view(true, false);
+  // a multisampled scene takes the alpha in every sample and resolves, as its draws do
+  soft_pass(encoder, 4, multisampled, uniforms, blankDepth, filtered, blank, blank, multisampled ? scene.msView : attachment_view(scene),
+    multisampled ? attachment_view(scene) : nullptr, state.rect, true);
+  if (!batch_encoder) { submit(encoder); }
+  wgpuTextureViewRelease(filtered); wgpuTextureViewRelease(blank); wgpuTextureViewRelease(blankDepth); wgpuBufferRelease(uniforms);
+}
 void clear(uint32_t resource, std::span<const uint8_t> bytes) {
       const auto spec = packet<ClearPacket>(bytes); exact(bytes, uint64_t(spec.rect_count) * 16);
       if (!spec.flags || spec.flags > 7 || spec.rect_count > 4096 || spec.stencil > 255 || !std::isfinite(spec.depth) || spec.depth < 0 || spec.depth > 1 ||
@@ -1155,6 +1408,7 @@ void release_resources() {
   release_blits();
   release_msaa();
   release_smaa();
+  release_soft();
   if (depth_upload_layout) { wgpuPipelineLayoutRelease(depth_upload_layout); depth_upload_layout = nullptr; }
   if (depth_upload_bindings) { wgpuBindGroupLayoutRelease(depth_upload_bindings); depth_upload_bindings = nullptr; }
   if (depth_readback_pipeline) { wgpuRenderPipelineRelease(depth_readback_pipeline); depth_readback_pipeline = nullptr; }
@@ -1454,6 +1708,8 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
     case Opcode::Copy: { copy(resource, bytes); break; }
     case Opcode::Blit: { blit(resource, bytes); break; }
     case Opcode::Multisample: { multisample(resource, bytes); break; }
+    case Opcode::SoftShadows: { soft_shadows(resource, bytes); break; }
+    case Opcode::ApplyShadows: { apply_shadows(resource, bytes); break; }
     case Opcode::SetGamma: {
       exact(bytes, gamma_ramp.size()); std::memcpy(gamma_ramp.data(), bytes.data(), gamma_ramp.size()); upload_gamma(); break;
     }

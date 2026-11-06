@@ -201,3 +201,35 @@ the cave; perf with out/perf-60/bench.mjs and `PERF_SOAK=60` per setting, separa
 - Render scale and the "Automatic" shadow resolution logic itself (C07).
 - MSAA (C08); this chunk only consumes its multisampled depth view.
 - Console shadow correctness work owned by P6.1.
+
+## Implementation notes
+
+What C09 built.
+
+- `shadows` and `light_distance` are in the default hook list (light_distance uses the `mem::IsCommitted` shim).
+  shadows.cpp's CreateTargets hook fills `gpu::g_shadow` (logged "shadows: map ..., edge blur ..."), and its
+  BlurShadowEdges hook calls `d3d::FilterShadows` / `ApplyShadows` for `shadow_filter` 3 at DrawLevel's call.
+- The `d3d::` effect calls now pause the guest worker's execution lease before reaching the backend, as every guest
+  D3D call does (a hook runs inside generated code; the backend refused to wait with the lease held).
+- Shadow resolution: the depth resource whose data is `g_shadow.map` (512 x 512) gets
+  `shadowResolution` x `shadowResolution` through C07's host extent; a change resamples it at the next Present.
+  Its draws, depth bias, imports and readbacks follow C07's scaled target rules.
+- Soft filter: service opcodes `SoftShadows` (scene, its depth, zp, vp, sz) and `ApplyShadows`. The native HLSL is in
+  WGSL (`kSoftShadowWgsl`): copy (rg16f, 256 x s), quarter and penumbra mask (r16f, 128 x s), filtered (r16f at the
+  scene's size, in its viewport), then an alpha-only apply into the scene. A multisampled depth is read through
+  `texture_depth_multisampled_2d` sample 0; a multisampled scene takes the apply in every sample and resolves.
+  `MenuBackend::FilterShadows` has native's guards (the frame's scene, depth at its size and samples, a non-empty
+  viewport) and `Supports` now answers true for the shadow effects.
+- Diagnostics: `hookStatus.drawnEffects` counts effect calls the backend drew (word 6).
+- Settings (Graphics tab and in-game GRAPHICS): Shadow resolution 512 (console), 1024, 2048, 4096 (next frame);
+  Shadow filter Console or Soft (SM3) (live); Shadow distance 1x to 8x (live, as native at the next view). Host
+  words 21 to 23 fill `shadow_resolution`, `shadow_filter` (1 or 3) and `shadow_distance`.
+
+### Checked in the browser (out/parity, development start)
+
+- Soft, 2048 and 2x distance, with and without MSAA 4x: no validation errors; `drawnEffects` about two a frame.
+
+### Not done
+
+The light_distance and shadows contract tests, the synthetic service test of the penumbra mask, a save at 4x loaded
+at 1x, visual comparison in a scene with visible character shadows, and the perf runs.

@@ -6,7 +6,7 @@
 namespace browser::webgpu {
 constexpr uint32_t MaxBytes = 4 * 1024 * 1024;
 constexpr uint32_t ReadbackSlots = 4;
-enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17, ReadbackStart = 18, ReadbackCollect = 19, Blit = 20, Multisample = 21 };
+enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17, ReadbackStart = 18, ReadbackCollect = 19, Blit = 20, Multisample = 21, SoftShadows = 22, ApplyShadows = 23 };
 enum class Status : uint32_t { Ok, Error, Closed, Lost };
 struct Dimensions { uint32_t width, height; };
 struct TexturePacket { uint32_t width, height, depth; uint32_t levels = 1; };
@@ -50,6 +50,13 @@ struct BlitPacket {
   uint32_t taps = 0, force_opaque = 0;
 };
 static_assert(sizeof(BlitPacket) == 44);
+// Chaos Theory's soft shadows over the scene (the resource): its depth, view z = zp.x / (depth - zp.y), the scene's
+// viewport in host pixels (vp), the copy's and the mask's sizes (sz.xy); the filtered shadow waits for ApplyShadows
+struct SoftShadowPacket {
+  uint32_t depth;
+  float zp[4], vp[4], sz[4];
+};
+static_assert(sizeof(SoftShadowPacket) == 52);
 struct CopyPacket { uint32_t source, width, height; uint32_t source_x = 0, source_y = 0, destination_x = 0, destination_y = 0, force_opaque = 0; };
 static_assert(sizeof(CopyPacket) == 32);
 static_assert(sizeof(PipelinePacket) == 116);

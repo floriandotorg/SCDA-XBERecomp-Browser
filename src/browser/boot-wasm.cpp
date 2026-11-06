@@ -220,7 +220,8 @@ struct Session {
       return browser::MenuBackend::Output{output.width, output.height, linear, output.scale,
         written ? std::min(words[hs::kBrightnessWord].load(), 100u) : 50, written ? std::min(words[hs::kContrastWord].load(), 100u) : 50,
         std::min(words[hs::kAnisoWord].load(), 16u), words[hs::kMsaaWord].load() == 4 ? 4u : 0u,
-        written && (words[hs::kFlagsWord].load() >> hs::kSmaaBit & 1)};
+        written && (words[hs::kFlagsWord].load() >> hs::kSmaaBit & 1),
+        written && words[hs::kShadowResolutionWord].load() ? words[hs::kShadowResolutionWord].load() : 512u};
     });
     graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), graphics_mode, std::move(backend));
     graphics->ConfigurePresentCheckpoint(BROWSER_MENU_TRACE_FRAMES);

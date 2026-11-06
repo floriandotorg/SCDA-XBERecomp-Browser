@@ -38,6 +38,9 @@ const TABS = Object.freeze([
     { setting: 'anisotropy', label: 'Anisotropic filtering', values: { 0: 'Off', 2: '2x', 4: '4x', 8: '8x', 16: '16x' } },
     { setting: 'msaa', label: 'Multisampling (MSAA)', restart: true, values: { 0: 'Off', 4: '4x' } },
     { setting: 'smaa', label: 'SMAA' },
+    { setting: 'shadowResolution', label: 'Shadow resolution', values: { 512: '512 (console)', 1024: '1024', 2048: '2048', 4096: '4096' } },
+    { setting: 'shadowFilter', label: 'Shadow filter', values: { console: 'Console', soft: 'Soft (SM3)' } },
+    { setting: 'shadowDistance', label: 'Shadow distance', values: { 1: '1x', 2: '2x', 4: '4x', 8: '8x' } },
   ] },
   { id: 'audio', label: 'Audio', rows: [
     { setting: 'volume', label: 'Master volume', format: value => `${value}%` },
