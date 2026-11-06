@@ -21,11 +21,19 @@ export const HOST_SETTINGS_FIELDS = Object.freeze([
   Object.freeze({ field: 'render_percent', key: 'resolutionScale', type: 'u32', word: 11 }),
   Object.freeze({ field: 'device_width', key: 'deviceWidth', type: 'u32', word: 12, computed: true }),
   Object.freeze({ field: 'device_height', key: 'deviceHeight', type: 'u32', word: 13, computed: true }),
+  // the simple settings pack (C12)
+  Object.freeze({ field: 'aniso', key: 'anisotropy', type: 'u32', word: 14 }),
+  Object.freeze({ field: 'brightness', key: 'brightness', type: 'u32', word: 15 }),
+  Object.freeze({ field: 'contrast', key: 'contrast', type: 'u32', word: 16 }),
+  Object.freeze({ field: 'fps_cap', key: 'frameCap', type: 'u32', word: 17 }),
+  Object.freeze({ field: 'display_rate', key: 'displayRate', type: 'u32', word: 18, computed: true }),
+  Object.freeze({ field: 'audio_output', key: 'audioOutput', type: 'u32', word: 19, values: Object.freeze(['auto', 'stereo', 'surround', 'mono']) }),
+  Object.freeze({ field: 'language', key: 'bootLanguage', type: 'text', computed: true }),
   Object.freeze({ field: 'keys', key: 'keys', type: 'map' }),
   Object.freeze({ field: 'pad_buttons', key: 'padButtons', type: 'map' }),
   // browser settings the in-game options pages show and step (settings-rows.cpp), as host.<key>=<value> lines
   ...['scaling', 'filter', 'volume', 'showFps', 'skipIntros', 'pauseOnFocusLoss', 'sensitivity', 'weaponSensitivity',
-    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
+    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale', 'anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
 ]);
 const REVISION = 0, SCHEMA = 1, FLAGS = 2;
 const ATTEMPTS = 1 << 16;

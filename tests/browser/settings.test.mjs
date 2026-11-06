@@ -90,3 +90,19 @@ test('per view sensitivities share the free look range', () => {
   settings.set('weaponSensitivity', 0.04);
   assert.equal(settings.get('weaponSensitivity'), 0.1);
 });
+
+test('the simple settings pack normalises, persists and resets', () => {
+  const storage = memory();
+  const settings = createSettings({ storage });
+  assert.deepEqual(['anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput'].map(name => settings.get(name)), [0, 50, 50, 60, 'auto', 'stereo']);
+  settings.set('anisotropy', 16);
+  settings.set('anisotropy', 3);
+  settings.set('brightness', 140);
+  settings.set('frameCap', 30);
+  settings.set('language', 'fra');
+  settings.set('audioOutput', 'mono');
+  const reloaded = createSettings({ storage });
+  assert.deepEqual(['anisotropy', 'brightness', 'frameCap', 'language', 'audioOutput'].map(name => reloaded.get(name)), [16, 100, 30, 'fra', 'mono']);
+  reloaded.reset();
+  assert.equal(reloaded.get('frameCap'), 60);
+});

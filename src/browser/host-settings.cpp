@@ -54,6 +54,11 @@ app::Settings Decode(const Snapshot& snapshot) {
   }
   if (snapshot.words[kFovWord]) { settings.fov = std::clamp<uint32_t>(snapshot.words[kFovWord], 45, 140); }
   settings.fmv_scale = snapshot.words[kFmvScaleWord] ? 1 : 0;
+  settings.aniso = std::min<uint32_t>(snapshot.words[kAnisoWord], 16);
+  settings.brightness = std::min<uint32_t>(snapshot.words[kBrightnessWord], 100);
+  settings.contrast = std::min<uint32_t>(snapshot.words[kContrastWord], 100);
+  settings.fps_cap = snapshot.words[kFpsCapWord];
+  settings.audio_output = snapshot.words[kAudioOutputWord];
   if (snapshot.words[kRenderPercentWord]) { settings.render_percent = std::clamp<uint32_t>(snapshot.words[kRenderPercentWord], 20, 200); }
   hostValues.clear();
   std::string_view text = snapshot.text;

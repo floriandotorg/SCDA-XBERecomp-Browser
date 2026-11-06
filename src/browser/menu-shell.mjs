@@ -28,10 +28,19 @@ const TABS = Object.freeze([
     { setting: 'resolutionScale', label: 'Resolution scale', format: value => `${value}% (${renderSize(value)})` },
     { setting: 'filter', label: 'Upscaling', values: { smooth: 'Smooth', sharp: 'Sharp' } },
     { setting: 'fov', label: 'Field of view', format: value => value === 75 ? '75 (default)' : String(value) },
+    { setting: 'brightness', label: 'Brightness', format: value => String(value) },
+    { setting: 'contrast', label: 'Contrast', format: value => String(value) },
+    { setting: 'frameCap', label: 'Frame rate cap', values: { 0: 'Display rate', 30: '30', 60: '60' } },
     { setting: 'fmvScale', label: 'Full screen movies', values: { fill: 'Fill', '4:3': '4:3' } },
     { fullscreen: true, label: 'Fullscreen' },
   ] },
-  { id: 'audio', label: 'Audio', rows: [{ setting: 'volume', label: 'Master volume', format: value => `${value}%` }] },
+  { id: 'graphics', label: 'Graphics', rows: [
+    { setting: 'anisotropy', label: 'Anisotropic filtering', values: { 0: 'Off', 2: '2x', 4: '4x', 8: '8x', 16: '16x' } },
+  ] },
+  { id: 'audio', label: 'Audio', rows: [
+    { setting: 'volume', label: 'Master volume', format: value => `${value}%` },
+    { setting: 'audioOutput', label: 'Output', values: { stereo: 'Stereo', mono: 'Mono' } },
+  ] },
   { id: 'controls', label: 'Controls', rows: [
     { setting: 'sensitivity', label: 'Free look sensitivity', format: value => value.toFixed(1) },
     { setting: 'weaponSensitivity', label: 'Weapon sensitivity', format: value => value.toFixed(1) },
@@ -46,6 +55,7 @@ const TABS = Object.freeze([
     { reset: 'padButtons', label: 'Restore defaults' },
   ] },
   { id: 'game', label: 'Game', rows: [
+    { setting: 'language', label: 'Language', restart: true, values: { auto: 'Automatic', int: 'English', fra: 'Français', deu: 'Deutsch', ita: 'Italiano', esp: 'Español' } },
     { setting: 'skipIntros', label: 'Skip intros' },
     { setting: 'pauseOnFocusLoss', label: 'Pause when unfocused' },
   ] },
@@ -115,7 +125,27 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     diagnostic.hidden = !settings.get('showDiagnostics');
     if (!diagnostic.hidden) { diagnostic.textContent = JSON.stringify(evidence, null, 2); }
   };
-  let shape = { aspect: 4 / 3 }, hostSettings, layoutTimer;
+  let shape = { aspect: 4 / 3 }, hostSettings, layoutTimer, displayRate = 0;
+  // the language a session starts in: Automatic follows the browser's, English when the game lacks it
+  const bootLanguage = () => {
+    const chosen = settings.get('language');
+    if (chosen !== 'auto') { return chosen; }
+    const code = String(window.navigator?.language ?? '').slice(0, 2).toLowerCase();
+    return { fr: 'fra', de: 'deu', it: 'ita', es: 'esp' }[code] ?? 'int';
+  };
+  // the display's refresh rate, from animation frames: a frame cap at or above it is left to presentation
+  const measureDisplayRate = () => {
+    const times = [];
+    const frame = time => {
+      times.push(time);
+      if (times.length < 61) { window.requestAnimationFrame?.(frame); return; }
+      const intervals = times.slice(1).map((value, n) => value - times[n]).sort((left, right) => left - right);
+      displayRate = Math.round(1000 / intervals[intervals.length >> 1]);
+      hostSettings?.refresh();
+    };
+    window.requestAnimationFrame?.(frame);
+  };
+  measureDisplayRate();
   const deviceSize = () => {
     const ratio = window.devicePixelRatio || 1;
     const size = { deviceWidth: Math.max(1, Math.min(8192, Math.round(shape.width * ratio))), deviceHeight: Math.max(1, Math.min(8192, Math.round(shape.height * ratio))) };
@@ -213,7 +243,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       const line = root.createElement(row.bind || row.padBind || row.reset ? 'div' : 'label');
       line.className = row.heading ? 'row heading' : 'row';
       const name = root.createElement('span');
-      name.textContent = row.label ?? row.heading;
+      name.textContent = row.restart ? `${row.label} (next start)` : row.label ?? row.heading;
       if (row.heading) {
         line.append(name);
       } else if (row.reset) {
@@ -448,7 +478,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     return motion;
   };
   const createAudio = options => {
-    audio = createBrowserAudio({ ...options, volume: settings.get('volume') / 100 });
+    audio = createBrowserAudio({ ...options, volume: settings.get('volume') / 100, output: settings.get('audioOutput') });
     return audio;
   };
   const controller = createShellController({ onChange: state => render(state), createRuntime: () => createMenuRuntime({
@@ -460,7 +490,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       output: text => { consoleModel.print(text); if (consoleOpen) { showConsoleLog(); } },
       setting: value => { applyHostMessage(settings, value); },
     }, HOST_MESSAGES),
-    hostComputed: () => ({ effectiveAspect: shape.aspect, ...deviceSize() }),
+    hostComputed: () => ({ effectiveAspect: shape.aspect, ...deviceSize(), displayRate, bootLanguage: bootLanguage() }),
     onHostSettings: value => { hostSettings = value; },
     acquireCanvas: () => {
       if (!globalThis.navigator?.gpu || typeof canvas.transferControlToOffscreen !== 'function') {
@@ -643,6 +673,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const stopSettings = settings.subscribe(name => {
     if (name === 'scaling' || name === 'filter' || name === 'aspect' || name === 'resolution') { layout(); }
     if (name === 'volume') { audio?.setVolume(settings.get('volume') / 100); }
+    if (name === 'audioOutput') { audio?.setOutput(settings.get('audioOutput')); }
     if (name === 'showFps') { show(); }
     if (name === 'showDiagnostics') { showDiagnostics(); }
     if (name === 'pauseOnFocusLoss') { motion?.refresh(); }

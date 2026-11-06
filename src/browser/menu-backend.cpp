@@ -1,5 +1,6 @@
 #include "browser/menu-backend.h"
 #include "browser/render-scale.h"
+#include "browser/settings-pack.h"
 #include "browser/guest-vertex.h"
 #include "browser/guest-primitives.h"
 #include "browser/menu-shaders.h"
@@ -320,6 +321,9 @@ struct MenuBackend::Impl {
   uint32_t canvasWidth = 0, canvasHeight = 0;
   std::function<MenuBackend::Output()> outputSource;
   float scale = 1;  // screen sized render targets are drawn this many times the guest's size
+  uint32_t anisotropy = 0, brightness = 50, contrast = 50;
+  std::array<uint8_t, 768> guestRamp = [] { std::array<uint8_t, 768> ramp; for (size_t n = 0; n < ramp.size(); ++n) { ramp[n] = uint8_t(n % 256); } return ramp; }();
+  void sendGamma() { send(webgpu::Opcode::SetGamma, 0, settings_pack::ComposeRamp(guestRamp.data(), brightness, contrast)); }
   std::pair<uint32_t, uint32_t> hostSize(const gpu::TextureDesc& desc, bool target) const {
     if (!target || desc.levels != 1 || desc.cube || desc.depth > 1) { return {desc.width, desc.height}; }
     return render_scale::HostSize(desc.width, desc.height, width, height, scale);
@@ -1313,12 +1317,16 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
       packet.sampler[n][0] = samplerAddress(sampling[gpu::kTssAddressU]);
       if (item.desc.depth > 1) { packet.address_w[n] = samplerAddress(sampling[gpu::kTssAddressW]); }
       packet.sampler[n][1] = samplerAddress(sampling[gpu::kTssAddressV]);
-      const uint32_t mag = sampling[gpu::kTssMagFilter], min = sampling[gpu::kTssMinFilter], mip = sampling[gpu::kTssMipFilter];
-      require(mag >= 1 && mag <= 2 && min >= 1 && min <= 2 && mip <= 2, "menu backend unsupported sampler filter");
+      const uint32_t mag = std::min(sampling[gpu::kTssMagFilter], 2u), min = std::min(sampling[gpu::kTssMinFilter], 2u), mip = sampling[gpu::kTssMipFilter];
+      require(mag >= 1 && min >= 1 && mip <= 2 && sampling[gpu::kTssMagFilter] <= 3 && sampling[gpu::kTssMinFilter] <= 3, "menu backend unsupported sampler filter");
+      const bool border = sampling[gpu::kTssAddressU] == 4 || sampling[gpu::kTssAddressV] == 4;
+      packet.anisotropy[n] = settings_pack::Anisotropy(impl_->anisotropy, sampling[gpu::kTssMinFilter], sampling[gpu::kTssMagFilter], mip,
+        sampling[gpu::kTssMaxAnisotropy], item.desc.levels, texinfo[n].shadow != 0, border);
       const float bias = std::bit_cast<float>(sampling[gpu::kTssMipLodBias]);
       require(std::isfinite(bias), "menu backend unsupported nonfinite sampler LOD bias");
       require((item.desc.levels == 1 && min == mag) || (bias >= -16 && bias < 16), "menu backend sampler LOD bias exceeds WebGPU range");
       packet.sampler[n][2] = mag; packet.sampler[n][3] = min; packet.sampler[n][4] = mip == 2 ? 2 : 1;
+      if (packet.anisotropy[n] > 1) { packet.sampler[n][2] = packet.sampler[n][3] = packet.sampler[n][4] = 2; }
       packet.sampler[n][5] = std::min(sampling[gpu::kTssMaxMipLevel], item.desc.levels - 1);
       packet.sampler[n][6] = mip ? item.desc.levels - 1 : packet.sampler[n][5];
     } else {
@@ -1739,6 +1747,11 @@ void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
   auto& item = impl_->surface(front);
   const Output output = impl_->outputSource ? impl_->outputSource() : Output{};
   if (output.scale > 0) { impl_->applyScale(output.scale); }
+  impl_->anisotropy = output.anisotropy;
+  if (output.brightness != impl_->brightness || output.contrast != impl_->contrast) {
+    impl_->brightness = output.brightness; impl_->contrast = output.contrast;
+    impl_->sendGamma();
+  }
   if (output.width && output.height && (output.width != impl_->canvasWidth || output.height != impl_->canvasHeight)) {
     require(output.width <= 8192 && output.height <= 8192, "menu backend canvas dimension budget exceeded");
     impl_->sendPacket(webgpu::Opcode::Configure, 0, webgpu::Dimensions{output.width, output.height});
@@ -1806,9 +1819,8 @@ void MenuBackend::SetGamma(const uint8_t* ramp) {
   std::lock_guard lock(impl_->mutex);
   impl_->requireOwner();
   require(ramp, "menu backend missing gamma ramp");
-  std::array<uint8_t, 768> bytes;
-  std::memcpy(bytes.data(), ramp, bytes.size());
-  impl_->send(webgpu::Opcode::SetGamma, 0, bytes);
+  std::memcpy(impl_->guestRamp.data(), ramp, impl_->guestRamp.size());
+  impl_->sendGamma();
 }
 void MenuBackend::Occlusion(const gpu::State&, const float*) { throw std::runtime_error("menu backend unsupported occlusion effect"); }
 void MenuBackend::FilterShadows(const gpu::State&, const float*) { throw std::runtime_error("menu backend unsupported shadow filtering"); }

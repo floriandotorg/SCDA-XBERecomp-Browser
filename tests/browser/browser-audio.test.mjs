@@ -93,3 +93,12 @@ test('a running context with a stalled device clock stops accepting stale audio'
   assert.equal(f.header[3], 0);
   await f.audio.dispose();
 });
+
+test('mono output down-mixes to one channel on the gain node, stereo restores it', async () => {
+  const f = await fixture();
+  await f.audio.enable();
+  f.audio.setOutput('mono');
+  assert.deepEqual([f.gain.channelCount, f.gain.channelCountMode, f.gain.channelInterpretation], [1, 'explicit', 'speakers']);
+  f.audio.setOutput('stereo');
+  assert.deepEqual([f.gain.channelCount, f.gain.channelCountMode], [2, 'max']);
+});

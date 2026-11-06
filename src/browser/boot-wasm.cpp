@@ -43,6 +43,8 @@
 #include "browser/host-settings.h"
 #include "browser/host-messages.h"
 #include "browser/render-scale.h"
+#include "browser/settings-pack.h"
+#include "app/app.h"
 #include <chrono>
 #include "browser/input-core.h"
 #include "browser/keyboard-input.h"
@@ -175,7 +177,11 @@ struct Session {
     runtime.ReuseTimerSamples(1);
 #endif
     browser::InstallSectionProvider(runtime, *image);
+#ifdef BROWSER_MENU
+    browser::InstallKernelProvider(runtime, *image->memory, [] { return browser::settings_pack::LanguageId(app::BootLanguage()); });
+#else
     browser::InstallKernelProvider(runtime, *image->memory);
+#endif
     browser::QueryContiguousMemoryUsage contiguousUsage;
     browser::ContiguousMemoryAccess contiguousAccess;
     browser::InstallContiguousMemory(runtime, *image->memory, &contiguousUsage, &contiguousAccess);
@@ -210,10 +216,18 @@ struct Session {
       last = now;
       if (mode == rs::kDynamic && output.scale != 1) { output.scale = dynamic.Next(output.scale, frame); }
       const bool linear = hs::HostValue("filter") != "sharp" || output.height != 480;
-      return browser::MenuBackend::Output{output.width, output.height, linear, output.scale};
+      const bool written = words[hs::kSchemaWord].load() == hs::kSchema;
+      return browser::MenuBackend::Output{output.width, output.height, linear, output.scale,
+        written ? std::min(words[hs::kBrightnessWord].load(), 100u) : 50, written ? std::min(words[hs::kContrastWord].load(), 100u) : 50,
+        std::min(words[hs::kAnisoWord].load(), 16u)};
     });
     graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), graphics_mode, std::move(backend));
     graphics->ConfigurePresentCheckpoint(BROWSER_MENU_TRACE_FRAMES);
+    graphics->SetPacer([pacer = std::make_shared<browser::settings_pack::Pacer>()] {
+      namespace hs = browser::host_settings;
+      const auto& words = hs::Shared().words;
+      pacer->Pace(words[hs::kFpsCapWord].load(), words[hs::kDisplayRateWord].load());
+    });
 #else
     graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), graphics_mode);
 #endif
@@ -302,6 +316,12 @@ struct Session {
       }
     }
     audioProvider = browser::InstallAudioProvider(runtime, *image, silentAudio, mountedDisc);
+#ifdef BROWSER_MENU
+    audioProvider->SetSpeakerConfig([] {
+      namespace hs = browser::host_settings;
+      return hs::Shared().words[hs::kAudioOutputWord].load() == 3 ? 1u : 0u;
+    });
+#endif
     browser::InstallTimerClockObserver(runtime, *image, timers,
       [sink = silentAudio, provider = audioProvider](const X86Context& context, uint64_t now) {
         sink->Advance(context, now);

@@ -662,7 +662,7 @@ uint32_t AudioProvider::Handle(const X86Context& ctx, uint32_t id, uint64_t now,
   case 89: {
     if (!args[1]) { throw Fault(ctx, ctx.esp, 0, "GetSpeakerConfig requires an output pointer"); }
     memory_->CheckRange(ctx, args[1], 4);
-    Write32(ctx, args[1], kColdSpeakerConfig);
+    Write32(ctx, args[1], speakerConfig_ ? speakerConfig_() : kColdSpeakerConfig);
     return 0;
   }
   case 90: return 0;

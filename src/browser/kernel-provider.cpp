@@ -559,17 +559,21 @@ void InvokeCriticalSection(Runtime& runtime, Memory& memory, X86Context& ctx, ui
 
 }
 
-void InstallKernelProvider(Runtime& runtime, Memory& memory) {
+void InstallKernelProvider(Runtime& runtime, Memory& memory, std::function<uint32_t()> language) {
   if (runtime.ActiveWorkers()) { throw Fault({}, 0, 0, "kernel provider installation requires a stopped runtime"); }
   runtime.Checkpoint({});
   auto pool = std::make_shared<GuestPool>(memory);
   const std::array<uint32_t, 3> settings = {1, KernelVideoFlags, 0};
   for (const uint32_t ordinal : {2u, 15u, 17u, 23u, 24u, 37u, 126u, 128u, 129u, 160u, 161u, 252u, 253u, 277u, 291u, 294u, 301u, 335u, 336u, 337u, 338u, 339u, 340u, 346u}) {
-    runtime.RegisterKernel(ordinal, [&runtime, &memory, ordinal, pool, settings](X86Context& ctx, uint8_t* base) {
+    runtime.RegisterKernel(ordinal, [&runtime, &memory, ordinal, pool, settings, language](X86Context& ctx, uint8_t* base) {
       if (&Runtime::From(ctx) != &runtime || base != memory.Base()) { throw Fault(ctx, ordinal, 0, "kernel provider session mismatch"); }
       if (ordinal == 2) { InvokeDiagnosticVirtualDisplayQuery(runtime, memory, ctx); }
       else if (ordinal == 15 || ordinal == 17 || ordinal == 23) { pool->Invoke(runtime, memory, ctx, ordinal); }
-      else if (ordinal == 24) { InvokeSettings(runtime, memory, ctx, settings); }
+      else if (ordinal == 24) {
+        auto current = settings;
+        if (language) { current[0] = language(); }
+        InvokeSettings(runtime, memory, ctx, current);
+      }
       else if (ordinal == 37) { InvokeNonCachingFscPolicy(runtime, memory, ctx); }
       else if (ordinal == 126) { InvokePerformanceCounter(runtime, memory, ctx); }
       else if (ordinal == 128) { InvokeSystemTime(runtime, memory, ctx); }

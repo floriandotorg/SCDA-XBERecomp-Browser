@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include "browser/audio-core.h"
 #include "browser/sdk-provider.h"
 #include "browser/silent-audio.h"
@@ -16,6 +17,7 @@ namespace kernel { class DiscIndex; }
 namespace browser {
 
 class AudioProvider final : public SdkGraphics {
+  std::function<uint32_t()> speakerConfig_;
 public:
   static constexpr uint32_t kArenaBase = 0xc0100000;
   static constexpr uint32_t kArenaCapacity = 4u << 20;
@@ -23,6 +25,8 @@ public:
   static constexpr uint32_t kBufferObjectBytes = 0x40;
   static constexpr uint32_t kStreamObjectBytes = 0x80;
   static constexpr uint32_t kColdSpeakerConfig = 0;
+  // GetSpeakerConfig's answer, asked at each query: DSSPEAKER_MONO (1) for the mono output setting
+  void SetSpeakerConfig(std::function<uint32_t()> config) { speakerConfig_ = std::move(config); }
   static constexpr uint32_t kMixBinCount = 32;
   static constexpr uint32_t kFeedChunkFrames = 4096;
   static constexpr size_t kMaxPendingCallbacks = audio::kMaxVoices * audio::kMaxPacketsPerVoice;

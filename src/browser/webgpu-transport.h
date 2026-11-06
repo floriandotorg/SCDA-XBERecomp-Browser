@@ -25,6 +25,7 @@ struct DrawPacket {
   uint32_t stencil_reference;
   float blend_constant[4];
   uint32_t address_w[4] = {1, 1, 1, 1};
+  uint32_t anisotropy[4] = {1, 1, 1, 1};  // maxAnisotropy a stage, 1 to 16; above 1 every filter is linear
 };
 constexpr uint32_t ResidentVertexMask = 0x10000;
 struct RawAttribute { uint32_t stream, offset, format; };
@@ -51,7 +52,7 @@ static_assert(sizeof(BlitPacket) == 44);
 struct CopyPacket { uint32_t source, width, height; uint32_t source_x = 0, source_y = 0, destination_x = 0, destination_y = 0, force_opaque = 0; };
 static_assert(sizeof(CopyPacket) == 32);
 static_assert(sizeof(PipelinePacket) == 112);
-static_assert(sizeof(DrawPacket) == 236);
+static_assert(sizeof(DrawPacket) == 252);
 static_assert(sizeof(ClearPacket) == 36);
 struct Result { Status status; uint32_t command, resource; std::vector<uint8_t> bytes; };
 class Transport {

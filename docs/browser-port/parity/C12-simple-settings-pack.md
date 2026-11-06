@@ -189,3 +189,30 @@ audio snapshot rather than listening); perf with out/perf-60/bench.mjs at anisot
 - FPS counter and diagnostics overlay (already in the browser front end).
 - Translating the HTML front end; native translations.cpp covers recomp menu rows only.
 - Vsync off and tearing, HDR output, field of view, FMV scale, the fpsfixes.cpp effect timing.
+
+## Implementation notes
+
+What C12 built. `src/browser/settings-pack.h` holds the native rules, tested by `tests/browser/settings-pack.cpp`
+(ramp identity and fixed ends, anisotropy rule, pacer with an injected clock, language ids).
+
+| Setting | Where | Applies |
+| --- | --- | --- |
+| Anisotropic filtering (Graphics tab; in game GRAPHICS > ANISOTROPIC FILTERING) | host word 14; `DrawPacket::anisotropy` per stage (packet 252 bytes), a ninth sampler cache word and `maxAnisotropy` in the service; native `StageSampler` rule, all filters linear above 1; the title's filter 3 is accepted | Next Present |
+| Brightness, Contrast (Display tab; DISPLAY > BRIGHTNESS, CONTRAST) | words 15, 16; MenuBackend keeps the game's ramp and sends `ComposeRamp(game ramp, brightness, contrast)` when either changes, so Shadow Calibration still works under it (decision 1: compose) | Next Present |
+| Frame rate cap (Display tab: Display rate, 30, 60; DISPLAY > MAX FRAME RATE) | word 17; `Pacer` after every presented Swap (`DiagnosticGraphics::SetPacer`), skipped when the cap is at or above the display rate the page measures from animation frames (word 18) | Live |
+| Language (Game tab, marked "next start"; GENERAL > LANGUAGE) | Automatic resolves from `navigator.language`; the host settings text carries `language=`; `app::BootLanguage()` latches it and the kernel answers XC_LANGUAGE with it (decision 2: a language setting overrides the kernel default) | New start |
+| Audio output (Audio tab: Stereo, Mono; GENERAL > AUDIO OUTPUT) | browser-audio's `setOutput` (gain node down-mix); word 19 makes `GetSpeakerConfig` answer DSSPEAKER_MONO | Mix live, speaker config at the game's next query |
+
+Vsync: browsers always synchronise canvas presentation; no setting.
+
+### Checked in the browser (out/parity)
+
+- Language French: the title read "APPUYEZ SUR START POUR COMMENCER".
+- Frame cap 30: 30.8 presented frames a second on the title.
+- Anisotropy 16 and brightness 75: no validation errors, the picture visibly brighter.
+
+### Not checked
+
+Index 0xFFFF (whole EEPROM) still answers 0xC00000BB; the game booted French without it. Perf at anisotropy 16 and
+the cap's interval jitter were not measured with the harness. Disc images without all five language folders are not
+detected.

@@ -41,13 +41,13 @@ struct ResidentBuffer { WGPUBuffer handle; uint32_t bytes; };
 std::map<uint32_t, ResidentBuffer> resident_buffers;
 uint64_t resident_buffer_bytes = 0;
 struct CachedSampler { WGPUSampler handle; uint64_t used; };
-std::map<std::array<uint32_t, 8>, CachedSampler> sampler_cache;
+std::map<std::array<uint32_t, 9>, CachedSampler> sampler_cache;
 uint64_t sampler_sequence = 0;
 uint32_t cached_views = 0;
-WGPUSampler cached_sampler(const uint32_t (&state)[7], uint32_t addressW) {
-  std::array<uint32_t, 8> key;
+WGPUSampler cached_sampler(const uint32_t (&state)[7], uint32_t addressW, uint32_t anisotropy) {
+  std::array<uint32_t, 9> key;
   std::copy(std::begin(state), std::end(state), key.begin());
-  key[7] = addressW;
+  key[7] = addressW; key[8] = anisotropy;
   auto found = sampler_cache.find(key);
   if (found == sampler_cache.end()) {
     if (sampler_cache.size() == 128) {
@@ -62,6 +62,7 @@ WGPUSampler cached_sampler(const uint32_t (&state)[7], uint32_t addressW) {
     descriptor.addressModeU = static_cast<WGPUAddressMode>(state[0]); descriptor.addressModeV = static_cast<WGPUAddressMode>(state[1]);
     descriptor.magFilter = static_cast<WGPUFilterMode>(state[2]); descriptor.minFilter = static_cast<WGPUFilterMode>(state[3]);
     descriptor.mipmapFilter = static_cast<WGPUMipmapFilterMode>(state[4]); descriptor.lodMinClamp = float(state[5]); descriptor.lodMaxClamp = float(state[6]);
+    descriptor.maxAnisotropy = uint16_t(anisotropy);
     found = sampler_cache.emplace(key, CachedSampler{wgpuDeviceCreateSampler(device, &descriptor), 0}).first;
   }
   found->second.used = ++sampler_sequence;
@@ -562,7 +563,8 @@ void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* 
       }
       for (uint32_t n = 0; n < 4; ++n) {
         if (spec.texture[n] == spec.depth_target || spec.texture[n] == resource) { throw std::runtime_error("invalid sampled texture resource"); }
-        if (spec.sampler[n][0] < 1 || spec.sampler[n][0] > 3 || spec.sampler[n][1] < 1 || spec.sampler[n][1] > 3 || spec.sampler[n][2] < 1 || spec.sampler[n][2] > 2 || spec.sampler[n][3] < 1 || spec.sampler[n][3] > 2 || spec.sampler[n][4] < 1 || spec.sampler[n][4] > 2 || spec.sampler[n][5] > spec.sampler[n][6] || spec.sampler[n][6] > 32 || spec.address_w[n] < 1 || spec.address_w[n] > 3) { throw std::runtime_error("unsupported sampler state"); }
+        if (spec.sampler[n][0] < 1 || spec.sampler[n][0] > 3 || spec.sampler[n][1] < 1 || spec.sampler[n][1] > 3 || spec.sampler[n][2] < 1 || spec.sampler[n][2] > 2 || spec.sampler[n][3] < 1 || spec.sampler[n][3] > 2 || spec.sampler[n][4] < 1 || spec.sampler[n][4] > 2 || spec.sampler[n][5] > spec.sampler[n][6] || spec.sampler[n][6] > 32 || spec.address_w[n] < 1 || spec.address_w[n] > 3 ||
+            spec.anisotropy[n] < 1 || spec.anisotropy[n] > 16 || (spec.anisotropy[n] > 1 && (spec.sampler[n][2] != 2 || spec.sampler[n][3] != 2 || spec.sampler[n][4] != 2))) { throw std::runtime_error("unsupported sampler state"); }
       }
       if (spec.depth_target && !texture(spec.depth_target).depth) { throw std::runtime_error("invalid depth target resource"); }
       std::array<WGPUBuffer, 16> residentVertices{};
@@ -587,7 +589,7 @@ void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* 
       entries[0] = WGPU_BIND_GROUP_ENTRY_INIT; entries[0].binding = 0; entries[0].buffer = uniforms; entries[0].offset = offsets[2]; entries[0].size = spec.uniform_bytes;
       for (uint32_t n = 0; n < 4; ++n) {
         auto& sampled = texture(spec.texture[n]);
-        samplers[n] = cached_sampler(spec.sampler[n], spec.address_w[n]);
+        samplers[n] = cached_sampler(spec.sampler[n], spec.address_w[n], spec.anisotropy[n]);
         views[n] = sampled_view(sampled);
         entries[1 + n * 2] = WGPU_BIND_GROUP_ENTRY_INIT; entries[1 + n * 2].binding = 1 + n * 2; entries[1 + n * 2].textureView = views[n];
         entries[2 + n * 2] = WGPU_BIND_GROUP_ENTRY_INIT; entries[2 + n * 2].binding = 2 + n * 2; entries[2 + n * 2].sampler = samplers[n];

@@ -1288,6 +1288,7 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
       renderer_->Present(front, hooks_.SplashPresent());
       PublishHookStatus(hooks_, hooks_.Fog());
       hooks_.ClearFog();
+      if (pace_) { pace_(); }
       for (uint32_t n = 0; n < payload.size(); ++n) {
         const auto& next = payload[1 - n];
         memory_->Write(ctx, resources_[n].header + 4, next.data(), sizeof(next));

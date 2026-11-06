@@ -3,7 +3,7 @@ import { AudioQueue, AUDIO_RATE } from './audio-transport.mjs';
 const gestures = ['pointerdown', 'keydown', 'touchend'];
 const clampVolume = value => Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1;
 
-export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal, volume = 1,
+export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal, volume = 1, output = 'stereo',
   document = globalThis.document, window = globalThis.window,
   AudioContext = globalThis.AudioContext,
   createNode = (context, options) => new AudioWorkletNode(context, 'mission-audio', options),
@@ -56,6 +56,7 @@ export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal, 
           node.addEventListener('processorerror', fail);
           gain ??= context.createGain();
           gain.gain.value = level;
+          applyOutput();
           node.connect(gain);
           gain.connect(context.destination);
         }
@@ -80,6 +81,19 @@ export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal, 
   const setVolume = value => {
     level = clampVolume(value);
     if (gain) { gain.gain.value = level; }
+  };
+  // mono: the gain node takes one channel, which Web Audio's speakers down-mix makes (L + R) / 2 and the destination
+  // plays on both sides, as native's mono output
+  let mono = output === 'mono';
+  const applyOutput = () => {
+    if (!gain) { return; }
+    gain.channelCount = mono ? 1 : 2;
+    gain.channelCountMode = mono ? 'explicit' : 'max';
+    gain.channelInterpretation = 'speakers';
+  };
+  const setOutput = value => {
+    mono = value === 'mono';
+    applyOutput();
   };
   let closing;
   const dispose = () => {
@@ -106,5 +120,5 @@ export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal, 
   window.addEventListener('focus', focus);
   signal?.addEventListener('abort', dispose, { once: true });
   void enable();
-  return Object.freeze({ enable, dispose, snapshot, setVolume });
+  return Object.freeze({ enable, dispose, snapshot, setVolume, setOutput });
 };

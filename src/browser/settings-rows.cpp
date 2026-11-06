@@ -53,6 +53,12 @@ const std::vector<Setting>& Settings() {
     {12, "fmvScale", "fill", {{"fill", "FILL"}, {"4:3", "4:3"}}},
     {13, "resolution", "console", {{"console", "CONSOLE"}, {"window", "MATCH WINDOW"}, {"dynamic", "DYNAMIC"}}},
     {14, "resolutionScale", "100", {}, false, 50, 200, 5, "%.0f%%"},
+    {15, "brightness", "50", {}, false, 0, 100, 1, "%.0f"},
+    {16, "contrast", "50", {}, false, 0, 100, 1, "%.0f"},
+    {17, "frameCap", "60", {{"0", "DISPLAY RATE"}, {"30", "30"}, {"60", "60"}}},
+    {18, "anisotropy", "0", {{"0", "OFF"}, {"2", "2X"}, {"4", "4X"}, {"8", "8X"}, {"16", "16X"}}},
+    {19, "language", "auto", {{"auto", "AUTOMATIC"}, {"int", "ENGLISH"}, {"fra", "FRANCAIS"}, {"deu", "DEUTSCH"}, {"ita", "ITALIANO"}, {"esp", "ESPANOL"}}},
+    {20, "audioOutput", "stereo", {{"stereo", "2.0 STEREO"}, {"mono", "MONO"}}},
   };
   return list;
 }
@@ -73,12 +79,18 @@ constexpr Row kSettingsRows[] = {
   {Kind::Value, 1, "UPSCALING"},
   {Kind::Value, 11, "FIELD OF VIEW"},
   {Kind::Value, 12, "FMV SCALE"},
+  {Kind::Value, 15, "BRIGHTNESS"},
+  {Kind::Value, 16, "CONTRAST"},
+  {Kind::Value, 17, "MAX FRAME RATE"},
   {Kind::Heading, -1, "GRAPHICS"},
   {Kind::Value, 2, "FPS COUNTER"},
+  {Kind::Value, 18, "ANISOTROPIC FILTERING"},
   {Kind::Heading, -1, "GENERAL"},
   {Kind::Value, 3, "MASTER VOLUME"},
   {Kind::Value, 4, "SKIP INTROS"},
   {Kind::Value, 5, "PAUSE ON FOCUS LOSS"},
+  {Kind::Value, 19, "LANGUAGE"},
+  {Kind::Value, 20, "AUDIO OUTPUT"},
 };
 
 // the actions the browser has no use for: push to talk waits for voice

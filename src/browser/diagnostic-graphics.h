@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include "browser/contiguous-memory.h"
 #include "browser/hook-graphics.h"
 #include "browser/sdk-provider.h"
@@ -70,7 +71,10 @@ public:
   gpu::State State() const;
   gpu::State SnapshotState() const;
   HookGraphics& Hooks() { return hooks_; }
+  // after each presented Swap, as native's app::Pace after D3DDevice_Swap (the frame cap)
+  void SetPacer(std::function<void()> pace) { pace_ = std::move(pace); }
 private:
+  std::function<void()> pace_;
   class Recorder;
   Runtime& runtime_;
   PreparedImage& image_;

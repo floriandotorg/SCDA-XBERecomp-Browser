@@ -43,6 +43,8 @@ public:
     uint32_t width = 0, height = 0;
     bool linear = false;
     float scale = 1;
+    uint32_t brightness = 50, contrast = 50;  // composed over the game's gamma ramp, 50 / 50 leaves it alone
+    uint32_t anisotropy = 0;                  // forced anisotropic filtering, 0 as the game asks
   };
   void SetOutputSource(std::function<Output()> source);
   struct SnapshotData {

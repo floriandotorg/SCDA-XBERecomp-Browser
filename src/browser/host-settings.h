@@ -29,6 +29,12 @@ inline constexpr uint32_t kResolutionWord = 10;
 inline constexpr uint32_t kRenderPercentWord = 11;
 inline constexpr uint32_t kDeviceWidthWord = 12;
 inline constexpr uint32_t kDeviceHeightWord = 13;
+inline constexpr uint32_t kAnisoWord = 14;
+inline constexpr uint32_t kBrightnessWord = 15;
+inline constexpr uint32_t kContrastWord = 16;
+inline constexpr uint32_t kFpsCapWord = 17;
+inline constexpr uint32_t kDisplayRateWord = 18;
+inline constexpr uint32_t kAudioOutputWord = 19;
 
 struct Block {
   std::array<std::atomic<uint32_t>, kWords> words{};
