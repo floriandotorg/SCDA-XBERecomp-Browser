@@ -173,3 +173,46 @@ host features (splash, handover, pause on focus loss, intro skip) the browser al
 - Widescreen HUD placement from hud.cpp.
 - Host splash image and process handover (not applicable in a browser).
 - Key rebinding and in-game RECOMP SETTINGS pages (C05).
+
+## Implementation notes
+
+What C04 built.
+
+- `prompts`, `text` and `xbox_live` are in the default `BROWSER_GAME_HOOKS`; their weak stand-ins (PromptsTick,
+  EventPrompts, ComboElement, HintElement, WordingElement) and the ProjectModel one are gone from game-stubs.cpp, which
+  keeps only `app::DrawFps` and `app::DrawWatermark`. `app::BootLanguage()` is in host-settings.cpp (English until C12).
+- `src/browser/exit-menu.cpp` ports exit_menu.cpp (page setup, back, OnAccept, OnCancel; the same constants and
+  strings). Its press check is `browser::exit_menu::Press`, which MenuRoute's `sub_0018697A` asks before the
+  Coop / Versus route (a weak `false` keeps menu-route.cpp building alone). OnAccept posts a `quit` entry on the guest
+  to host ring; menu-shell turns it into the pause panel's Quit to main menu.
+- `src/browser/loading-input.cpp` ports the input wait group of loading.cpp: the mission loading wait (with the full
+  bar, polling `input::PressReleased` with a runtime checkpoint between polls, so a stop unwinds it), the controller
+  layout screen, the movie skip check with keys and the held button guard, and movie frames (`g_movie`).
+  `MarkPersistedDisplay` and the Press Any Key text are not ported.
+- Console: the `console` setting (Developer tab) lets the `console` binding (Backtick) open a DOM overlay over the
+  game. Lines go to the guest as `console` entries; `src/browser/input-update.cpp` queues them with
+  `game::QueueCommand(line, Route::Player)` before mouse.cpp's update runs them, and sends `game::TakeOutput()` lines
+  back as `output` entries. The overlay keeps a bounded log and Up / Down history (`src/browser/console-model.mjs`,
+  `tests/browser/console-model.test.mjs`, which also covers the quit and output routing); the game gets no keys while
+  it is open.
+
+### Checked in the browser (out/parity)
+
+- Title: "PLEASE PRESS (ENTER) TO BEGIN" (text.cpp).
+- Game mode list: Solo, Coop, Versus, Credits, Exit with "(ENTER) Select (ESC) Back" (prompts.cpp, exit-menu.cpp).
+- Console in a mission: `nonsensecommand` printed "unrecognized command: nonsensecommand" in the overlay.
+
+### Not checked
+
+- Exit's OK returning to the page's main menu: automation kept landing on the attract movie, which starts while the
+  title waits, so the box was not reached. The routing is unit tested.
+- The mission loading wait (development start skips the front end), the controller screen, movie skipping with keys,
+  and the pad / keyboard legend switch need the user's playtest.
+
+### Static lifetime
+
+| Static | Restart safe because |
+| --- | --- |
+| exit-menu `g_block`, `g_list`, `g_exit_index` | `g_block` is in the hook pool, which keeps its bytes; the list is found again by address and refilled |
+| loading-input `g_mission_load`, `g_held_at_start` | Set around one call; a held bit clears on the next release |
+| prompts.cpp bars and block | The block is in the hook pool; bars are matched against the stacks every tick |

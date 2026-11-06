@@ -3,8 +3,15 @@
 #include "cpu/x86_ops.h"
 #include <algorithm>
 
+// exit-menu.cpp's Exit item on the game mode list, before the route checks Coop and Versus; a build without it has
+// no such item
+namespace browser::exit_menu {
+__attribute__((weak)) bool Press(X86Context&) { return false; }
+}
+
 BROWSER_GAME_CHAIN(0018697A)
 X86_FUNC(sub_0018697A) {
+  if (browser::exit_menu::Press(ctx)) { return; }
   if (browser::Runtime::ObserveSdkEntry(ctx, base, 65)) { game_sub_0018697A(ctx, base); }
 }
 

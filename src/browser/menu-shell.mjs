@@ -8,6 +8,8 @@ import { ACTIONS, PAD_ACTIONS, PAD_BUTTONS, keyNamed, keyOfButton, keyOfVk, keyO
 import { bind, bindPad, keyBinding, label as keyLabel, padBinding } from './input-bindings.mjs';
 import { createWheelAccumulator } from './keyboard-input.mjs';
 import { frameShape } from './frame-shape.mjs';
+import { applyHostMessage, HOST_MESSAGES } from './host-messages.mjs';
+import { createConsoleModel, routeHostMessage } from './console-model.mjs';
 
 const onOff = Object.freeze({ true: 'On', false: 'Off' });
 const KEEP_CAPS = new Set(['EEV', 'OPSAT', 'EMF', 'HUD', 'COOP', 'LS', 'RS', 'LB', 'RB', 'LT', 'RT']);
@@ -43,6 +45,7 @@ const TABS = Object.freeze([
     { setting: 'developmentStart', label: 'Skip to first mission' },
     { setting: 'showFps', label: 'Frame rate' },
     { setting: 'showDiagnostics', label: 'Diagnostics' },
+    { setting: 'console', label: 'Console' },
   ] },
 ]);
 
@@ -79,13 +82,19 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const stage = find('#stage'), input = find('#iso'), boot = find('#boot');
   const detail = find('#detail'), diagnostic = find('#gpu'), fps = find('#fps'), gear = find('#gear');
   const front = find('#front'), mainMenu = find('#main-menu'), loadingLayer = find('#loading'), errorLayer = find('#error');
-  const pauseLayer = find('#pause'), settingsLayer = find('#settings');
+  const pauseLayer = find('#pause'), settingsLayer = find('#settings'), consoleLayer = find('#console');
+  const consoleLog = consoleLayer.querySelector('.log'), consoleLine = consoleLayer.querySelector('.line');
   const tabList = settingsLayer.querySelector('.tabs'), rowList = settingsLayer.querySelector('.rows');
   let canvas = find('#game');
   let screen = 'title', panel = 'none', settingsReturn = 'none', tab = TABS[0].id;
   let presented = false, dismissed = false, quitting = false, pickToStart = false;
   let handle, motion, audio, keyboard, idleTimer, padFrame, padPrevious = new Set();
-  let capture, layoutMap;
+  let capture, layoutMap, hostMessages, consoleOpen = false;
+  const consoleModel = createConsoleModel({ send: line => hostMessages?.post(HOST_MESSAGES.console, line) ?? false });
+  const showConsoleLog = () => {
+    consoleLog.textContent = consoleModel.lines.join('\n');
+    consoleLog.scrollTop = consoleLog.scrollHeight;
+  };
   const captureWheel = createWheelAccumulator();
   void globalThis.navigator?.keyboard?.getLayoutMap?.().then(map => { layoutMap = map; if (panel === 'settings') { refreshRows(); } }).catch(() => {});
   let started = 0, lastUpdated = 0, fpsFrames = 0, fpsSince = 0;
@@ -364,8 +373,10 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     pauseLayer.classList.toggle('shown', panel === 'pause');
     settingsLayer.classList.toggle('shown', panel === 'settings');
     fps.hidden = !(settings.get('showFps') && screen === 'game');
-    keyboard?.setHost({ panel: panel !== 'none' });
-    keyboard?.setActive(screen === 'game' && panel === 'none');
+    if (screen !== 'game' && consoleOpen) { consoleOpen = false; }
+    consoleLayer.classList.toggle('shown', consoleOpen);
+    keyboard?.setHost({ panel: panel !== 'none', console: consoleOpen });
+    keyboard?.setActive(screen === 'game' && panel === 'none' && !consoleOpen);
     motion?.setSuspended(screen === 'game' && panel !== 'none');
     if (activeLayer() && padFrame === undefined) { padFrame = window.requestAnimationFrame(pollPad); }
   };
@@ -429,6 +440,12 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const controller = createShellController({ onChange: state => render(state), createRuntime: () => createMenuRuntime({
     developmentStart: settings.get('developmentStart'), settings, createMotion, createAudio,
     onKeyboard: value => { keyboard = value; show(); },
+    onHostMessages: value => { hostMessages = value; },
+    onHostMessage: message => routeHostMessage(message, {
+      quit: () => { if (screen === 'game') { quit(); } },
+      output: text => { consoleModel.print(text); if (consoleOpen) { showConsoleLog(); } },
+      setting: value => { applyHostMessage(settings, value); },
+    }, HOST_MESSAGES),
     hostComputed: () => ({ effectiveAspect: shape.aspect }),
     onHostSettings: value => { hostSettings = value; },
     acquireCanvas: () => {
@@ -525,8 +542,38 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     else if (action === 'quit') { quit(); }
     else if (action === 'dismiss') { back(); }
   };
+  const consoleKey = event => {
+    const vk = vkOfCode(event.code);
+    return Boolean(vk) && settings.get('console') && keyBinding(settings.get('keys'), 'console').some(name => keyNamed(name)?.vk === vk);
+  };
+  const setConsole = open => {
+    consoleOpen = open;
+    show();
+    if (open) { consoleLine.focus({ preventScroll: true }); showConsoleLog(); } else { focusDefault(); }
+  };
   const keydown = event => {
     if (captureKey(event)) { return; }
+    if (consoleOpen) {
+      event.stopImmediatePropagation();
+      if (event.code === 'Escape' || (consoleKey(event) && !event.repeat)) {
+        event.preventDefault();
+        setConsole(false);
+      } else if (event.code === 'Enter') {
+        event.preventDefault();
+        if (consoleModel.submit(consoleLine.value)) { consoleLine.value = ''; }
+        showConsoleLog();
+      } else if (event.code === 'ArrowUp' || event.code === 'ArrowDown') {
+        event.preventDefault();
+        consoleLine.value = consoleModel.recall(event.code === 'ArrowUp' ? -1 : 1);
+      }
+      return;
+    }
+    if (screen === 'game' && panel === 'none' && consoleKey(event) && !keyboard?.capturing()) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setConsole(true);
+      return;
+    }
     const settingsKey = settingsPanelKey(event) && !keyboard?.capturing();
     if (screen === 'game' && panel === 'none') {
       if (settingsKey) {
@@ -558,7 +605,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       resume();
     }
   };
-  const keyup = event => { if (screen === 'game' && panel !== 'none') { event.stopImmediatePropagation(); } };
+  const keyup = event => { if (screen === 'game' && (panel !== 'none' || consoleOpen)) { event.stopImmediatePropagation(); } };
   const hover = event => {
     const target = event.target.closest?.('[data-nav]');
     if (target && !target.disabled && activeLayer()?.contains(target) && root.activeElement !== target) { target.focus({ preventScroll: true }); }

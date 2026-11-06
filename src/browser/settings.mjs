@@ -23,6 +23,7 @@ export const SETTINGS = Object.freeze({
   developmentStart: Object.freeze({ initial: false }),
   showFps: Object.freeze({ initial: false }),
   showDiagnostics: Object.freeze({ initial: false }),
+  console: Object.freeze({ initial: false }),
 });
 
 const normalize = (name, value) => {

@@ -187,7 +187,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       }
       paths.push('src/browser/render-snapshot.h', 'src/browser/render-snapshot.cpp', 'src/browser/menu-backend.h', 'src/browser/menu-backend.cpp', 'src/browser/shader-inventory.h',
         'src/browser/menu-shaders.h', 'src/browser/menu-shaders.cpp', 'src/browser/menu-pixel-shaders.h', 'src/browser/menu-pixel-shaders.cpp', 'src/browser/menu-texture.h', 'src/browser/menu-texture.cpp',
-        'src/browser/menu-input.mjs', 'src/browser/gamepad-input.mjs', 'src/browser/input-bindings.mjs', 'src/browser/frame-shape.mjs', 'src/browser/browser-audio.mjs', 'src/browser/audio-worklet.mjs', 'src/browser/webgpu-transport.h', 'src/browser/webgpu-transport.cpp', 'src/browser/webgpu-transport.mjs',
+        'src/browser/menu-input.mjs', 'src/browser/gamepad-input.mjs', 'src/browser/input-bindings.mjs', 'src/browser/frame-shape.mjs', 'src/browser/console-model.mjs', 'src/browser/browser-audio.mjs', 'src/browser/audio-worklet.mjs', 'src/browser/webgpu-transport.h', 'src/browser/webgpu-transport.cpp', 'src/browser/webgpu-transport.mjs',
         'src/browser/webgpu-service.cpp', 'src/browser/webgpu-service.mjs', 'src/browser/menu-runtime.mjs', 'src/browser/menu-shell.mjs', 'src/browser/settings.mjs',
         'src/browser/menu.html', 'src/gpu/shaders.h', 'src/gpu/shaders.cpp', 'src/gpu/vertex.h');
     }
@@ -224,6 +224,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       'src/browser/input-core.h', 'src/browser/input-core.cpp', 'src/browser/input-update.cpp', 'src/browser/keyboard-input.h',
       'src/browser/keyboard-input.mjs', 'src/browser/input-actions.mjs', 'src/browser/settings-rows.cpp', 'src/browser/host-messages.h',
       'src/browser/host-messages.cpp', 'src/browser/host-messages.mjs', 'src/browser/game-stubs.cpp', 'src/browser/loading-screen.cpp',
+      'src/browser/loading-input.cpp', 'src/browser/exit-menu.cpp',
       'src/game/loading.h', 'src/gpu/backend.h',
       'src/app/translations.h', 'src/app/translations.cpp', 'src/core/input.h', 'src/game/console.h', 'src/game/unreal.h',
       'src/xdk/hle.h', 'src/xdk/d3d8.h', 'src/app/app.h', 'src/core/log.h');
