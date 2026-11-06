@@ -1,11 +1,10 @@
 const owners = new WeakMap();
 export const createMissionControls = ({ buffer, byteOffset, document = globalThis.document, window = globalThis.window,
-  canvas = document?.querySelector('#game'), capture = document?.querySelector('#capture'), unlock = document?.querySelector('#unlock'),
-  sensitivity = document?.querySelector('#sensitivity'), status = document?.querySelector('#capture-status'),
+  canvas = document?.querySelector('#game'), capture = canvas, sensitivity = () => 1, invertY = () => false,
   clear = () => {}, now = () => performance.now(), signal } = {}) => {
   if (!(buffer instanceof SharedArrayBuffer) || buffer.growable) { throw new TypeError('Mission controls require fixed shared memory.'); }
   if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset % 4 || byteOffset > buffer.byteLength - 20) { throw new RangeError('Mission input span is out of bounds.'); }
-  if (!canvas || !capture || !unlock || !sensitivity || !status || !document?.addEventListener || !window?.addEventListener) { throw new TypeError('Mission controls require their canvas and visible controls.'); }
+  if (!canvas || !capture?.addEventListener || typeof sensitivity !== 'function' || typeof invertY !== 'function' || !document?.addEventListener || !window?.addEventListener) { throw new TypeError('Mission controls require their canvas and settings.'); }
   signal?.throwIfAborted();
   const spans = owners.get(buffer) ?? new Set();
   for (const start of spans) {
@@ -18,12 +17,13 @@ export const createMissionControls = ({ buffer, byteOffset, document = globalThi
   Atomics.store(words, 1, 0);
   let focused = document.hasFocus?.() ?? true;
   let disposed = false;
+  let suspended = false;
   let pausedAt = Atomics.load(words, 2) ? Atomics.load(words, 3) >>> 0 : undefined;
   const reset = () => { Atomics.store(words, 0, 0); Atomics.store(words, 1, 0); clear(); };
   const locked = () => document.pointerLockElement === canvas;
   const update = () => {
     reset();
-    const paused = !focused || document.hidden;
+    const paused = !focused || document.hidden || suspended;
     const time = Math.floor(now());
     if (paused && pausedAt === undefined) {
       pausedAt = time;
@@ -36,19 +36,15 @@ export const createMissionControls = ({ buffer, byteOffset, document = globalThi
       pausedAt = undefined;
       Atomics.notify(words, 2);
     }
-    unlock.disabled = !locked();
-    status.textContent = paused ? 'Paused while this window is inactive.' : locked() ? 'Mouse captured. Escape unlocks the pointer. Enter pauses the game.' : 'Mouse unlocked. Capture mouse to look around.';
   };
   const request = async () => {
-    if (disposed || !focused || document.hidden) { return; }
+    if (disposed || !focused || document.hidden || suspended || locked()) { return; }
     try {
       canvas.focus({ preventScroll: true });
       if (typeof canvas.requestPointerLock !== 'function') { throw new Error('unavailable'); }
       await canvas.requestPointerLock();
       if (disposed && locked()) { document.exitPointerLock(); }
-    } catch {
-      if (!disposed) { status.textContent = 'Mouse capture was denied or is unavailable. Select Capture mouse to retry.'; }
-    }
+    } catch {}
   };
   const release = () => { if (locked()) { document.exitPointerLock(); } reset(); };
   const keydown = event => {
@@ -66,14 +62,14 @@ export const createMissionControls = ({ buffer, byteOffset, document = globalThi
   };
   const move = event => {
     if (disposed || !locked() || !focused || document.hidden) { return; }
-    const scale = Number(sensitivity.value);
+    const scale = Number(sensitivity());
     if (!Number.isFinite(scale) || scale < 0.05 || scale > 10 || !Number.isFinite(event.movementX) || !Number.isFinite(event.movementY)) { return; }
     accumulate(0, event.movementX * scale);
-    accumulate(1, event.movementY * scale);
+    accumulate(1, event.movementY * (invertY() ? -scale : scale));
   };
   const blur = () => { focused = false; update(); };
   const focus = () => { focused = true; update(); };
-  const failure = () => { reset(); status.textContent = 'Mouse capture was denied. Select Capture mouse to retry.'; };
+  const failure = () => { reset(); };
   const dispose = () => {
     if (disposed) { return; }
     disposed = true;
@@ -84,9 +80,7 @@ export const createMissionControls = ({ buffer, byteOffset, document = globalThi
       pausedAt = undefined;
     }
     release();
-    capture.disabled = unlock.disabled = true;
     capture.removeEventListener('click', request);
-    unlock.removeEventListener('click', release);
     document.removeEventListener('mousemove', move);
     document.removeEventListener('pointerlockchange', update);
     document.removeEventListener('pointerlockerror', failure);
@@ -97,9 +91,7 @@ export const createMissionControls = ({ buffer, byteOffset, document = globalThi
     signal?.removeEventListener('abort', dispose);
     spans.delete(byteOffset);
   };
-  capture.disabled = false;
   capture.addEventListener('click', request);
-  unlock.addEventListener('click', release);
   document.addEventListener('mousemove', move);
   document.addEventListener('pointerlockchange', update);
   document.addEventListener('pointerlockerror', failure);
@@ -108,6 +100,12 @@ export const createMissionControls = ({ buffer, byteOffset, document = globalThi
   window.addEventListener('blur', blur);
   window.addEventListener('focus', focus);
   signal?.addEventListener('abort', dispose, { once: true });
+  const setSuspended = value => {
+    if (disposed || suspended === Boolean(value)) { return; }
+    suspended = Boolean(value);
+    if (suspended) { release(); }
+    update();
+  };
   update();
-  return Object.freeze({ dispose });
+  return Object.freeze({ dispose, setSuspended, release });
 };

@@ -1,37 +1,38 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const fixture = async (load = Promise.resolve()) => {
+const fixture = async ({ load = Promise.resolve(), autoplay = true, volume = 1 } = {}) => {
   const { createBrowserAudio } = await import('../../src/browser/browser-audio.mjs');
   const buffer = new SharedArrayBuffer(32 + 16384 * 6 * 4);
   const header = new Uint32Array(buffer, 0, 8);
-  const button = new EventTarget(), document = new EventTarget(), window = new EventTarget(), status = {};
+  const document = new EventTarget(), window = new EventTarget();
   document.hasFocus = () => true;
   document.hidden = false;
   const events = [];
-  let elapsed = 0, tick;
+  const gain = { gain: { value: 1 }, connect: () => events.push('gain-connect'), disconnect: () => events.push('gain-disconnect') };
+  let elapsed = 0, tick, gestured = autoplay;
   class Context extends EventTarget {
     constructor(options) { super(); this.sampleRate = options.sampleRate; this.state = 'suspended'; this.destination = {}; this.currentTime = 0; }
     audioWorklet = { addModule: () => load };
-    resume = async () => { events.push('resume'); this.state = 'running'; };
+    createGain = () => gain;
+    resume = async () => { events.push('resume'); if (gestured) { this.state = 'running'; } };
     close = async () => { events.push('close'); this.state = 'closed'; };
   }
   const node = new EventTarget();
   node.connect = () => events.push('connect');
   node.disconnect = () => events.push('disconnect');
-  const audio = createBrowserAudio({ buffer, byteOffset: 0, samplesOffset: 32, button, status, document, window,
+  const audio = createBrowserAudio({ buffer, byteOffset: 0, samplesOffset: 32, document, window, volume,
     AudioContext: Context, createNode: () => node, now: () => elapsed,
     schedule: callback => { tick = callback; return 1; }, cancel: () => { tick = undefined; } });
-  return { audio, header, button, status, events, node, window, document,
+  return { audio, header, events, node, gain, window, document,
+    gesture: async type => { gestured = true; window.dispatchEvent(new Event(type)); await audio.enable(); },
     advance: value => { elapsed += value; tick?.(); } };
 };
 
-test('audio requires explicit activation and focus loss flushes queued sound', async () => {
+test('audio starts without a user control and focus loss flushes queued sound', async () => {
   const f = await fixture();
-  assert.equal(f.header[3], 0);
-  assert.equal(f.button.disabled, false);
   await f.audio.enable();
-  assert.deepEqual(f.events, ['resume', 'connect']);
+  assert.deepEqual(f.events, ['resume', 'connect', 'gain-connect']);
   assert.equal(f.header[3], 1);
   f.header[0] = 10;
   f.window.dispatchEvent(new Event('blur'));
@@ -41,38 +42,54 @@ test('audio requires explicit activation and focus loss flushes queued sound', a
   assert.equal(f.header[3], 1);
   await f.audio.dispose();
   assert.equal(f.header[3], 0);
-  assert.equal(f.button.disabled, true);
   assert.ok(f.events.includes('disconnect') && f.events.includes('close'));
+});
+
+test('a blocked autoplay starts on the next user gesture', async () => {
+  const f = await fixture({ autoplay: false });
+  await f.audio.enable();
+  assert.equal(f.header[3], 0);
+  await f.gesture('pointerdown');
+  assert.equal(f.header[3], 1);
+  await f.audio.dispose();
+});
+
+test('volume is applied at start and while playing', async () => {
+  const f = await fixture({ volume: 0.25 });
+  await f.audio.enable();
+  assert.equal(f.gain.gain.value, 0.25);
+  f.audio.setVolume(0.5);
+  assert.equal(f.gain.gain.value, 0.5);
+  f.audio.setVolume(7);
+  assert.equal(f.gain.gain.value, 1);
+  await f.audio.dispose();
 });
 
 test('retiring during worklet startup cannot connect or replay old samples', async () => {
   let loaded;
-  const f = await fixture(new Promise(resolve => { loaded = resolve; }));
-  const enabling = f.audio.enable();
+  const f = await fixture({ load: new Promise(resolve => { loaded = resolve; }) });
   await Promise.resolve();
   await f.audio.dispose();
   loaded();
-  await enabling;
+  await f.audio.enable();
   assert.equal(f.header[3], 0);
   assert.equal(f.events.includes('connect'), false);
 });
 
-test('a failed worklet exposes a retry without leaving the ring active', async () => {
+test('a failed worklet stops the ring and recovers on the next gesture', async () => {
   const f = await fixture();
   await f.audio.enable();
   f.node.dispatchEvent(new Event('processorerror'));
   assert.equal(f.header[3], 0);
-  assert.equal(f.button.disabled, false);
-  assert.match(f.status.textContent, /retry|enable/i);
+  await f.gesture('keydown');
+  assert.equal(f.header[3], 1);
   await f.audio.dispose();
 });
 
-test('a running context with a stalled device clock stops accepting stale audio and exposes a retry', async () => {
+test('a running context with a stalled device clock stops accepting stale audio', async () => {
   const f = await fixture();
   await f.audio.enable();
   f.advance(3000);
   assert.equal(f.header[3], 0);
-  assert.equal(f.button.disabled, false);
-  assert.match(f.status.textContent, /clock stopped/i);
   await f.audio.dispose();
 });

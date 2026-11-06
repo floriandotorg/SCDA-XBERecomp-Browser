@@ -12,8 +12,27 @@ const phaseText = Object.freeze({
   error: 'Boot failed.',
 });
 
+const loadBootManifest = async () => (await import('./boot-manifest.mjs')).default;
+
+export const createShellController = ({ createRuntime = createBootRuntime, loadManifest = loadBootManifest, validateWasm, onChange }) => createBootController({
+  createRuntime,
+  validateSelection: async (source, { signal }) => {
+    signal.throwIfAborted();
+    if (!globalThis.crossOriginIsolated || typeof SharedArrayBuffer !== 'function' || typeof Worker !== 'function') {
+      throw Object.assign(new Error('A secure context with cross origin isolation and browser workers is required.'), { code: 'CAPABILITY' });
+    }
+    if (!Number.isSafeInteger(source.size) || source.size < 1 || typeof source.slice !== 'function') {
+      throw Object.assign(new Error('Select a nonempty local ISO.'), { code: 'FILE' });
+    }
+    const manifest = await loadManifest();
+    signal.throwIfAborted();
+    assertWasmCapabilities(manifest, validateWasm);
+  },
+  onChange,
+});
+
 export const mountBootShell = ({ root = document, createRuntime = createBootRuntime,
-  loadManifest = async () => (await import('./boot-manifest.mjs')).default, validateWasm } = {}) => {
+  loadManifest = loadBootManifest, validateWasm } = {}) => {
   const input = root.querySelector('#iso');
   const boot = root.querySelector('#boot');
   const stop = root.querySelector('#stop');
@@ -28,8 +47,6 @@ export const mountBootShell = ({ root = document, createRuntime = createBootRunt
     boot.disabled = !state.source || active || state.stopping || state.code === 'TEARDOWN';
     stop.disabled = !active || state.stopping;
     input.disabled = state.stopping || state.code === 'TEARDOWN';
-    const development = root.querySelector('#development-start');
-    if (development) { development.disabled = active || state.stopping; }
     status.textContent = state.stopping ? 'Stopping guest workers and cancelling pending reads.' :
       state.phase === 'stopped' && state.code === 'SINGLE_PLAYER_LAUNCH_REQUEST' ? 'Single player launch boundary reached.' : phaseText[state.phase];
     selected.textContent = state.source ? `${state.source.name ?? 'Local ISO'} (${state.source.size.toLocaleString()} bytes)` : 'No ISO selected.';
@@ -41,22 +58,7 @@ export const mountBootShell = ({ root = document, createRuntime = createBootRunt
     status.dataset.state = state.phase;
     boot.setAttribute('aria-busy', String(state.phase === 'validating' || state.phase === 'booting' || state.stopping));
   };
-  const controller = createBootController({
-    createRuntime,
-    validateSelection: async (source, { signal }) => {
-      signal.throwIfAborted();
-      if (!globalThis.crossOriginIsolated || typeof SharedArrayBuffer !== 'function' || typeof Worker !== 'function') {
-        throw Object.assign(new Error('A secure context with cross origin isolation and browser workers is required.'), { code: 'CAPABILITY' });
-      }
-      if (!Number.isSafeInteger(source.size) || source.size < 1 || typeof source.slice !== 'function') {
-        throw Object.assign(new Error('Select a nonempty local ISO.'), { code: 'FILE' });
-      }
-      const manifest = await loadManifest();
-      signal.throwIfAborted();
-      assertWasmCapabilities(manifest, validateWasm);
-    },
-    onChange: render,
-  });
+  const controller = createShellController({ createRuntime, loadManifest, validateWasm, onChange: render });
   const select = () => { void controller.select(input.files?.[0]); };
   const start = () => { void controller.start(); };
   const stopBoot = () => { void controller.stop(); };

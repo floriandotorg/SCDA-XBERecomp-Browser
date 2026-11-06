@@ -1,17 +1,20 @@
 import { AudioQueue, AUDIO_RATE } from './audio-transport.mjs';
 
-export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal,
+const gestures = ['pointerdown', 'keydown', 'touchend'];
+const clampVolume = value => Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1;
+
+export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal, volume = 1,
   document = globalThis.document, window = globalThis.window,
-  button = document?.querySelector('#enable-audio'), status = document?.querySelector('#audio-status'),
   AudioContext = globalThis.AudioContext,
   createNode = (context, options) => new AudioWorkletNode(context, 'mission-audio', options),
   now = () => performance.now(), schedule = setInterval, cancel = clearInterval,
 } = {}) => {
   const queue = new AudioQueue({ buffer, byteOffset, samplesOffset });
-  if (!button || !status || !document?.addEventListener || !window?.addEventListener) { throw new Error('Audio controls are required.'); }
+  if (!document?.addEventListener || !window?.addEventListener) { throw new Error('Audio requires document and window events.'); }
   signal?.throwIfAborted();
   const header = queue.header;
-  let context, node, pending, timer;
+  let context, node, gain, pending, timer;
+  let level = clampVolume(volume);
   let disposed = false;
   let focused = document.hasFocus?.() ?? true;
   const flush = () => {
@@ -21,42 +24,40 @@ export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal,
   const snapshot = () => ({ mode: 'web-audio', sampleRate: AUDIO_RATE, channels: 2,
     queuedFrames: (Atomics.load(header, 0) - Atomics.load(header, 1)) >>> 0,
     droppedFrames: Atomics.load(header, 4), underrunFrames: Atomics.load(header, 5),
-    playedFrames: Atomics.load(header, 6), fault: Atomics.load(header, 7), state: context?.state ?? 'disabled' });
+    playedFrames: Atomics.load(header, 6), fault: Atomics.load(header, 7), state: context?.state ?? 'disabled', volume: level });
+  const playing = () => context?.state === 'running' && node !== undefined;
   const sync = () => {
     flush();
-    if (!disposed && focused && !document.hidden && context?.state === 'running' && node) {
-      Atomics.store(header, 3, 1);
-      status.textContent = 'Audio enabled.';
-    } else if (!disposed) { status.textContent = 'Audio paused. Select Enable audio to resume if needed.'; }
+    if (!disposed && focused && !document.hidden && playing()) { Atomics.store(header, 3, 1); }
   };
-  const fail = reason => {
+  const fail = () => {
     flush();
     node?.disconnect();
     node?.removeEventListener('processorerror', fail);
     node = undefined;
     cancel(timer);
-    if (!disposed) { button.disabled = false; status.textContent = typeof reason === 'string' ? reason : 'Audio unavailable. Select Enable audio to retry.'; }
   };
   const enable = () => {
-    if (disposed || pending) { return pending; }
+    if (disposed || pending) { return pending ?? Promise.resolve(); }
     pending = (async () => {
-      button.disabled = true;
       try {
-        if (typeof AudioContext !== 'function') { throw new Error('Web Audio is unavailable.'); }
+        if (typeof AudioContext !== 'function') { return; }
         if (!context || context.state === 'closed') {
           context = new AudioContext({ sampleRate: AUDIO_RATE, latencyHint: 'interactive' });
           context.addEventListener('statechange', sync);
         }
         await context.resume();
-        if (disposed) { return; }
-        if (context.sampleRate !== AUDIO_RATE || context.state !== 'running') { throw new Error('Audio activation was denied.'); }
+        if (disposed || context.sampleRate !== AUDIO_RATE || context.state !== 'running') { return; }
         if (!node) {
           await context.audioWorklet.addModule(new URL('./audio-worklet.mjs', import.meta.url));
           if (disposed) { return; }
           node = createNode(context, { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
             processorOptions: { buffer, byteOffset, samplesOffset } });
           node.addEventListener('processorerror', fail);
-          node.connect(context.destination);
+          gain ??= context.createGain();
+          gain.gain.value = level;
+          node.connect(gain);
+          gain.connect(context.destination);
         }
         focused = document.hasFocus?.() ?? focused;
         sync();
@@ -65,48 +66,45 @@ export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal,
         timer = schedule(() => {
           if (disposed || !Atomics.load(header, 3)) { return; }
           if (context.currentTime > lastClock) { lastClock = context.currentTime; lastAdvance = now(); }
-          else if (now() - lastAdvance > 2000) {
-            fail('The browser audio clock stopped. Check the output device, then select Enable audio to retry.');
-            return;
-          }
-          const sample = snapshot();
-          status.textContent = `Audio enabled. ${(sample.queuedFrames / 48).toFixed(0)} ms queued; ${sample.underrunFrames} underrun frames.`;
-          if (sample.fault) { fail(); }
+          else if (now() - lastAdvance > 2000) { fail(); return; }
+          if (Atomics.load(header, 7)) { fail(); }
         }, 1000);
-        button.disabled = false;
       } catch { if (!disposed) { fail(); } }
       finally { pending = undefined; }
     })();
     return pending;
   };
-  const click = () => { void enable(); };
+  const gesture = () => { if (!playing()) { void enable(); } };
   const blur = () => { focused = false; sync(); };
   const focus = () => { focused = true; sync(); };
+  const setVolume = value => {
+    level = clampVolume(value);
+    if (gain) { gain.gain.value = level; }
+  };
   let closing;
   const dispose = () => {
     if (disposed) { return closing; }
     disposed = true;
     flush();
     cancel(timer);
-    button.disabled = true;
-    button.removeEventListener('click', click);
+    for (const type of gestures) { window.removeEventListener(type, gesture, true); }
     document.removeEventListener('visibilitychange', sync);
     window.removeEventListener('blur', blur);
     window.removeEventListener('focus', focus);
     signal?.removeEventListener('abort', dispose);
     node?.removeEventListener('processorerror', fail);
     node?.disconnect();
+    gain?.disconnect();
     context?.removeEventListener('statechange', sync);
     closing = context?.close().catch(() => {});
     return closing;
   };
   flush();
-  button.disabled = false;
-  status.textContent = 'Select Enable audio to hear speech, music and effects.';
-  button.addEventListener('click', click);
+  for (const type of gestures) { window.addEventListener(type, gesture, true); }
   document.addEventListener('visibilitychange', sync);
   window.addEventListener('blur', blur);
   window.addEventListener('focus', focus);
   signal?.addEventListener('abort', dispose, { once: true });
-  return Object.freeze({ enable, dispose, snapshot });
+  void enable();
+  return Object.freeze({ enable, dispose, snapshot, setVolume });
 };

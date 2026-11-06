@@ -12,21 +12,18 @@ const fixture = async () => {
   const window = new EventTarget();
   const canvas = { focus() {}, requestPointerLock: async () => { document.pointerLockElement = canvas; document.dispatchEvent(new Event('pointerlockchange')); } };
   const capture = new EventTarget();
-  const unlock = new EventTarget();
-  const sensitivity = new EventTarget();
-  sensitivity.value = '1';
-  const status = {};
+  const settings = { sensitivity: 1, invertY: false };
   document.hidden = false;
   document.hasFocus = () => true;
   document.exitPointerLock = () => { document.pointerLockElement = null; document.dispatchEvent(new Event('pointerlockchange')); };
   let now = 100, cleared = 0;
-  const controls = createMissionControls({ buffer, byteOffset: 4, document, window, canvas, capture, unlock, sensitivity, status, now: () => now, clear: () => { ++cleared; } });
+  const controls = createMissionControls({ buffer, byteOffset: 4, document, window, canvas, capture, sensitivity: () => settings.sensitivity, invertY: () => settings.invertY, now: () => now, clear: () => { ++cleared; } });
   const move = (movementX, movementY) => {
     const event = new Event('mousemove');
     Object.assign(event, { movementX, movementY });
     document.dispatchEvent(event);
   };
-  return { controls, words, document, window, canvas, capture, unlock, sensitivity, status, move, advance: value => { now += value; }, cleared: () => cleared };
+  return { controls, words, document, window, canvas, capture, settings, move, advance: value => { now += value; }, cleared: () => cleared };
 };
 test('relative motion needs gesture lock and sensitivity, unlock clears deltas and keyboard', async () => {
   const f = await fixture();
@@ -34,16 +31,40 @@ test('relative motion needs gesture lock and sensitivity, unlock clears deltas a
   assert.deepEqual([...f.words].slice(0, 3), [0, 0, 0]);
   f.capture.dispatchEvent(new Event('click'));
   await Promise.resolve();
-  f.sensitivity.value = '2';
+  f.settings.sensitivity = 2;
   f.move(1.5, -3);
   assert.deepEqual([...f.words].slice(0, 2), [3000, -6000]);
-  f.unlock.dispatchEvent(new Event('click'));
+  f.document.exitPointerLock();
   assert.deepEqual([...f.words].slice(0, 2), [0, 0]);
   assert.ok(f.cleared() > 0);
   f.move(20, 20);
   assert.equal(f.words[0], 0);
   f.controls.dispose();
-  assert.equal(f.capture.disabled, true);
+});
+test('inverted look negates vertical motion only', async () => {
+  const f = await fixture();
+  f.capture.dispatchEvent(new Event('click'));
+  await Promise.resolve();
+  f.settings.invertY = true;
+  f.move(2, 3);
+  assert.deepEqual([...f.words].slice(0, 2), [2000, -3000]);
+  f.controls.dispose();
+});
+test('suspending holds the simulation like a background window and releases the pointer', async () => {
+  const f = await fixture();
+  f.capture.dispatchEvent(new Event('click'));
+  await Promise.resolve();
+  f.controls.setSuspended(true);
+  assert.equal(f.words[2], 1);
+  assert.equal(f.document.pointerLockElement, null);
+  f.capture.dispatchEvent(new Event('click'));
+  await Promise.resolve();
+  assert.equal(f.document.pointerLockElement, null);
+  f.advance(2500);
+  f.controls.setSuspended(false);
+  assert.equal(f.words[2], 0);
+  assert.equal(f.words[4], 2500);
+  f.controls.dispose();
 });
 test('background duration is bounded shared state and focus resumes without replay', async () => {
   const f = await fixture();
@@ -74,8 +95,11 @@ test('denial recovers, abort removes listeners, malformed and overlapping storag
   f.canvas.requestPointerLock = async () => { throw new Error('denied'); };
   f.capture.dispatchEvent(new Event('click'));
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.match(f.status.textContent, /denied|available|capture/i);
-  assert.equal(f.capture.disabled, false);
+  assert.equal(f.document.pointerLockElement, undefined);
+  f.canvas.requestPointerLock = async () => { f.document.pointerLockElement = f.canvas; f.document.dispatchEvent(new Event('pointerlockchange')); };
+  f.capture.dispatchEvent(new Event('click'));
+  await Promise.resolve();
+  assert.equal(f.document.pointerLockElement, f.canvas);
   f.controls.dispose();
   const { createMissionControls } = await load();
   assert.throws(() => createMissionControls({ buffer: new ArrayBuffer(32), byteOffset: 0 }), /shared/i);

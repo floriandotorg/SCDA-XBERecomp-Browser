@@ -3,55 +3,187 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Story menu development</title>
+  <meta name="color-scheme" content="dark">
+  <title>Deep Cover</title>
   <style>
-    :root { color-scheme: light dark; font: 1rem/1.5 system-ui, sans-serif; }
-    body { max-width: 64rem; margin: 2rem auto; padding: 0 1rem; }
-    label, button, input { font: inherit; }
-    button { padding: .5rem 1.25rem; margin-right: .5rem; }
-    canvas { display: block; width: 100%; height: auto; aspect-ratio: 4/3; background: black; }
-    canvas:focus-visible { outline: 2px solid Highlight; outline-offset: 4px; }
-    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-    #detail { overflow-wrap: anywhere; }
+    :root {
+      --frame: #56645a;
+      --frame-dark: #2b322d;
+      --head: #b6dca6;
+      --item: #c6cdc3;
+      --item-dim: #7f877d;
+      --bar: linear-gradient(180deg, #78966f 0%, #5f7d59 55%, #55714f 100%);
+      --alert: #e0b36a;
+      --face: "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      color-scheme: dark;
+      background: #000;
+      color: var(--item);
+      font: 700 15px/1.3 var(--face);
+      font-size: clamp(14px, calc(1.1vw + 2px), 24px);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+    body { user-select: none; -webkit-font-smoothing: antialiased; }
+    [hidden] { display: none !important; }
+    button { font: inherit; color: inherit; }
+
+    #stage { position: fixed; inset: 0; display: grid; place-items: center; background: #000; }
+    #game { display: block; width: var(--frame-width, 640px); height: var(--frame-height, 480px); outline: none; background: #000; }
+    #stage[data-filter="sharp"] #game { image-rendering: pixelated; }
+    body[data-screen="game"][data-cursor="idle"] { cursor: none; }
+
+    .layer { position: fixed; inset: 0; opacity: 0; visibility: hidden; transition: opacity .25s ease, visibility 0s linear .25s; }
+    .layer.shown { opacity: 1; visibility: visible; transition: opacity .25s ease, visibility 0s; }
+
+    #front { background: #000; }
+    body[data-screen="game"] #front { display: none; }
+    .backdrop { position: absolute; inset: 9vh 0; pointer-events: none;
+      background: radial-gradient(70% 90% at 72% 45%, #1b241e 0%, #0d120f 45%, #050706 100%);
+      border-top: 1px solid #111; border-bottom: 1px solid #111; }
+    .backdrop::after { content: ""; position: absolute; inset: 0;
+      background: repeating-linear-gradient(to bottom, rgba(0, 0, 0, .22) 0 1px, transparent 1px 3px); }
+
+    .title-screen { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2.2rem; }
+    body:not([data-screen="title"]) .title-screen, body[data-panel="settings"] .title-screen { opacity: 0; pointer-events: none; }
+    .logo { display: flex; flex-direction: column; align-items: center; gap: .35rem; transform: skewX(-8deg); }
+    .logo h1 { margin: 0; font: 900 clamp(2.6rem, 6vw, 4.6rem)/.9 "Arial Black", "Helvetica Neue", Arial, sans-serif; letter-spacing: -.01em; text-transform: uppercase;
+      background: linear-gradient(180deg, #f2f2f0 0%, #c9cbc8 45%, #7d817c 52%, #b3b6b2 100%); -webkit-background-clip: text; background-clip: text; color: transparent;
+      filter: drop-shadow(0 2px 0 #000) drop-shadow(0 0 1px #000); }
+    .logo span { padding: .12rem .7rem .08rem; font: 900 .95rem/1.1 "Arial Black", Arial, sans-serif; letter-spacing: .06em; text-transform: uppercase;
+      color: #c8e26a; background: #1f2a10; border: 2px solid #8fae3a; box-shadow: inset 0 0 0 1px #000; }
+
+    .box { position: relative; width: min(29rem, calc(100vw - 2rem)); max-height: calc(100vh - 2rem); overflow: auto;
+      padding: .9rem 1.1rem 1.1rem; background: rgba(4, 6, 5, .86); border: 1px solid var(--frame); box-shadow: inset 0 0 0 1px #000, 0 0 0 1px #000; }
+    .box.wide { width: min(40rem, calc(100vw - 2rem)); }
+    .box h2 { margin: 0 0 .7rem; padding: 0 .2rem .35rem; font: italic 700 1.15rem/1 var(--face); text-transform: uppercase; color: var(--head);
+      border-bottom: 2px solid #6e7a6f; box-shadow: 0 1px 0 #000; }
+
+    .menu { display: flex; flex-direction: column; gap: .2rem; }
+    .menu button, .actions button {
+      all: unset; position: relative; display: flex; align-items: center; gap: .75rem; padding: .38rem .6rem;
+      font: 700 .82rem/1.2 var(--face); letter-spacing: .03em; text-transform: uppercase; color: var(--item); cursor: pointer;
+    }
+    .menu button::before, .actions button::before, .row::before {
+      content: ""; flex: none; width: .45rem; height: .7rem; border-radius: 2px; background: #1b1f1b; border: 1px solid #3c433c;
+    }
+    .menu button:focus, .actions button:focus, .row:focus-within { background: var(--bar); color: #f3f6f1; }
+    .menu button:focus::before, .actions button:focus::before, .row:focus-within::before {
+      border: 0; border-radius: 0; width: .5rem; height: .65rem; background: #e4e8e2; clip-path: polygon(0 0, 100% 50%, 0 100%);
+    }
+    .menu button:disabled { color: #4d544c; cursor: default; }
+
+    .center { display: grid; place-items: center; z-index: 2; }
+    #loading { background: #000; }
+    .loading { position: absolute; right: 6vw; bottom: 12vh; display: flex; flex-direction: column; align-items: flex-end; gap: .5rem; }
+    .loading p { margin: 0; font: italic 700 1rem/1 var(--face); text-transform: uppercase; color: var(--head); }
+    .bar { position: relative; width: 12rem; height: 4px; background: #1b1f1b; border: 1px solid var(--frame); overflow: hidden; }
+    .bar::after { content: ""; position: absolute; top: 0; bottom: 0; width: 30%; background: #6f8f6a; animation: seek 1.4s ease-in-out infinite alternate; }
+
+    .shade { z-index: 3; background: rgba(0, 0, 0, .6); }
+    body[data-screen="title"] #settings { background: transparent; }
+
+    .tabs { display: flex; gap: 1.2rem; margin: -.2rem .2rem .6rem; }
+    .tabs button { all: unset; cursor: pointer; padding: .2rem 0; font: 700 .78rem/1 var(--face); text-transform: uppercase; color: var(--item-dim); border-bottom: 2px solid transparent; }
+    .tabs button[aria-selected="true"] { color: var(--head); border-bottom-color: #6f8f6a; }
+    .tabs button:focus { color: #f3f6f1; border-bottom-color: #9fc496; }
+
+    .rows { display: flex; flex-direction: column; gap: .2rem; min-height: 9rem; }
+    .row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: .75rem; padding: .32rem .6rem; font-size: .82rem; text-transform: uppercase; color: var(--item); }
+    .cycler { all: unset; cursor: pointer; display: grid; grid-template-columns: 1rem 1fr 1rem; align-items: center; width: 11rem; text-align: center; font: inherit; text-transform: uppercase; }
+    .cycler i { font-style: normal; color: var(--item-dim); }
+    .row:focus-within .cycler i { color: #f3f6f1; }
+    .slider { display: grid; grid-template-columns: 1fr 2.6rem; align-items: center; gap: .6rem; width: 11rem; }
+    .slider output { font: 700 .8rem/1 var(--face); text-align: right; }
+    input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; height: 1rem; background: transparent; cursor: pointer; margin: 0; outline: none; }
+    input[type="range"]::-webkit-slider-runnable-track { height: 5px; border: 1px solid #3c433c; background: linear-gradient(90deg, #a9c3a2 var(--fill, 50%), #151815 var(--fill, 50%)); }
+    input[type="range"]::-moz-range-track { height: 5px; border: 1px solid #3c433c; background: linear-gradient(90deg, #a9c3a2 var(--fill, 50%), #151815 var(--fill, 50%)); }
+    input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: .45rem; height: .9rem; margin-top: -.3rem; background: #e4e8e2; border: 1px solid #000; }
+    input[type="range"]::-moz-range-thumb { width: .45rem; height: .9rem; border: 1px solid #000; border-radius: 0; background: #e4e8e2; }
+    .keys { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 1.6rem; margin: .7rem 0 0; padding: .6rem .6rem 0; border-top: 1px solid var(--frame-dark); }
+    .keys div { display: flex; justify-content: space-between; gap: 1rem; padding: .18rem 0; font: 700 .72rem/1.2 var(--face); text-transform: uppercase; color: var(--item-dim); }
+    .keys kbd { font: inherit; color: var(--item); }
+
+    .actions { display: flex; justify-content: space-between; gap: .4rem; margin-top: .8rem; padding-top: .6rem; border-top: 1px solid var(--frame-dark); }
+    .actions.stack { flex-direction: column; margin-top: 0; padding-top: 0; border-top: 0; gap: .2rem; }
+
+    #error h2 { color: var(--alert); }
+    #detail { margin: 0 .2rem; font: 400 .78rem/1.5 var(--mono); color: var(--item); overflow-wrap: anywhere; user-select: text; max-height: 40vh; overflow: auto; }
+
+    #gear {
+      all: unset; position: fixed; top: 1rem; right: 1rem; z-index: 2; width: 2rem; height: 2rem; display: grid; place-items: center; cursor: pointer;
+      color: var(--item); background: rgba(0, 0, 0, .7); border: 1px solid var(--frame); opacity: 0; pointer-events: none; transition: opacity .3s;
+    }
+    #gear:hover, #gear:focus { background: #5f7d59; color: #fff; }
+    body[data-screen="game"][data-panel="none"][data-cursor="active"] #gear { opacity: 1; pointer-events: auto; }
+    #gear svg { width: 1.1rem; height: 1.1rem; }
+
+    #fps { position: fixed; top: .8rem; left: .9rem; z-index: 4; padding: .3rem .55rem; font: 500 .78rem/1 var(--mono); color: #b6dca6; background: rgba(0, 0, 0, .65); pointer-events: none; }
+    #gpu { position: fixed; top: .8rem; right: .9rem; z-index: 4; width: min(28rem, 45vw); max-height: 70vh; overflow: auto; margin: 0; padding: .7rem .8rem; font: 400 .68rem/1.35 var(--mono); color: #b6dca6; background: rgba(0, 0, 0, .8); border: 1px solid var(--frame); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+
+    @keyframes seek { from { left: 0; } to { left: 70%; } }
+    @media (prefers-reduced-motion: reduce) { .bar::after { animation: none; } }
   </style>
 </head>
-<body>
-  <main>
-    <h1>Story menu development</h1>
-    <p>This host page starts the original guest code. Only the canvas below contains game output. An empty canvas or a diagnostic is not a working menu.</p>
-    <label for="iso">Select ISO</label>
-    <input id="iso" type="file" accept=".iso,application/x-iso9660-image" aria-describedby="selected privacy">
-    <p id="selected">No ISO selected.</p>
-    <p id="privacy">Your ISO stays on this device and is read only. Stop keeps the selection for another attempt.</p>
-    <p>Storage is temporary and bounded. Stop or refresh discards cache, profile and save writes. Mission reloads keep session data. Durable saves are not available.</p>
-    <div role="group" aria-label="Host controls">
-      <label><input id="development-start" type="checkbox"> Development: start Iceland without the title and profile menus</label>
-      <p>Development start bypasses the front end for debugging. Level loading still runs. Use a normal start to verify the complete game flow.</p>
-      <button id="boot" type="button" disabled>Start</button>
-      <button id="stop" type="button" disabled>Stop</button>
-    </div>
-    <div role="group" aria-label="Camera controls">
-      <button id="capture" type="button" disabled>Capture mouse</button>
-      <button id="unlock" type="button" disabled>Unlock mouse</button>
-      <label for="sensitivity">Mouse sensitivity</label>
-      <input id="sensitivity" type="range" min="0.05" max="10" step="0.05" value="1">
-      <p id="capture-status" role="status">Start a mission session to enable mouse capture.</p>
-    </div>
-    <div role="group" aria-label="Audio controls">
-      <button id="enable-audio" type="button" disabled>Enable audio</button>
-      <p id="audio-status" role="status">Start a mission session to enable audio.</p>
-    </div>
-    <p id="status" role="status" aria-live="polite" aria-atomic="true">Select an ISO to begin.</p>
-    <p id="loading" role="status" aria-live="polite"></p>
-    <p id="detail" role="alert" aria-atomic="true"></p>
-    <p id="keys">Game keys: WASD moves and arrows navigate. Enter starts or pauses, Space or Z confirms. Capture mouse to look around; Escape unlocks it. When unlocked, Escape or Backspace returns. C crouches, Shift jumps, F presses the left stick (back to wall), 1 presses the right stick (EEV/scope), and Tab opens OPSAT. 2/3/4/5 press left/right/up/down for vision and gadget views. X and Y press those controller buttons; Q/E press Black/White and [/] press the left/right triggers. Standard gamepads also work, including both analog sticks and triggers. Focus the canvas to play. Switching windows or focusing host controls releases held buttons.</p>
-    <canvas id="game" width="640" height="480" tabindex="0" aria-label="Original game output" aria-describedby="keys"></canvas>
-    <details>
-      <summary>WebGPU diagnostics</summary>
-      <pre id="gpu">No GPU service is active.</pre>
-    </details>
-    <noscript>JavaScript is required to run a selected ISO.</noscript>
-  </main>
+<body data-screen="title" data-panel="none">
+  <div id="stage"><canvas id="game" width="640" height="480" tabindex="-1" aria-label="Game"></canvas></div>
+
+  <div id="front" class="layer shown">
+    <div class="backdrop" aria-hidden="true"></div>
+    <main class="title-screen">
+      <header class="logo"><h1>Deep Cover</h1><span>Recompiled</span></header>
+      <section class="box">
+        <h2>Main menu</h2>
+        <nav class="menu" id="main-menu" aria-label="Main menu">
+          <button id="boot" type="button" data-nav>Start game</button>
+          <button type="button" data-nav data-action="settings">Options</button>
+        </nav>
+      </section>
+    </main>
+  </div>
+
+  <div id="loading" class="layer" role="status" aria-label="Loading">
+    <div class="loading"><p>Loading</p><div class="bar"></div></div>
+  </div>
+
+  <div id="error" class="layer center shade" role="alertdialog" aria-labelledby="error-title">
+    <section class="box">
+      <h2 id="error-title">Error</h2>
+      <p id="detail" role="alert"></p>
+      <div class="actions"><button type="button" data-nav data-action="dismiss">Back</button></div>
+    </section>
+  </div>
+
+  <div id="pause" class="layer center shade" role="dialog" aria-labelledby="pause-title">
+    <section class="box">
+      <h2 id="pause-title">Paused</h2>
+      <div class="actions stack">
+        <button type="button" data-nav data-action="resume">Resume</button>
+        <button type="button" data-nav data-action="settings">Options</button>
+        <button type="button" data-nav data-action="quit">Quit to main menu</button>
+      </div>
+    </section>
+  </div>
+
+  <div id="settings" class="layer center shade" role="dialog" aria-labelledby="settings-title">
+    <section class="box wide">
+      <h2 id="settings-title">Options</h2>
+      <div class="tabs" role="tablist"></div>
+      <div class="rows"></div>
+      <div class="actions">
+        <button type="button" data-nav data-action="back">Back</button>
+        <button type="button" data-nav data-action="reset">Default settings</button>
+      </div>
+    </section>
+  </div>
+
+  <button id="gear" type="button" aria-label="Pause and settings">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7"/></svg>
+  </button>
+  <div id="fps" hidden></div>
+  <pre id="gpu" hidden></pre>
+  <input id="iso" type="file" accept=".iso,application/x-iso9660-image" hidden>
+  <noscript>JavaScript is required.</noscript>
   <script type="module">
     import { mountMenuShell } from './menu-shell.mjs';
     const shell = mountMenuShell();

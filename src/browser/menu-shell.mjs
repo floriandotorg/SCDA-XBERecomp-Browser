@@ -1,21 +1,315 @@
-import { mountBootShell } from './boot-shell.mjs';
+import { createShellController } from './boot-shell.mjs';
 import { createMenuRuntime } from './menu-runtime.mjs';
 import { createMissionMetrics } from './mission-metrics.mjs';
+import { createMissionControls } from './mission-controls.mjs';
+import { createBrowserAudio } from './browser-audio.mjs';
+import { createSettings, SETTINGS } from './settings.mjs';
 
-export const mountMenuShell = ({ root = document } = {}) => {
-  const diagnostic = root.querySelector('#gpu');
-  let canvas = root.querySelector('#game');
-  if (!diagnostic || !canvas) { throw new Error('Menu canvas and diagnostics are required.'); }
-  let evidence;
-  let started;
-  let lastUpdated = 0;
+const FRAME = Object.freeze({ width: 640, height: 480 });
+const onOff = Object.freeze({ true: 'On', false: 'Off' });
+const TABS = Object.freeze([
+  { id: 'display', label: 'Display', rows: [
+    { setting: 'scaling', label: 'Picture', values: { fit: 'Fit to window', integer: 'Pixel perfect', stretch: 'Stretch' } },
+    { setting: 'filter', label: 'Upscaling', values: { smooth: 'Smooth', sharp: 'Sharp' } },
+    { fullscreen: true, label: 'Fullscreen' },
+  ] },
+  { id: 'audio', label: 'Audio', rows: [{ setting: 'volume', label: 'Master volume', format: value => `${value}%` }] },
+  { id: 'controls', label: 'Controls', rows: [
+    { setting: 'sensitivity', label: 'Mouse sensitivity', format: value => value.toFixed(1) },
+    { setting: 'invertY', label: 'Invert look' },
+  ], keys: [['Move', 'W A S D'], ['Look', 'Mouse'], ['Confirm', 'Space / Z'], ['Back', 'Esc / Backspace'], ['Game pause', 'Enter'],
+    ['Settings', 'F1 / P'], ['Crouch', 'C'], ['Jump', 'Shift'], ['Back to wall', 'F'], ['Scope', '1'], ['Vision and gadgets', '2 3 4 5'],
+    ['OPSAT', 'Tab'], ['X / Y', 'X / Y'], ['Black / White', 'Q / E'], ['Triggers', '[ / ]'], ['Navigate', 'Arrows']] },
+  { id: 'developer', label: 'Developer', rows: [
+    { setting: 'developmentStart', label: 'Skip to first mission' },
+    { setting: 'showFps', label: 'Frame rate' },
+    { setting: 'showDiagnostics', label: 'Diagnostics' },
+  ] },
+]);
+
+const createDiscStore = (indexedDB = globalThis.indexedDB) => {
+  const run = async (mode, action) => {
+    if (!indexedDB) { return undefined; }
+    const database = await new Promise((resolve, reject) => {
+      const request = indexedDB.open('scda-front-end', 1);
+      request.onupgradeneeded = () => { request.result.createObjectStore('disc'); };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      return await new Promise((resolve, reject) => {
+        const request = action(database.transaction('disc', mode).objectStore('disc'));
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    } finally { database.close(); }
+  };
+  return Object.freeze({
+    load: () => run('readonly', store => store.get('handle')),
+    save: handle => run('readwrite', store => store.put(handle, 'handle')),
+  });
+};
+
+export const mountMenuShell = ({ root = document, window = globalThis.window, settings = createSettings(), discs = createDiscStore() } = {}) => {
+  const find = selector => {
+    const element = root.querySelector(selector);
+    if (!element) { throw new Error(`Menu shell element ${selector} is missing.`); }
+    return element;
+  };
+  const body = root.body;
+  const stage = find('#stage'), input = find('#iso'), boot = find('#boot');
+  const detail = find('#detail'), diagnostic = find('#gpu'), fps = find('#fps'), gear = find('#gear');
+  const front = find('#front'), mainMenu = find('#main-menu'), loadingLayer = find('#loading'), errorLayer = find('#error');
+  const pauseLayer = find('#pause'), settingsLayer = find('#settings');
+  const tabList = settingsLayer.querySelector('.tabs'), rowList = settingsLayer.querySelector('.rows');
+  let canvas = find('#game');
+  let screen = 'title', panel = 'none', settingsReturn = 'none', tab = TABS[0].id;
+  let presented = false, dismissed = false, quitting = false, pickToStart = false;
+  let handle, motion, audio, idleTimer, padFrame, padPrevious = new Set();
+  let started = 0, lastUpdated = 0, fpsFrames = 0, fpsSince = 0;
   const measurement = createMissionMetrics();
-  const suspend = () => { measurement.suspend(); };
-  globalThis.addEventListener('blur', suspend);
-  root.addEventListener('visibilitychange', suspend);
-  const update = () => { evidence.performance = measurement.snapshot(); diagnostic.textContent = JSON.stringify(evidence, null, 2); };
-  const shell = mountBootShell({ root, createRuntime: () => createMenuRuntime({
-    developmentStart: root.querySelector('#development-start')?.checked === true,
+  const createEvidence = () => ({ developmentStart: settings.get('developmentStart'), renderedFrames: 0, firstPresentedFrameMilliseconds: null,
+    adapter: null, validationErrors: [], resources: null, get performance() { return measurement.snapshot(); } });
+  let evidence = createEvidence();
+
+  const showDiagnostics = () => {
+    diagnostic.hidden = !settings.get('showDiagnostics');
+    if (!diagnostic.hidden) { diagnostic.textContent = JSON.stringify(evidence, null, 2); }
+  };
+  const layout = () => {
+    const mode = settings.get('scaling');
+    const width = window.innerWidth, height = window.innerHeight, ratio = window.devicePixelRatio || 1;
+    let frameWidth = width, frameHeight = height;
+    if (mode !== 'stretch') {
+      const fit = Math.min(width / FRAME.width, height / FRAME.height);
+      const whole = Math.floor(fit * ratio);
+      const scale = mode === 'integer' && whole >= 1 ? whole / ratio : fit;
+      frameWidth = FRAME.width * scale;
+      frameHeight = FRAME.height * scale;
+    }
+    stage.style.setProperty('--frame-width', `${frameWidth}px`);
+    stage.style.setProperty('--frame-height', `${frameHeight}px`);
+    stage.dataset.filter = settings.get('filter');
+  };
+
+  const activeLayer = () => panel === 'settings' ? settingsLayer : panel === 'pause' ? pauseLayer :
+    screen === 'error' ? errorLayer : screen === 'title' ? mainMenu : undefined;
+  const stops = () => [...(activeLayer()?.querySelectorAll('[data-nav]') ?? [])]
+    .filter(element => !element.disabled && element.getClientRects().length > 0);
+  const focusDefault = () => {
+    const layer = activeLayer();
+    if (!layer) {
+      if (screen === 'game') { canvas.focus({ preventScroll: true }); }
+      return;
+    }
+    const preferred = layer === mainMenu && !boot.disabled ? boot : stops()[0];
+    preferred?.focus({ preventScroll: true });
+  };
+  const moveFocus = direction => {
+    const list = stops();
+    if (!list.length) { return; }
+    const index = list.indexOf(root.activeElement);
+    const next = index < 0 ? (direction > 0 ? 0 : list.length - 1) : (index + direction + list.length) % list.length;
+    list[next].focus({ preventScroll: true });
+  };
+
+  const choiceText = row => row.fullscreen ? onOff[Boolean(root.fullscreenElement)] :
+    row.values ? row.values[settings.get(row.setting)] : onOff[settings.get(row.setting)];
+  const toggleFullscreen = () => {
+    const request = root.fullscreenElement ? root.exitFullscreen() : root.documentElement.requestFullscreen();
+    void request?.catch(() => {});
+  };
+  const step = (row, direction) => {
+    if (row.fullscreen) { toggleFullscreen(); return; }
+    const options = SETTINGS[row.setting].options;
+    if (!options) { settings.set(row.setting, !settings.get(row.setting)); return; }
+    const index = options.indexOf(settings.get(row.setting));
+    settings.set(row.setting, options[(index + direction + options.length) % options.length]);
+  };
+  const rowsOf = () => TABS.find(entry => entry.id === tab);
+  const refreshRows = () => {
+    for (const element of rowList.querySelectorAll('[data-row]')) {
+      const row = rowsOf().rows[Number(element.dataset.row)];
+      if (row.format) {
+        const setting = SETTINGS[row.setting], value = settings.get(row.setting);
+        element.value = String(value);
+        element.style.setProperty('--fill', `${(value - setting.min) / (setting.max - setting.min) * 100}%`);
+        element.nextElementSibling.textContent = row.format(value);
+      } else { element.querySelector('b').textContent = choiceText(row); }
+    }
+  };
+  const renderSettings = () => {
+    tabList.replaceChildren(...TABS.map(entry => {
+      const button = root.createElement('button');
+      Object.assign(button, { type: 'button', textContent: entry.label, tabIndex: entry.id === tab ? 0 : -1 });
+      button.setAttribute('role', 'tab');
+      button.setAttribute('aria-selected', String(entry.id === tab));
+      button.dataset.tab = entry.id;
+      if (entry.id === tab) { button.dataset.nav = ''; }
+      return button;
+    }));
+    const current = rowsOf();
+    rowList.replaceChildren(...current.rows.map((row, index) => {
+      const line = root.createElement('label');
+      line.className = 'row';
+      const name = root.createElement('span');
+      name.textContent = row.label;
+      if (row.format) {
+        const setting = SETTINGS[row.setting];
+        const holder = root.createElement('div');
+        holder.className = 'slider';
+        const range = root.createElement('input');
+        Object.assign(range, { type: 'range', min: String(setting.min), max: String(setting.max), step: String(setting.step) });
+        range.dataset.nav = '';
+        range.dataset.row = String(index);
+        range.addEventListener('input', () => { settings.set(row.setting, range.value); });
+        holder.append(range, root.createElement('output'));
+        line.append(name, holder);
+      } else {
+        const cycler = root.createElement('button');
+        cycler.type = 'button';
+        cycler.className = 'cycler';
+        cycler.dataset.nav = '';
+        cycler.dataset.row = String(index);
+        const previous = root.createElement('i'), value = root.createElement('b'), next = root.createElement('i');
+        previous.textContent = '‹';
+        next.textContent = '›';
+        previous.dataset.direction = '-1';
+        cycler.append(previous, value, next);
+        cycler.addEventListener('click', event => { step(row, event.target.closest?.('[data-direction]') ? -1 : 1); });
+        line.append(name, cycler);
+      }
+      return line;
+    }));
+    if (current.keys) {
+      const list = root.createElement('div');
+      list.className = 'keys';
+      list.append(...current.keys.map(([action, keys]) => {
+        const entry = root.createElement('div');
+        const label = root.createElement('span'), key = root.createElement('kbd');
+        label.textContent = action;
+        key.textContent = keys;
+        entry.append(label, key);
+        return entry;
+      }));
+      rowList.append(list);
+    }
+    refreshRows();
+  };
+  const selectTab = (id, focus = true) => {
+    tab = id;
+    renderSettings();
+    if (focus) { tabList.querySelector('[data-nav]')?.focus({ preventScroll: true }); }
+  };
+  const adjust = (direction, ranges) => {
+    const element = root.activeElement;
+    if (element?.dataset.tab !== undefined) {
+      const index = TABS.findIndex(entry => entry.id === tab);
+      selectTab(TABS[(index + direction + TABS.length) % TABS.length].id);
+    } else if (element?.classList.contains('cycler')) {
+      step(rowsOf().rows[Number(element.dataset.row)], direction);
+    } else if (ranges && element?.type === 'range') {
+      if (direction > 0) { element.stepUp(); } else { element.stepDown(); }
+      element.dispatchEvent(new Event('input'));
+    }
+  };
+
+  const pollPad = () => {
+    padFrame = undefined;
+    if (!activeLayer()) { padPrevious = new Set(); return; }
+    padFrame = window.requestAnimationFrame(pollPad);
+    let pad;
+    try { pad = Array.from(window.navigator.getGamepads?.() ?? []).find(value => value?.connected); }
+    catch {}
+    if (!pad || !root.hasFocus()) { padPrevious = new Set(); return; }
+    const pressed = new Set();
+    pad.buttons.forEach((button, n) => { if (button.pressed) { pressed.add(n); } });
+    const [x = 0, y = 0] = pad.axes;
+    if (y < -0.6) { pressed.add('up'); }
+    if (y > 0.6) { pressed.add('down'); }
+    if (x < -0.6) { pressed.add('left'); }
+    if (x > 0.6) { pressed.add('right'); }
+    const fresh = (...keys) => keys.some(key => pressed.has(key) && !padPrevious.has(key));
+    padPrevious = pressed;
+    if (fresh(12, 'up')) { moveFocus(-1); }
+    if (fresh(13, 'down')) { moveFocus(1); }
+    if (fresh(14, 'left')) { adjust(-1, true); }
+    if (fresh(15, 'right')) { adjust(1, true); }
+    if (fresh(0)) { root.activeElement?.click?.(); }
+    if (fresh(1)) { back(); }
+  };
+
+  const show = () => {
+    body.dataset.screen = screen;
+    body.dataset.panel = panel;
+    front.classList.toggle('shown', screen !== 'game');
+    loadingLayer.classList.toggle('shown', screen === 'loading');
+    errorLayer.classList.toggle('shown', screen === 'error');
+    pauseLayer.classList.toggle('shown', panel === 'pause');
+    settingsLayer.classList.toggle('shown', panel === 'settings');
+    fps.hidden = !(settings.get('showFps') && screen === 'game');
+    motion?.setSuspended(screen === 'game' && panel !== 'none');
+    if (activeLayer() && padFrame === undefined) { padFrame = window.requestAnimationFrame(pollPad); }
+  };
+  const setPanel = next => {
+    panel = next === 'pause' && screen !== 'game' ? 'none' : next;
+    show();
+    focusDefault();
+  };
+  const setScreen = next => {
+    if (next === screen) { return; }
+    screen = next;
+    if (panel === 'pause' && screen !== 'game') { panel = 'none'; }
+    show();
+    focusDefault();
+  };
+  const openSettings = () => {
+    settingsReturn = panel;
+    renderSettings();
+    setPanel('settings');
+  };
+  const resume = () => {
+    setPanel('none');
+    if (motion) { stage.click(); }
+  };
+  const quit = () => {
+    quitting = true;
+    panel = 'none';
+    void controller.stop();
+  };
+  const back = () => {
+    if (panel === 'settings') { setPanel(settingsReturn); }
+    else if (panel === 'pause') { resume(); }
+    else if (screen === 'error') { dismissed = true; render(controller.state); }
+  };
+
+  const render = state => {
+    const active = ['validating', 'booting', 'running'].includes(state.phase);
+    boot.disabled = active || state.stopping || state.code === 'TEARDOWN';
+    boot.setAttribute('aria-busy', String(active || state.stopping));
+    if (!active && !state.stopping) { quitting = false; }
+    let next;
+    if (state.stopping) { next = quitting ? 'title' : screen; }
+    else if (active) { next = presented ? 'game' : 'loading'; }
+    else if (!dismissed && (state.phase === 'error' || (state.phase === 'stopped' && state.code !== 'CANCELLED'))) { next = 'error'; }
+    else { next = 'title'; }
+    detail.textContent = next === 'error' && state.message ? `${state.code}: ${state.message}` : '';
+    setScreen(next);
+    if (screen === 'title' && !mainMenu.contains(root.activeElement) && panel === 'none') { focusDefault(); }
+  };
+
+  const createMotion = options => {
+    motion = createMissionControls({ ...options, canvas, capture: stage,
+      sensitivity: () => settings.get('sensitivity'), invertY: () => settings.get('invertY') });
+    motion.setSuspended(screen === 'game' && panel !== 'none');
+    return motion;
+  };
+  const createAudio = options => {
+    audio = createBrowserAudio({ ...options, volume: settings.get('volume') / 100 });
+    return audio;
+  };
+  const controller = createShellController({ onChange: state => render(state), createRuntime: () => createMenuRuntime({
+    developmentStart: settings.get('developmentStart'), createMotion, createAudio,
     acquireCanvas: () => {
       if (!globalThis.navigator?.gpu || typeof canvas.transferControlToOffscreen !== 'function') {
         throw Object.assign(new Error('WebGPU and an offscreen canvas are required in this browser.'), { code: 'CAPABILITY' });
@@ -25,48 +319,187 @@ export const mountMenuShell = ({ root = document } = {}) => {
       canvas = replacement;
       started = performance.now();
       measurement.begin();
-      lastUpdated = started;
-      evidence = { developmentStart: root.querySelector('#development-start')?.checked === true,
-        renderedFrames: 0, firstPresentedFrameMilliseconds: null, adapter: null, validationErrors: [], resources: null };
-      update();
+      lastUpdated = fpsSince = started;
+      fpsFrames = 0;
+      evidence = createEvidence();
+      showDiagnostics();
       return canvas.transferControlToOffscreen();
     },
-    onAdapter: (details) => { evidence.adapter = details; update(); },
-    onPresented: (details) => {
+    onAdapter: details => { evidence.adapter = details; showDiagnostics(); },
+    onPresented: details => {
       const time = performance.now();
       measurement.present(time, details);
       ++evidence.renderedFrames;
       evidence.resources = details.resources;
       evidence.lastCompletedCommand = details.command;
       if (evidence.firstPresentedFrameMilliseconds === null) {
-        evidence.firstPresentedFrameMilliseconds = performance.now() - started;
-        canvas.focus({ preventScroll: true });
+        evidence.firstPresentedFrameMilliseconds = time - started;
+        presented = true;
       }
-      if (evidence.renderedFrames === 1 || time - lastUpdated >= 1000) { lastUpdated = time; update(); }
+      ++fpsFrames;
+      if (time - fpsSince >= 500) {
+        if (!fps.hidden) { fps.textContent = `${Math.round(fpsFrames * 1000 / (time - fpsSince))} FPS  ${((time - fpsSince) / fpsFrames).toFixed(1)} MS`; }
+        fpsFrames = 0;
+        fpsSince = time;
+      }
+      if (evidence.renderedFrames === 1 || time - lastUpdated >= 1000) { lastUpdated = time; showDiagnostics(); }
     },
-    onDiagnostic: (details) => {
-      if (details.io) {
-        evidence.io = details.io;
-        const loading = root.querySelector('#loading');
-        if (loading) { loading.textContent = `Read ${(details.io.bytesRead / 1048576).toFixed(1)} MiB from the ISO. ${details.io.active} active reads.`; }
-      }
+    onDiagnostic: details => {
+      if (details.io) { evidence.io = details.io; }
       else if (details.guest) { evidence.guest = details.guest; }
       else if (details.runtime) { evidence.runtime = details.runtime; }
       else {
         evidence.validationErrors.push(details);
         if (evidence.validationErrors.length > 16) { evidence.validationErrors.shift(); }
       }
-      update();
+      if (!details.io) { showDiagnostics(); }
     },
   }) });
-  return Object.freeze({ controller: shell.controller,
+
+  const select = async (file, start) => {
+    if (!file) { return; }
+    await controller.select(file);
+    if (start) { await begin(); }
+  };
+  const choose = async () => {
+    if (typeof window.showOpenFilePicker !== 'function') {
+      pickToStart = true;
+      input.click();
+      return;
+    }
+    let picked;
+    try { [picked] = await window.showOpenFilePicker({ id: 'disc', types: [{ description: 'Disc image', accept: { 'application/x-iso9660-image': ['.iso'] } }] }); }
+    catch { return; }
+    handle = picked;
+    void discs.save(picked).catch(() => {});
+    await select(await picked.getFile(), true);
+  };
+  const begin = async () => {
+    dismissed = false;
+    presented = false;
+    void controller.start();
+  };
+  const start = async () => {
+    if (controller.state.source) { await begin(); return; }
+    if (handle) {
+      try {
+        const granted = await handle.queryPermission({ mode: 'read' }) === 'granted' || await handle.requestPermission({ mode: 'read' }) === 'granted';
+        if (granted) { await select(await handle.getFile(), true); return; }
+      } catch { handle = undefined; }
+    }
+    await choose();
+  };
+
+  const clicks = event => {
+    const action = event.target.closest?.('[data-action]')?.dataset.action;
+    const tabButton = event.target.closest?.('[data-tab]');
+    if (tabButton) { selectTab(tabButton.dataset.tab); }
+    else if (action === 'settings') { openSettings(); }
+    else if (action === 'back') { back(); }
+    else if (action === 'reset') { settings.reset(); }
+    else if (action === 'resume') { resume(); }
+    else if (action === 'quit') { quit(); }
+    else if (action === 'dismiss') { back(); }
+  };
+  const keydown = event => {
+    const settingsKey = event.code === 'F1' || event.code === 'KeyP';
+    if (screen === 'game' && panel === 'none') {
+      if (settingsKey) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setPanel('pause');
+      }
+      return;
+    }
+    if (!activeLayer()) { return; }
+    if (screen === 'game') { event.stopImmediatePropagation(); }
+    const element = root.activeElement;
+    if (event.code === 'ArrowUp' || event.code === 'ArrowDown') {
+      event.preventDefault();
+      moveFocus(event.code === 'ArrowDown' ? 1 : -1);
+    } else if ((event.code === 'ArrowLeft' || event.code === 'ArrowRight') && element?.type !== 'range') {
+      event.preventDefault();
+      adjust(event.code === 'ArrowRight' ? 1 : -1, false);
+    } else if (event.code === 'Escape' || event.code === 'Backspace') {
+      event.preventDefault();
+      back();
+    } else if (settingsKey && screen === 'game' && element?.type !== 'range') {
+      event.preventDefault();
+      resume();
+    }
+  };
+  const keyup = event => { if (screen === 'game' && panel !== 'none') { event.stopImmediatePropagation(); } };
+  const hover = event => {
+    const target = event.target.closest?.('[data-nav]');
+    if (target && !target.disabled && activeLayer()?.contains(target) && root.activeElement !== target) { target.focus({ preventScroll: true }); }
+  };
+  const activity = () => {
+    if (screen !== 'game' || root.pointerLockElement) { body.dataset.cursor = 'idle'; return; }
+    body.dataset.cursor = 'active';
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => { body.dataset.cursor = 'idle'; }, 2500);
+  };
+  const fullscreen = () => { layout(); if (panel === 'settings') { refreshRows(); } };
+  const startClick = () => { void start(); };
+  const picked = () => {
+    const file = input.files?.[0];
+    const startAfter = pickToStart;
+    pickToStart = false;
+    input.value = '';
+    handle = undefined;
+    void select(file, startAfter);
+  };
+  const stopSettings = settings.subscribe(name => {
+    if (name === 'scaling' || name === 'filter') { layout(); }
+    if (name === 'volume') { audio?.setVolume(settings.get('volume') / 100); }
+    if (name === 'showFps') { show(); }
+    if (name === 'showDiagnostics') { showDiagnostics(); }
+    if (panel === 'settings') { refreshRows(); }
+  });
+
+  boot.addEventListener('click', startClick);
+  gear.addEventListener('click', () => { setPanel('pause'); });
+  input.addEventListener('change', picked);
+  root.addEventListener('click', clicks);
+  root.addEventListener('pointermove', hover);
+  root.addEventListener('mousemove', activity);
+  root.addEventListener('pointerlockchange', activity);
+  root.addEventListener('fullscreenchange', fullscreen);
+  window.addEventListener('keydown', keydown, true);
+  window.addEventListener('keyup', keyup, true);
+  window.addEventListener('resize', layout);
+  layout();
+  showDiagnostics();
+  renderSettings();
+  render(controller.state);
+  show();
+  focusDefault();
+  void discs.load().then(stored => {
+    if (stored && !controller.state.source && !handle) { handle = stored; }
+  }).catch(() => {});
+
+  return Object.freeze({
+    controller,
+    settings,
     dispose: async () => {
-      globalThis.removeEventListener('blur', suspend);
-      root.removeEventListener('visibilitychange', suspend);
-      await shell.dispose();
+      stopSettings();
+      clearTimeout(idleTimer);
+      if (padFrame !== undefined) { window.cancelAnimationFrame(padFrame); }
+      boot.removeEventListener('click', startClick);
+      input.removeEventListener('change', picked);
+      root.removeEventListener('click', clicks);
+      root.removeEventListener('pointermove', hover);
+      root.removeEventListener('mousemove', activity);
+      root.removeEventListener('pointerlockchange', activity);
+      root.removeEventListener('fullscreenchange', fullscreen);
+      window.removeEventListener('keydown', keydown, true);
+      window.removeEventListener('keyup', keyup, true);
+      window.removeEventListener('resize', layout);
+      await controller.stop();
     },
     beginMeasurement: () => { measurement.begin(); },
     get measurement() { return measurement.snapshot(); },
     get evidence() { return evidence; },
+    get audio() { return audio?.snapshot(); },
   });
 };
