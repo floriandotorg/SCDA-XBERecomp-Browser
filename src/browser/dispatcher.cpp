@@ -180,11 +180,12 @@ int32_t Dispatcher::ReleaseMutant(uint32_t id, uint32_t owner) {
   const int32_t previous = object.signal;
   if (++object.signal == 1) {
     object.owner = 0;
+    const bool waiting = object.waiting != 0;
     if (object.unreferenced) {
       object.destroyed = true;
       reference.reset();
     }
-    runtime_.Wake();
+    if (waiting) { runtime_.Wake(); }
   }
   return previous;
 }
@@ -215,7 +216,7 @@ int32_t Dispatcher::SetEvent(uint32_t id) {
   auto& object = *Find(id);
   if (object.kind != Kind::NotificationEvent && object.kind != Kind::SynchronizationEvent) { throw Fault({}, id, 0, "dispatcher object is not an event"); }
   const int32_t previous = std::exchange(object.signal, 1);
-  runtime_.Wake();
+  if (object.waiting) { runtime_.Wake(); }
   return previous;
 }
 
@@ -236,7 +237,7 @@ int32_t Dispatcher::ReleaseSemaphore(uint32_t id, int32_t count) {
   }
   const int32_t previous = object.signal;
   object.signal += count;
-  runtime_.Wake();
+  if (object.waiting) { runtime_.Wake(); }
   return previous;
 }
 
@@ -342,14 +343,17 @@ Dispatcher::WaitOutcome Dispatcher::WaitImpl(const X86Context& ctx, std::span<co
       }
     }
     ++waiters_;
+    for (size_t n = 0; n < count; ++n) { ++objects[n]->waiting; }
   }
   struct PendingWait {
     Dispatcher& dispatcher;
+    std::span<const std::shared_ptr<Object>> objects;
     ~PendingWait() {
       std::lock_guard lock(dispatcher.lock_);
       --dispatcher.waiters_;
+      for (const auto& object : objects) { --object->waiting; }
     }
-  } pending{*this};
+  } pending{*this, std::span(objects.data(), count)};
   for (;;) {
     uint64_t sequence;
     auto clockWait = std::chrono::milliseconds(16);

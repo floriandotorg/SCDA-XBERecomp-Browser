@@ -42,6 +42,14 @@ struct RenderSnapshot {
   std::vector<RenderResourceSnapshot> resources;
 };
 
+struct RenderBindings {
+  bool color = true;
+  bool depth = true;
+  bool vertices = true;
+};
+
+std::vector<RenderResourceSnapshot> CaptureRenderResources(const X86Context& context, Memory& memory, const gpu::State& state,
+  std::span<const RenderResourceRequest> resources, const RenderSnapshotLimits& limits = {}, const RenderBindings& bindings = {});
 RenderSnapshot CaptureRenderSnapshot(const X86Context& context, Memory& memory, const gpu::State& state,
   std::span<const RenderResourceRequest> resources, const RenderSnapshotLimits& limits = {});
 std::vector<uint8_t> SerializeRenderSnapshot(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits = {});

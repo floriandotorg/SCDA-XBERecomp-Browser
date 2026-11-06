@@ -1,6 +1,6 @@
-import { waitForMailboxRequest, serveMailbox, closeMailbox, Status, MAX_BYTES, Opcode } from './webgpu-transport.mjs';
+import { waitForMailboxRequest, serveMailbox, closeMailbox, createCommandRing, Status, MAX_BYTES, Opcode } from './webgpu-transport.mjs';
 
-export const createGPUService = async ({ canvas, moduleURL, diagnostic = () => {}, onPresented = () => {}, onAdapter = () => {} }) => {
+export const createGPUService = async ({ canvas, moduleURL, mailbox, diagnostic = () => {}, onPresented = () => {}, onAdapter = () => {} }) => {
   const { default: createModule } = await import(moduleURL);
   let resolveReady;
   let pending;
@@ -8,6 +8,7 @@ export const createGPUService = async ({ canvas, moduleURL, diagnostic = () => {
   const readiness = new Promise(resolve => { resolveReady = resolve; });
   const module = await createModule({
     canvas,
+    readbackMailbox: mailbox,
     onGPUReady: (status, message) => resolveReady({ status, message }),
     onGPUAdapter: onAdapter,
     onGPUComplete: (status, bytes, message) => {
@@ -208,15 +209,28 @@ if (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlob
       if (stopped) { service.shutdown(); globalThis.postMessage({ type: 'stopped', resources: service.resources() }); return; }
       commands = createGPUCommandQueue(service, () => ({ width: event.data.canvas.width, height: event.data.canvas.height }));
       globalThis.postMessage({ type: 'ready' });
-      while (!stopped && await waitForMailboxRequest(mailbox)) {
-        await serveMailbox(mailbox, async packet => {
-          const result = await commands.execute(packet);
-          if (packet.opcode === Opcode.Shutdown) {
-            commands.shutdown();
-            stopped = true;
-          }
-          return result;
-        });
+      const header = new Int32Array(mailbox, 0, 16);
+      const ring = createCommandRing(mailbox);
+      const execute = packet => commands.execute(packet);
+      while (!stopped) {
+        const doorbell = ring?.doorbell();
+        const state = Atomics.load(header, 0);
+        if (state === 4) { break; }
+        if (state === 1) {
+          if (ring) { await ring.drain(ring.bound(), execute); }
+          await serveMailbox(mailbox, async packet => {
+            const result = await commands.execute(packet);
+            if (packet.opcode === Opcode.Shutdown) {
+              commands.shutdown();
+              stopped = true;
+            }
+            return result;
+          });
+          continue;
+        }
+        if (ring?.pending()) { await ring.drain(ring.bound(), execute); continue; }
+        if (ring) { await ring.wait(doorbell); }
+        else if (!await waitForMailboxRequest(mailbox)) { break; }
       }
     } catch (error) {
       closeMailbox(mailbox, Status.Error);

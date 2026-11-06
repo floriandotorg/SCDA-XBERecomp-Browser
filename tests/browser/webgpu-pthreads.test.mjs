@@ -27,14 +27,15 @@ test('GPU bindings reach current and later pthreads before entry while preservin
 });
 test('worker bindings require a bounded shared mailbox and cannot change owners', () => {
   const fixture = create({ webgpuMailbox: undefined });
-  for (const data of [null, {}, { type: 'different' }, { type: 'browser-webgpu-mailbox', mailbox: new ArrayBuffer(4194368) },
-    { type: 'browser-webgpu-mailbox', mailbox: new SharedArrayBuffer(64) }]) { fixture.message(data); }
+  const bytes = 4194368 * 5 + 1024 + 16777216;
+  for (const data of [null, {}, { type: 'different' }, { type: 'browser-webgpu-mailbox', mailbox: new ArrayBuffer(bytes) },
+    { type: 'browser-webgpu-mailbox', mailbox: new SharedArrayBuffer(64) }, { type: 'browser-webgpu-mailbox', mailbox: new SharedArrayBuffer(4194368) }]) { fixture.message(data); }
   assert.equal(fixture.Module.webgpuMailbox, undefined);
-  const mailbox = new SharedArrayBuffer(4194368);
+  const mailbox = new SharedArrayBuffer(bytes);
   fixture.message({ type: 'browser-webgpu-mailbox', mailbox });
   fixture.message({ type: 'browser-webgpu-mailbox', mailbox });
   assert.equal(fixture.Module.webgpuMailbox, mailbox);
-  assert.throws(() => fixture.message({ type: 'browser-webgpu-mailbox', mailbox: new SharedArrayBuffer(4194368) }), /ownership/);
+  assert.throws(() => fixture.message({ type: 'browser-webgpu-mailbox', mailbox: new SharedArrayBuffer(bytes) }), /ownership/);
   assert.equal(fixture.Module.webgpuMailbox, mailbox);
 });
 test('explicit fallback mode leaves pthread bindings absent', () => {

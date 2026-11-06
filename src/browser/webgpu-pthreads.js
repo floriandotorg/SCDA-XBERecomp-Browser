@@ -1,7 +1,7 @@
 globalThis.addEventListener?.('message', event => {
   const request = event.data;
   if (request?.type !== 'browser-webgpu-mailbox' || !(request.mailbox instanceof SharedArrayBuffer) ||
-      request.mailbox.byteLength !== 4194368 || request.mailbox.growable) { return; }
+      request.mailbox.byteLength !== 4194368 * 5 + 1024 + 16777216 || request.mailbox.growable) { return; }
   if (Module.webgpuMailbox && Module.webgpuMailbox !== request.mailbox) { throw new Error('WebGPU worker mailbox ownership changed.'); }
   Module.webgpuMailbox = request.mailbox;
 });

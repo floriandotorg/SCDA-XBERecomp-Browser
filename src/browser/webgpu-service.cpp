@@ -96,6 +96,12 @@ struct Pipeline { WGPURenderPipeline handle; uint32_t vertexStride; };
 std::map<uint32_t, Pipeline> pipelines;
 std::vector<uint8_t> reply;
 std::string failure;
+struct AsyncRead { bool done = false; std::vector<uint8_t> bytes; std::string failure; };
+std::map<uint32_t, AsyncRead> async_reads;
+std::array<AsyncRead, ReadbackSlots> slot_reads;
+uint32_t collect_waiting = 0;
+uint32_t presents_in_flight = 0;
+bool present_waiting = false;
 bool closed = false;
 bool active = false;
 uint32_t pending_validations = 0;
@@ -124,6 +130,8 @@ std::array<uint8_t, 768> gamma_ramp = [] {
   return result;
 }();
 void discard(uint32_t id) {
+  async_reads.erase(id);
+  if (collect_waiting == id) { collect_waiting = 0; }
   const auto buffer = resident_buffers.find(id);
   if (buffer != resident_buffers.end()) { resident_buffer_bytes -= buffer->second.bytes; wgpuBufferDestroy(buffer->second.handle); wgpuBufferRelease(buffer->second.handle); resident_buffers.erase(buffer); }
   auto image = textures.find(id);
@@ -141,6 +149,17 @@ EM_JS(void, uncaptured, (const char* message), { Module.onGPUError(UTF8ToString(
 EM_JS(void, lost, (const char* message), { Module.onGPULost(UTF8ToString(message)); });
 EM_JS(void, deferred_failure, (uint32_t command, uint32_t resource, const char* message), {
   Module.onGPUDeferredError?.({ command, resource, status: 1, message: UTF8ToString(message) });
+});
+EM_JS(void, deliver_readback, (uint32_t slot, uint32_t resource, int status, const uint8_t* bytes, uint32_t size), {
+  const mailbox = Module.readbackMailbox;
+  if (!mailbox) { Module.printErr('asynchronous readback mailbox unavailable'); return; }
+  const base = 64 + 4194304 + slot * (64 + 4194304);
+  if (slot >= 4 || mailbox.byteLength < base + 64 + 4194304 || size > 4194304) { Module.printErr('asynchronous readback slot exceeds mailbox ' + mailbox.byteLength); return; }
+  const header = new Int32Array(mailbox, base, 4);
+  new Uint8Array(mailbox, base + 64, size).set(HEAPU8.subarray(bytes, bytes + size));
+  header[1] = resource; header[2] = size; header[3] = status;
+  Atomics.store(header, 0, 2);
+  Atomics.notify(header, 0);
 });
 EM_JS(void, register_canvas, (), { specialHTMLTargets['#canvas'] = Module.canvas; });
 EM_JS(void, resize_canvas, (uint32_t width, uint32_t height), { Module.canvas.width = width; Module.canvas.height = height; });
@@ -695,6 +714,7 @@ void render_batch(uint32_t resource, std::span<const uint8_t> bytes, bool mixed,
 
 }
 void release_resources() {
+  async_reads.clear(); collect_waiting = 0; present_waiting = false;
   for (const auto& [key, item] : sampler_cache) { wgpuSamplerRelease(item.handle); }
   sampler_cache.clear(); sampler_sequence = 0;
   for (auto& pipeline : partial_clear_pipelines) { if (pipeline) { wgpuRenderPipelineRelease(pipeline); pipeline = nullptr; } }
@@ -1017,10 +1037,30 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       submit(encoder);
       wgpuBindGroupRelease(group); wgpuTextureViewRelease(source_view); wgpuTextureViewRelease(ramp_view); wgpuTextureViewRelease(target_view); wgpuTextureRelease(current.texture);
       auto info = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT; info.mode = WGPUCallbackMode_AllowSpontaneous;
-      info.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView message, void*, void*) { if (status != WGPUQueueWorkDoneStatus_Success) { failure = string(message); } if (active && device) { finish(); } };
-      wgpuQueueOnSubmittedWorkDone(queue, info); return;
+      info.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView message, void*, void*) {
+        if (status != WGPUQueueWorkDoneStatus_Success) { failure = string(message); }
+        --presents_in_flight;
+        if (present_waiting && presents_in_flight <= 1) { present_waiting = false; if (active && device) { finish(); } }
+      };
+      wgpuQueueOnSubmittedWorkDone(queue, info);
+      if (++presents_in_flight > 1) { present_waiting = true; return; }
+      break;
     }
+    case Opcode::ReadbackCollect: {
+      const bool poll = bytes.size() == 4 && packet<uint32_t>(bytes) == 1;
+      exact(bytes, 0);
+      const auto found = async_reads.find(resource);
+      if (found == async_reads.end()) { throw std::runtime_error("no started asynchronous readback"); }
+      if (!found->second.done && poll) { break; }
+      if (!found->second.done) { collect_waiting = resource; return; }
+      reply = std::move(found->second.bytes); failure = std::move(found->second.failure); async_reads.erase(found);
+      break;
+    }
+    case Opcode::ReadbackStart:
     case Opcode::Readback: {
+      const bool start = static_cast<Opcode>(operation) == Opcode::ReadbackStart;
+      const uint32_t slot = start && bytes.size() == 4 ? packet<uint32_t>(bytes) + 1 : 0;
+      if (start && (!resource || slot > ReadbackSlots || (!slot && (async_reads.size() >= 64 || async_reads.contains(resource))))) { throw std::runtime_error("invalid asynchronous readback"); }
       auto target = resource ? texture(resource) : presentation_target;
       bool stencil = false;
 #ifdef WEBGPU_SERVICE_TESTING
@@ -1054,16 +1094,21 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
         wgpuCommandEncoderCopyTextureToBuffer(encoder, &source, &destination, &extent);
       }
       submit(encoder);
-      struct Read { WGPUBuffer buffer; WGPUTexture packed; uint32_t width, height, pitch, pixel_bytes, stencil_pitch, map_bytes; };
-      auto read = new Read{staging, packed, target.width, target.height, pitch, pixel_bytes, stencilPitch, mapBytes};
+      struct Read { WGPUBuffer buffer; WGPUTexture packed; uint32_t width, height, pitch, pixel_bytes, stencil_pitch, map_bytes, async, slot, resource; };
+      auto read = new Read{staging, packed, target.width, target.height, pitch, pixel_bytes, stencilPitch, mapBytes, start && !slot ? resource : 0, slot, resource};
+      if (start && !slot) { async_reads[resource] = {}; }
+      if (slot) { slot_reads[slot - 1] = {}; }
       auto info = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT; info.mode = WGPUCallbackMode_AllowSpontaneous; info.userdata1 = read;
       info.callback = [](WGPUMapAsyncStatus status, WGPUStringView message, void* userdata, void*) {
         auto read = static_cast<Read*>(userdata);
+        const auto found = read->async ? async_reads.find(read->async) : async_reads.end();
+        auto& output = read->slot ? slot_reads[read->slot - 1].bytes : found != async_reads.end() ? found->second.bytes : reply;
+        auto& error = read->slot ? slot_reads[read->slot - 1].failure : found != async_reads.end() ? found->second.failure : failure;
         if (status == WGPUMapAsyncStatus_Success) {
           auto mapped = static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(read->buffer, 0, read->map_bytes));
-          reply.resize(read->width * read->height * read->pixel_bytes);
+          output.resize(read->width * read->height * read->pixel_bytes);
           for (uint32_t n = 0; n < read->height; ++n) {
-            auto row = reply.data() + n * read->width * read->pixel_bytes;
+            auto row = output.data() + n * read->width * read->pixel_bytes;
             std::memcpy(row, mapped + n * read->pitch, read->width * read->pixel_bytes);
             if (read->stencil_pitch) {
               const auto stencil = mapped + read->pitch * read->height + n * read->stencil_pitch;
@@ -1072,13 +1117,29 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
           }
           wgpuBufferUnmap(read->buffer);
         }
-        else { failure = string(message); }
+        else { error = string(message); }
         wgpuBufferDestroy(read->buffer); wgpuBufferRelease(read->buffer);
         if (read->packed) { wgpuTextureDestroy(read->packed); wgpuTextureRelease(read->packed); }
+        const uint32_t async = read->async, slot = read->slot, resource = read->resource;
         delete read;
+        if (slot) {
+          auto& result = slot_reads[slot - 1];
+          deliver_readback(slot - 1, resource, result.failure.empty() ? 0 : 1, result.bytes.data(), uint32_t(result.bytes.size()));
+          result = {};
+          return;
+        }
+        if (async && found == async_reads.end()) { return; }
+        if (found != async_reads.end()) {
+          found->second.done = true;
+          if (collect_waiting != async) { return; }
+          collect_waiting = 0;
+          reply = std::move(found->second.bytes); failure = std::move(found->second.failure); async_reads.erase(found);
+        }
         if (active && device) { finish(); }
       };
-      wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, descriptor.size, info); return;
+      wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, descriptor.size, info);
+      if (start) { break; }
+      return;
     }
     case Opcode::Destroy: {
       exact(bytes, 0);
@@ -1100,7 +1161,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
   } catch (const std::exception& error) { failure = error.what(); }
   const auto opcode = static_cast<Opcode>(operation);
   if (failure.empty() && pending_validations < 64 && (opcode == Opcode::Draw || opcode == Opcode::DrawBatch || opcode == Opcode::RenderBatch ||
-      opcode == Opcode::Clear || opcode == Opcode::Copy || opcode == Opcode::Destroy || opcode == Opcode::UploadBuffer || opcode == Opcode::UploadDrawBatch)) {
+      opcode == Opcode::Clear || opcode == Opcode::Copy || opcode == Opcode::Destroy || opcode == Opcode::UploadBuffer || opcode == Opcode::UploadDrawBatch || opcode == Opcode::ReadbackStart)) {
     created_resource = 0;
     defer_validation(command, resource);
     return;

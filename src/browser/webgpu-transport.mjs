@@ -1,8 +1,56 @@
 export const MAX_BYTES = 4 * 1024 * 1024;
 export const HEADER_BYTES = 64;
-export const Opcode = Object.freeze({ Configure: 1, CreateTexture: 2, CreatePipeline: 3, Draw: 4, Readback: 5, Destroy: 6, Flush: 7, Shutdown: 8, Present: 9, Clear: 10, Copy: 11, SetGamma: 12, UploadDepth: 13, DrawBatch: 14, RenderBatch: 15, UploadBuffer: 16, UploadDrawBatch: 17 });
+export const Opcode = Object.freeze({ Configure: 1, CreateTexture: 2, CreatePipeline: 3, Draw: 4, Readback: 5, Destroy: 6, Flush: 7, Shutdown: 8, Present: 9, Clear: 10, Copy: 11, SetGamma: 12, UploadDepth: 13, DrawBatch: 14, RenderBatch: 15, UploadBuffer: 16, UploadDrawBatch: 17, ReadbackStart: 18, ReadbackCollect: 19 });
 export const Status = Object.freeze({ Ok: 0, Error: 1, Closed: 2, Lost: 3 });
-export const createMailbox = () => new SharedArrayBuffer(HEADER_BYTES + MAX_BYTES);
+export const READBACK_SLOTS = 4;
+export const RING_OFFSET = (READBACK_SLOTS + 1) * (HEADER_BYTES + MAX_BYTES);
+export const RING_HEADER_BYTES = 1024;
+export const RING_BYTES = 16 * 1024 * 1024;
+export const createMailbox = () => new SharedArrayBuffer(RING_OFFSET + RING_HEADER_BYTES + RING_BYTES);
+const ringHeader = mailbox => {
+  const buffer = mailbox.buffer ?? mailbox;
+  return buffer.byteLength >= RING_OFFSET + RING_HEADER_BYTES + RING_BYTES ? new Int32Array(buffer, RING_OFFSET, 8) : undefined;
+};
+export const ringDoorbell = mailbox => {
+  const ring = ringHeader(mailbox);
+  if (ring) { Atomics.add(ring, 5, 1); Atomics.notify(ring, 5); }
+};
+export const createCommandRing = mailbox => {
+  const buffer = mailbox.buffer ?? mailbox;
+  const ring = ringHeader(mailbox);
+  if (!ring) { return undefined; }
+  const data = new Uint8Array(buffer, RING_OFFSET + RING_HEADER_BYTES, RING_BYTES);
+  const words = new Int32Array(buffer, RING_OFFSET + RING_HEADER_BYTES, RING_BYTES / 4);
+  let read = Atomics.load(ring, 1) >>> 0;
+  return {
+    doorbell: () => Atomics.load(ring, 5),
+    wait: async value => {
+      if (typeof Atomics.waitAsync === 'function') { await Atomics.waitAsync(ring, 5, value).value; }
+      else { await delay(); }
+    },
+    pending: () => (Atomics.load(ring, 0) >>> 0) !== read,
+    bound: () => Atomics.load(ring, 0) >>> 0,
+    async drain(bound, execute) {
+      while (read !== bound) {
+        const position = read % RING_BYTES;
+        const command = words[position / 4] >>> 0, opcode = words[position / 4 + 1], resource = words[position / 4 + 2] >>> 0, length = words[position / 4 + 3];
+        if (length < 0 || length > MAX_BYTES || position + 16 + length > RING_BYTES) { throw new Error('invalid posted GPU command'); }
+        if (opcode) {
+          const result = await execute({ command, opcode, resource, bytes: data.subarray(position + 16, position + 16 + length) });
+          if (result && result.status !== Status.Ok && !Atomics.load(ring, 2)) {
+            const message = (result.bytes ?? new Uint8Array()).subarray(0, RING_HEADER_BYTES - 64);
+            new Uint8Array(buffer, RING_OFFSET + 64, message.byteLength).set(message);
+            ring[4] = message.byteLength; ring[3] = result.status;
+            Atomics.store(ring, 2, 1);
+          }
+        }
+        read = (read + 16 + ((length + 15) & ~15)) >>> 0;
+        Atomics.store(ring, 1, read | 0);
+        Atomics.notify(ring, 1);
+      }
+    },
+  };
+};
 const views = mailbox => {
   const buffer = mailbox.buffer ?? mailbox;
   const offset = mailbox.byteOffset ?? 0;
@@ -32,6 +80,7 @@ export const closeMailbox = (mailbox, status = Status.Closed) => {
   Atomics.store(header, 5, 0);
   Atomics.store(header, 0, 4);
   Atomics.notify(header, 0);
+  ringDoorbell(mailbox);
 };
 export class MailboxClient {
   constructor(mailbox, { timeoutMs = 30000 } = {}) {
@@ -65,6 +114,7 @@ export class MailboxClient {
     header[5] = 0;
     Atomics.compareExchange(header, 0, 5, 1);
     Atomics.notify(header, 0);
+    ringDoorbell(this.mailbox);
     const deadline = Date.now() + this.timeoutMs;
     while (Atomics.load(header, 0) < 3) {
       if (Date.now() >= deadline) {

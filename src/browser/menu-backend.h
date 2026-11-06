@@ -52,6 +52,7 @@ public:
   bool Init(uint32_t width, uint32_t height) override;
   void Clear(const gpu::State& state, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z, uint32_t stencil) override;
   void Draw(const gpu::State& state, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
+  void IndexSource(uint32_t address) override;
   void Copy(const gpu::Surface& source, const gpu::Surface& destination, uint32_t count, uint32_t sourceRects, uint32_t destinationPoints) override;
   bool HasGpuContents(uint32_t address) const override;
   void Present(const gpu::Surface& front, bool pillarbox) override;

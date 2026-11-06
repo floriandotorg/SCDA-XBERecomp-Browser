@@ -4,6 +4,9 @@
 #include "browser/menu-shaders.h"
 #include "browser/menu-texture.h"
 #include "browser/render-snapshot.h"
+#include <list>
+#include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -64,6 +67,22 @@ std::vector<uint8_t> shaderKey(const gpu::State& state, uint16_t regs, bool pret
   }
   return key;
 }
+struct BytesHash {
+  template<class T> size_t operator()(const std::vector<T>& values) const {
+    uint64_t hash = 0xcbf29ce484222325ull ^ values.size();
+    const auto* bytes = reinterpret_cast<const uint8_t*>(values.data());
+    const size_t size = values.size() * sizeof(T);
+    size_t n = 0;
+    for (; n + 8 <= size; n += 8) {
+      uint64_t value;
+      std::memcpy(&value, bytes + n, 8);
+      hash = (hash ^ value) * 0x100000001b3ull;
+      hash ^= hash >> 29;
+    }
+    for (; n < size; ++n) { hash = (hash ^ bytes[n]) * 0x100000001b3ull; }
+    return size_t(hash ^ (hash >> 32));
+  }
+};
 uint32_t word(std::span<const uint8_t> bytes, size_t offset) {
   require(offset <= bytes.size() && bytes.size() - offset >= 4, "menu backend short resource header");
   uint32_t result;
@@ -137,12 +156,12 @@ void convertColumn(uint32_t type, const uint8_t* first, uint32_t stride, std::sp
       break;
   }
 }
-gpu::VertexShader layoutOf(const gpu::State& state) {
+const gpu::VertexShader& layoutOf(const gpu::State& state, gpu::VertexShader& layout) {
   if (state.vs_handle & 1) {
     require(bool(state.vs), "menu backend missing programmable vertex layout");
     return *state.vs;
   }
-  gpu::VertexShader layout;
+  layout = {};
   uint32_t offset = 0;
   const auto add = [&](uint32_t reg, uint32_t type) {
     layout.inputs[reg] = {0, offset, type};
@@ -251,6 +270,9 @@ struct MenuBackend::Impl {
     bool depthInitialized = false;
     bool dirty = false;
     uint64_t lateVersion = 0;
+    bool lateStarted = false;
+    uint32_t lateSlot = 0;
+    std::vector<uint8_t> delivered;
     std::optional<uint64_t> cpuVersion;
   };
   Runtime& runtime;
@@ -265,21 +287,24 @@ struct MenuBackend::Impl {
   mutable std::recursive_mutex mutex;
   std::map<uint64_t, Resource> resources;
   struct Pipeline { uint32_t id; uint64_t used; };
-  std::map<std::vector<uint8_t>, Pipeline> pipelines;
+  std::unordered_map<std::vector<uint8_t>, Pipeline, BytesHash> pipelines;
   uint64_t pipelineSequence = 0;
   uint64_t feedbackSequence = 0;
   std::set<uint32_t> feedbackPins;
-  std::map<std::vector<uint8_t>, menu::ShaderResult> shaderCache;
+  std::unordered_map<std::vector<uint8_t>, menu::ShaderResult, BytesHash> shaderCache;
+  std::unordered_map<const menu::ShaderResult*, uint64_t> shaderSerials;
+  uint64_t shaderSerial = 0, nextShaderSerial = 0;
   uint64_t shaderTranslations = 0;
   size_t shaderCacheBytes = 0;
-  struct ResidentBuffer { uint32_t id, offset, bytes; std::optional<uint64_t> version; uint64_t used, token; };
+  struct ResidentBuffer { uint32_t id, offset, bytes; std::optional<uint64_t> version; uint64_t used, token; std::list<const std::vector<uint32_t>*>::iterator order{}; };
   struct BufferPool { uint32_t id, bytes; uint64_t used; std::map<uint32_t, uint32_t> free; bool submitted = false; };
   std::map<uint32_t, BufferPool> bufferPools;
-  std::set<uint64_t> viewPins, stagedBufferViews;
+  std::vector<uint64_t> viewPins;
+  std::unordered_set<uint64_t> stagedBufferViews;
   uint64_t viewSequence = 0;
-  std::map<std::vector<uint32_t>, ResidentBuffer> residentBuffers;
-  std::set<std::pair<uint64_t, const std::vector<uint32_t>*>> residentOrder;
-  std::set<uint32_t> bufferPins;
+  std::unordered_map<std::vector<uint32_t>, ResidentBuffer, BytesHash> residentBuffers;
+  std::list<const std::vector<uint32_t>*> residentOrder;
+  std::vector<uint32_t> bufferPins;
   size_t bufferBytes = 0;
   struct UploadVersion { uint32_t id; uint64_t version, used; };
   std::map<uint32_t, UploadVersion> uploadVersions;
@@ -291,6 +316,13 @@ struct MenuBackend::Impl {
   uint64_t submittedCount = 0, completedCount = 0;
   uint32_t nextFence = 0, completedFence = 0;
   uint64_t frames = 0, finishedFrames = 0;
+  uint32_t previousPresent = 0, olderPresent = 0;
+  uint32_t indexSource = 0;
+  std::vector<uint16_t> scratchIndices;
+  std::vector<uint32_t> scratchVertices;
+  std::vector<RenderResourceRequest> scratchRequests;
+  std::array<uint32_t, webgpu::ReadbackSlots> lateSlots{};
+  uint64_t previousPresentCount = 0, olderPresentCount = 0;
   size_t resident = 0;
   std::string storageViewFailure;
   std::vector<uint8_t> stagedDraws;
@@ -311,14 +343,17 @@ struct MenuBackend::Impl {
     require(memory == image.memory.get() && (!image.boundRuntime || image.boundRuntime == &runtime), "menu backend foreign prepared image or runtime");
     require(!Memory::HasBorrow(), "menu backend cannot wait with borrowed guest memory");
     require(!retired, "menu backend is retired");
-    if (!retiring) { runtime.Checkpoint({}); }
+    if (!retiring && runtime.IsCancelled()) { runtime.Checkpoint({}); }
   }
   const menu::ShaderResult& shaders(const gpu::State& state, uint16_t regs, bool pretransformed,
       const gpu::TexInfo (&textures)[4], bool colorTarget, bool depthBias, const gpu::VertexShader* raw = nullptr) {
     auto key = shaderKey(state, regs, pretransformed, textures, colorTarget, depthBias);
     append(key, bool(raw));
     if (raw) { for (const auto& input : raw->inputs) { append(key, input.type); } }
-    if (const auto found = shaderCache.find(key); found != shaderCache.end()) { return found->second; }
+    if (const auto found = shaderCache.find(key); found != shaderCache.end()) {
+      shaderSerial = shaderSerials.at(&found->second);
+      return found->second;
+    }
     ++shaderTranslations;
     auto translated = menu::GenerateShaders(state, regs, pretransformed, textures, 0, colorTarget, depthBias);
     require(translated.supported, translated.diagnostic.c_str());
@@ -331,10 +366,14 @@ struct MenuBackend::Impl {
     while (!shaderCache.empty() && (shaderCache.size() >= 256 || shaderCacheBytes + bytes > (16u << 20))) {
       const auto found = shaderCache.begin();
       shaderCacheBytes -= bytesOf(found->first, found->second);
+      shaderSerials.erase(&found->second);
       shaderCache.erase(found);
     }
     shaderCacheBytes += bytes;
-    return shaderCache.emplace(std::move(key), std::move(translated)).first->second;
+    auto& inserted = shaderCache.emplace(std::move(key), std::move(translated)).first->second;
+    shaderSerial = ++nextShaderSerial;
+    shaderSerials[&inserted] = shaderSerial;
+    return inserted;
   }
   webgpu::Result send(webgpu::Opcode opcode, uint32_t resource, std::span<const uint8_t> bytes = {}) {
     if (opcode == webgpu::Opcode::UploadBuffer && limits.batchDraws) {
@@ -356,16 +395,16 @@ struct MenuBackend::Impl {
       stage(opcode, resource, depth, bytes);
       return {webgpu::Status::Ok, submitted, resource, {}};
     }
-    if (opcode != webgpu::Opcode::DrawBatch && opcode != webgpu::Opcode::RenderBatch && opcode != webgpu::Opcode::UploadBuffer && opcode != webgpu::Opcode::UploadDrawBatch) { flushDraws(); }
+    if (opcode != webgpu::Opcode::DrawBatch && opcode != webgpu::Opcode::RenderBatch && opcode != webgpu::Opcode::UploadBuffer && opcode != webgpu::Opcode::UploadDrawBatch && opcode != webgpu::Opcode::ReadbackCollect) { flushDraws(); }
     requireOwner();
     require(bytes.size() <= webgpu::MaxBytes, "menu backend command payload budget exceeded");
     const auto started = std::chrono::steady_clock::now();
-    const bool deferred = limits.postCommands && (opcode == webgpu::Opcode::Draw || opcode == webgpu::Opcode::DrawBatch ||
+    const bool deferred = limits.postCommands && (opcode == webgpu::Opcode::Draw || opcode == webgpu::Opcode::DrawBatch || opcode == webgpu::Opcode::ReadbackStart || opcode == webgpu::Opcode::Present ||
       opcode == webgpu::Opcode::RenderBatch || opcode == webgpu::Opcode::Clear || opcode == webgpu::Opcode::Copy || opcode == webgpu::Opcode::UploadBuffer || opcode == webgpu::Opcode::UploadDrawBatch);
     auto result = (deferred ? post : execute)(opcode, resource, bytes);
     const uint64_t elapsed = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
     commandWaitMicroseconds += elapsed;
-    if (opcode == webgpu::Opcode::Readback) { readbackWaitMicroseconds += elapsed; }
+    if (opcode == webgpu::Opcode::Readback || opcode == webgpu::Opcode::ReadbackCollect) { readbackWaitMicroseconds += elapsed; }
     if (opcode == webgpu::Opcode::CreateTexture || opcode == webgpu::Opcode::CreatePipeline || opcode == webgpu::Opcode::UploadDepth || opcode == webgpu::Opcode::UploadBuffer) { uploadWaitMicroseconds += elapsed; }
     if (opcode == webgpu::Opcode::Draw || opcode == webgpu::Opcode::DrawBatch || opcode == webgpu::Opcode::RenderBatch || opcode == webgpu::Opcode::UploadDrawBatch) { drawWaitMicroseconds += elapsed; }
     if (result.status != webgpu::Status::Ok) {
@@ -375,8 +414,14 @@ struct MenuBackend::Impl {
     submitted = result.command;
     require(submittedCount != UINT64_MAX, "menu backend command counter budget exceeded");
     ++submittedCount;
-    if (opcode == webgpu::Opcode::Flush || opcode == webgpu::Opcode::Readback || opcode == webgpu::Opcode::Present) {
-      completed = submitted; completedCount = submittedCount; finishedFrames = frames;
+    const bool presented = opcode == webgpu::Opcode::Present;
+    if (opcode == webgpu::Opcode::Flush || opcode == webgpu::Opcode::Readback || presented) {
+      if (presented) {
+        completed = std::max(completed, olderPresent); completedCount = std::max(completedCount, olderPresentCount);
+        finishedFrames = std::max(finishedFrames, frames ? frames - 1 : 0);
+        olderPresent = previousPresent; olderPresentCount = previousPresentCount;
+        previousPresent = submitted; previousPresentCount = submittedCount;
+      } else { completed = submitted; completedCount = submittedCount; finishedFrames = frames; }
       for (auto found = fences.begin(); found != fences.end();) {
         if (found->second > completed) { break; }
         completedFence = found->first; found = fences.erase(found);
@@ -430,11 +475,11 @@ struct MenuBackend::Impl {
     std::vector<uint8_t> bytes;
     const auto touch = [&](auto entry) {
       auto& view = entry->second;
-      if (view.used) { residentOrder.erase({view.used, &entry->first}); }
+      if (view.used) { residentOrder.splice(residentOrder.end(), residentOrder, view.order); }
+      else { view.order = residentOrder.insert(residentOrder.end(), &entry->first); }
       view.used = ++uploadSequence;
-      residentOrder.emplace(view.used, &entry->first);
       bufferPools.at(view.id).used = view.used;
-      bufferPins.insert(view.id); viewPins.insert(view.token);
+      bufferPins.push_back(view.id); viewPins.push_back(view.token);
       return view;
     };
     if (!headerAddress && !location) {
@@ -472,12 +517,12 @@ struct MenuBackend::Impl {
     const uint32_t storageBytes = uint32_t((bytes.size() + 3) & ~size_t(3));
     const auto evict = [&] {
       auto oldest = residentBuffers.end();
-      for (const auto& [used, key] : residentOrder) {
+      for (const auto* key : residentOrder) {
         const auto entry = residentBuffers.find(*key);
-        if (!viewPins.contains(entry->second.token)) { oldest = entry; break; }
+        if (std::find(viewPins.begin(), viewPins.end(), entry->second.token) == viewPins.end()) { oldest = entry; break; }
       }
       if (oldest == residentBuffers.end()) { return false; }
-      residentOrder.erase({oldest->second.used, &oldest->first});
+      residentOrder.erase(oldest->second.order);
       if (stagedBufferViews.contains(oldest->second.token)) { flushDraws(); }
       auto& free = bufferPools.at(oldest->second.id).free;
       uint32_t offset = oldest->second.offset, length = oldest->second.bytes;
@@ -589,13 +634,13 @@ struct MenuBackend::Impl {
     while (resourceCount() + slots > limits.maxResources || resident + bytes > limits.maxResidentBytes) {
       auto buffer = bufferPools.end();
       for (auto entry = bufferPools.begin(); entry != bufferPools.end(); ++entry) {
-        if (!bufferPins.contains(entry->first) && (buffer == bufferPools.end() || entry->second.used < buffer->second.used)) { buffer = entry; }
+        if (std::find(bufferPins.begin(), bufferPins.end(), entry->first) == bufferPins.end() && (buffer == bufferPools.end() || entry->second.used < buffer->second.used)) { buffer = entry; }
       }
       if (buffer != bufferPools.end()) {
         send(webgpu::Opcode::Destroy, buffer->first); resident -= buffer->second.bytes; bufferBytes -= buffer->second.bytes;
         std::erase_if(residentBuffers, [&](const auto& view) {
           if (view.second.id != buffer->first) { return false; }
-          residentOrder.erase({view.second.used, &view.first});
+          if (view.second.used) { residentOrder.erase(view.second.order); }
           return true;
         });
         bufferPools.erase(buffer); continue;
@@ -655,6 +700,7 @@ struct MenuBackend::Impl {
       const bool compatible = item.depth == depth && item.desc.format == desc.format && item.desc.width == desc.width && item.desc.height == desc.height &&
         item.desc.depth == desc.depth && item.desc.pitch == desc.pitch && item.desc.levels == desc.levels && item.desc.cube == desc.cube && item.desc.linear == desc.linear && item.uploaded.size() == bytes;
       if (!compatible) {
+        collectLate(item);
         if (item.dirty || !item.late.empty() || item.views.contains(headerAddress)) { incompatible("incompatible storage", item); }
         replacedStorage = true;
       } else {
@@ -704,6 +750,7 @@ struct MenuBackend::Impl {
     uint64_t version = 1;
     if (found != resources.end()) {
       version = found->second.version + 1;
+      collectLate(found->second);
       send(webgpu::Opcode::Destroy, found->second.id);
       if (found->second.feedback) { send(webgpu::Opcode::Destroy, found->second.feedback); }
       resident -= std::min(resident, oldBytes);
@@ -834,8 +881,41 @@ struct MenuBackend::Impl {
     }
     return false;
   }
-  std::vector<uint8_t> readback(Resource& item) {
-    const auto result = send(webgpu::Opcode::Readback, item.id);
+  std::vector<uint8_t> readback(Resource& item) { return decodeReadback(item, send(webgpu::Opcode::Readback, item.id)); }
+  bool startLate(Resource& item) {
+    const auto free = std::find(lateSlots.begin(), lateSlots.end(), 0u);
+    if (free == lateSlots.end()) { return false; }
+    const uint32_t slot = uint32_t(free - lateSlots.begin());
+    std::vector<uint8_t> request;
+    append(request, slot);
+    send(webgpu::Opcode::ReadbackStart, item.id, request);
+    *free = item.id;
+    item.lateStarted = true; item.lateSlot = slot;
+    return true;
+  }
+  bool collectLate(Resource& item, bool poll = false) {
+    if (!item.lateStarted) { return true; }
+    std::vector<uint8_t> request;
+    append(request, item.lateSlot); append(request, uint32_t(poll));
+    const auto started = std::chrono::steady_clock::now();
+    const auto result = execute(webgpu::Opcode::ReadbackCollect, item.id, request);
+    const uint64_t elapsed = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+    commandWaitMicroseconds += elapsed; readbackWaitMicroseconds += elapsed;
+    if (result.status != webgpu::Status::Ok) {
+      throw std::runtime_error("menu backend GPU service failure: " + std::string(result.bytes.begin(), result.bytes.end()));
+    }
+    if (result.bytes.empty()) {
+      require(poll, "menu backend empty asynchronous readback");
+      return false;
+    }
+    lateSlots.at(item.lateSlot) = 0;
+    item.lateStarted = false;
+    auto bytes = decodeReadback(item, result);
+    resident = resident - item.late.size() + bytes.size();
+    item.late = std::move(bytes);
+    return true;
+  }
+  std::vector<uint8_t> decodeReadback(Resource& item, const webgpu::Result& result) {
     if (item.depth) {
       require(result.bytes.size() == uint64_t(item.desc.width) * item.desc.height * 4, "menu backend depth readback size mismatch");
       auto bytes = item.uploaded;
@@ -932,7 +1012,7 @@ void MenuBackend::Retire() {
     impl_->white = 0;
   }
   impl_->resident = 0;
-  impl_->shaderCache.clear(); impl_->shaderCacheBytes = 0;
+  impl_->shaderCache.clear(); impl_->shaderSerials.clear(); impl_->shaderCacheBytes = 0;
   for (const auto& entry : impl_->bufferPools) { if (entry.second.submitted) { impl_->send(webgpu::Opcode::Destroy, entry.first); } }
   impl_->bufferPools.clear();
   impl_->residentBuffers.clear(); impl_->residentOrder.clear(); impl_->bufferPins.clear(); impl_->viewPins.clear(); impl_->stagedBufferViews.clear(); impl_->bufferBytes = 0;
@@ -955,8 +1035,13 @@ bool MenuBackend::Init(uint32_t width, uint32_t height) {
   impl_->width = width; impl_->height = height; impl_->initialized = true;
   return true;
 }
+void MenuBackend::IndexSource(uint32_t address) {
+  std::lock_guard lock(impl_->mutex);
+  impl_->indexSource = address;
+}
 void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
   std::lock_guard lock(impl_->mutex);
+  const uint32_t indexSource = std::exchange(impl_->indexSource, 0);
   impl_->requireOwner();
   impl_->feedbackPins.clear();
   impl_->bufferPins.clear(); impl_->viewPins.clear();
@@ -967,15 +1052,18 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   require(expandedCount <= (impl_->limits.maxExpandedVertices ? impl_->limits.maxExpandedVertices : impl_->limits.maxVertices), "menu backend expanded vertex budget exceeded");
   if (!expandedCount) { return; }
   require(!input.vs || (input.vs->decl.size() <= 65536 && input.vs->program.size() <= 65536 && input.vs->constants.size() <= 192), "menu backend shader budget exceeded");
-  auto layout = layoutOf(input);
+  gpu::VertexShader fixedLayout;
+  const auto& layout = layoutOf(input, fixedLayout);
   const auto& budget = impl_->limits;
   require(layout.decl.size() <= 65536 && layout.program.size() <= 65536 && layout.constants.size() <= 192, "menu backend shader budget exceeded");
-  std::vector<uint16_t> indexValues;
+  auto& indexValues = impl_->scratchIndices;
+  indexValues.clear();
   if (indices) {
     indexValues.resize(count);
     std::memcpy(indexValues.data(), indices, size_t(count) * 2);
   }
-  std::vector<uint32_t> vertexNumbers(count);
+  auto& vertexNumbers = impl_->scratchVertices;
+  vertexNumbers.resize(count);
   uint32_t maximum = 0, minimum = UINT32_MAX;
   for (uint32_t n = 0; n < count; ++n) {
     const uint64_t vertex = indices ? uint64_t(indexValues[n]) + input.base_vertex : uint64_t(start) + n;
@@ -1021,21 +1109,26 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     }
   }
 
-  std::vector<RenderResourceRequest> requests;
-  std::map<uint32_t, size_t> requestIndex;
+  auto& requests = impl_->scratchRequests;
+  requests.clear();
+  const auto requestAt = [&](uint32_t header) -> std::optional<size_t> {
+    for (size_t n = 0; n < requests.size(); ++n) {
+      if (requests[n].headerAddress == header) { return n; }
+    }
+    return std::nullopt;
+  };
   const auto addRequest = [&](RenderResourceKind kind, uint32_t header, uint32_t data, uint32_t bytes, uint64_t version, uint32_t gpuId = 0) {
     if (header) { impl_->releasedResources.erase(header); }
     if (kind == RenderResourceKind::Texture || kind == RenderResourceKind::Surface) {
       kind = kind == RenderResourceKind::Texture ? RenderResourceKind::TextureReference : RenderResourceKind::SurfaceReference;
       bytes = 0;
     }
-    if (header && requestIndex.contains(header)) {
-      auto& request = requests.at(requestIndex.at(header));
+    if (const auto existing = header ? requestAt(header) : std::nullopt) {
+      auto& request = requests.at(*existing);
       require(request.kind == kind && request.payloadAddress == data, "menu backend incompatible shared resource binding");
       request.payloadBytes = std::max(request.payloadBytes, bytes);
       return;
     }
-    if (header) { requestIndex[header] = requests.size(); }
     uint32_t id = 0;
     if (kind == RenderResourceKind::TextureReference || kind == RenderResourceKind::SurfaceReference) {
       require(gpuId, "menu backend missing snapshot GPU storage identity");
@@ -1134,14 +1227,8 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   RenderSnapshotLimits snapshotLimits;
   snapshotLimits.maxResources = budget.maxResources; snapshotLimits.maxPayloadBytes = budget.maxResourceBytes;
   snapshotLimits.maxTotalBytes = budget.maxResidentBytes;
-  auto consumedState = input;
-  if (!packet.depth_target) { consumedState.zs = {}; }
-  if (!colorTarget) { consumedState.rt = {}; }
-  if (raw) { consumedState.streams = {}; consumedState.index_buffer = 0; consumedState.index_data = 0; }
-  auto snapshot = CaptureRenderSnapshot({}, *impl_->memory, consumedState, requests, snapshotLimits);
-  auto& state = snapshot.state;
-  if (snapshot.vertexShader) { state.vs = std::make_shared<gpu::VertexShader>(*snapshot.vertexShader); }
-  if (snapshot.pixelShader) { state.ps = std::make_shared<gpu::PixelShader>(*snapshot.pixelShader); }
+  const auto captured = CaptureRenderResources({}, *impl_->memory, input, requests, snapshotLimits, {colorTarget != nullptr, packet.depth_target != 0, !raw});
+  const auto& state = input;
   const bool pretransformed = !(state.vs_handle & 1) && (state.vs_handle & 14) == 4;
   const bool depthBias = packet.depth_target && prim >= 5 && state.simple[gpu::kMSolidOffsetEnable / 4];
   const auto& shaders = impl_->shaders(state, regs, pretransformed, texinfo, colorTarget != nullptr, depthBias, raw ? &layout : nullptr);
@@ -1217,7 +1304,7 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   std::vector<uint8_t> key;
   append(key, pipeline);
   if (raw) { append(key, rawLayout); }
-  key.insert(key.end(), shaders.vertex.begin(), shaders.vertex.end()); key.insert(key.end(), shaders.fragment.begin(), shaders.fragment.end());
+  append(key, impl_->shaderSerial);
   auto foundPipeline = impl_->pipelines.find(key);
   require(budget.maxPipelines && impl_->pipelineSequence != UINT64_MAX, "menu backend pipeline cache budget exceeded");
   if (foundPipeline == impl_->pipelines.end()) {
@@ -1275,8 +1362,12 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     std::vector<uint32_t> indexKey{0, count, prim};
     if (indices) {
       const uint32_t origin = minimum - input.base_vertex;
-      indexKey.resize(3 + (count + 1) / 2, 0);
-      for (uint32_t n = 0; n < count; ++n) { indexKey[3 + n / 2] |= uint32_t(indexValues[n] - origin) << ((n & 1) * 16); }
+      const auto version = indexSource ? impl_->memory->PhysicalWriteVersion({}, indexSource, size_t(count) * 2) : std::nullopt;
+      if (version) { indexKey = {1, count, prim, indexSource, origin, uint32_t(*version), uint32_t(*version >> 32)}; }
+      else {
+        indexKey.resize(3 + (count + 1) / 2, 0);
+        for (uint32_t n = 0; n < count; ++n) { indexKey[3 + n / 2] |= uint32_t(indexValues[n] - origin) << ((n & 1) * 16); }
+      }
     }
     const auto indexView = impl_->residentBuffer(std::move(indexKey), 0, count * 2, [&vertexNumbers, prim, count, minimum] {
       const auto order = orderOf(prim, count);
@@ -1312,7 +1403,7 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     if (!(regs & (1u << n))) { continue; }
     const auto& element = layout.inputs[n];
     const auto& stream = state.streams[size_t(element.stream)];
-    const auto& resource = snapshot.resources.at(requestIndex.at(stream.vb));
+    const auto& resource = captured.at(requestAt(stream.vb).value());
     source.stride = stream.stride ? stream.stride : layout.stream_stride[size_t(element.stream)];
     require(uint64_t(maximum) * source.stride + element.offset + typeBytes(element.type) <= resource.payload.size(), "menu backend vertex exceeds owned snapshot");
     source.first = resource.payload.data() + element.offset;
@@ -1489,7 +1580,7 @@ void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
   require(impl_->initialized, "menu backend present before initialization");
   auto& item = impl_->surface(front);
   const auto result = impl_->sendPacket(webgpu::Opcode::Present, item.id, webgpu::PresentPacket{uint32_t(pillarbox)});
-  item.command = result.command; ++impl_->frames; impl_->finishedFrames = impl_->frames;
+  item.command = result.command; ++impl_->frames;
   if (impl_->metricsSink) {
     impl_->metricsSink({impl_->frames, impl_->commandWaitMicroseconds, impl_->readbackWaitMicroseconds, impl_->uploadWaitMicroseconds,
       impl_->drawWaitMicroseconds, uint32_t(impl_->resourceCount()), uint32_t(impl_->pipelines.size()), uint32_t(impl_->resident), impl_->inventory});
@@ -1512,23 +1603,34 @@ void MenuBackend::RecordLate(uint32_t location) {
   const size_t extra = item.uploaded.size();
   require(impl_->readHeader(item), "menu backend stale resource header before late readback");
   require(extra <= impl_->limits.maxResidentBytes && impl_->resident - item.late.size() <= impl_->limits.maxResidentBytes - extra, "menu backend late readback resident budget exceeded");
-  auto bytes = impl_->readback(item);
-  impl_->resident = impl_->resident - item.late.size() + bytes.size();
-  item.late = std::move(bytes); item.lateVersion = item.version;
+  impl_->collectLate(item);
+  if (impl_->startLate(item)) { item.lateVersion = item.version; }
 }
 bool MenuBackend::DeliverLate(uint32_t location) {
   std::lock_guard lock(impl_->mutex);
   impl_->requireOwner();
   auto& item = impl_->byAddress(location);
+  impl_->collectLate(item);
   if (item.late.empty()) { return false; }
   require(impl_->readHeader(item), "menu backend stale late readback resource header");
   impl_->publish(item, item.late, 0, uint32_t(item.late.size()));
   impl_->resident -= item.late.size();
   item.dirty = item.version != item.lateVersion;
+  item.delivered = std::move(item.late);
   item.late = std::vector<uint8_t>{};
   return true;
 }
 void MenuBackend::SyncLate(uint32_t location) {
+  {
+    std::lock_guard lock(impl_->mutex);
+    impl_->requireOwner();
+    auto& item = impl_->byAddress(location);
+    if (item.lateStarted && !item.delivered.empty() && !impl_->collectLate(item, true)) {
+      require(impl_->readHeader(item), "menu backend stale late readback resource header");
+      impl_->publish(item, item.delivered, 0, uint32_t(item.delivered.size()));
+      return;
+    }
+  }
   if (!DeliverLate(location)) { Sync(location, 0); }
   RecordLate(location);
 }
@@ -1598,6 +1700,7 @@ bool MenuBackend::ReleaseResource(uint32_t header, uint32_t data) {
   if (found == impl_->resources.end()) { return false; }
   auto& item = found->second;
   if (item.views.size() > 1) { item.views.erase(header); return false; }
+  impl_->collectLate(item);
   if (item.feedback) { impl_->send(webgpu::Opcode::Destroy, item.feedback); item.feedback = 0; }
   impl_->send(webgpu::Opcode::Destroy, item.id);
   impl_->resident -= item.residentBytes + item.late.size();

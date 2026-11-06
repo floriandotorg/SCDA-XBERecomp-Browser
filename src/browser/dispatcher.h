@@ -28,6 +28,7 @@ class Dispatcher {
     std::optional<uint64_t> deadline;
     uint64_t period = 0;
     bool unreferenced = false;
+    uint32_t waiting = 0;
   };
   Runtime& runtime_;
   mutable std::mutex lock_;

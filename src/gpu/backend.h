@@ -27,6 +27,8 @@ public:
                        uint32_t stencil) = 0;
     // indices: the title's 16 bit indices, null for non indexed draws, then start is the first vertex
     virtual void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) = 0;
+    // the guest address the next Draw's indices were copied from, zero when unknown
+    virtual void IndexSource(uint32_t) {}
     virtual void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects_va,
                       uint32_t dst_points_va) = 0;
     virtual bool HasGpuContents(uint32_t) const { return true; }

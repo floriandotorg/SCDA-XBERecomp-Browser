@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <bit>
 #include <limits>
+#include <memory>
 
 namespace browser {
 namespace {
@@ -150,6 +151,29 @@ template <typename Codec> void SnapshotFields(Codec& codec, RenderSnapshot& snap
   }
 }
 
+uint64_t WireBytes(const gpu::VertexShader* vertexShader, bool pixelShader, std::span<const RenderResourceSnapshot> resources) {
+  static const auto fixed = [] {
+    const RenderSnapshotLimits limits;
+    auto empty = std::make_unique<RenderSnapshot>();
+    const auto measure = [&] {
+      WireSize wire{0, UINT32_MAX};
+      SnapshotFields(wire, *empty, limits);
+      return wire.bytes;
+    };
+    const uint64_t base = measure();
+    empty->vertexShader.emplace();
+    const uint64_t vertex = measure() - base;
+    empty->vertexShader.reset();
+    empty->pixelShader.emplace();
+    return std::array<uint64_t, 3>{base, vertex, measure() - base};
+  }();
+  uint64_t bytes = fixed[0];
+  if (vertexShader) { bytes += fixed[1] + (vertexShader->decl.size() + vertexShader->program.size()) * 4 + vertexShader->constants.size() * 20; }
+  if (pixelShader) { bytes += fixed[2]; }
+  for (const auto& resource : resources) { bytes += 36 + resource.header.size() + resource.payload.size(); }
+  return bytes;
+}
+
 uint32_t HeaderWord(const RenderResourceSnapshot& resource, size_t offset) {
   require(offset + 4 <= resource.header.size(), "short render resource header");
   uint32_t value = 0;
@@ -171,13 +195,13 @@ void ValidateShader(const gpu::VertexShader& shader, const RenderSnapshotLimits&
   for (const auto& input : shader.inputs) { require(input.stream >= -1 && input.stream < 16, "invalid vertex shader stream"); }
 }
 
-void Validate(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits) {
-  require(!snapshot.state.vs && !snapshot.state.ps, "render snapshot cannot contain shared shaders");
-  require(snapshot.state.scissor_count <= 8, "render snapshot scissor count exceeds capacity");
-  require(snapshot.resources.size() <= limits.maxResources, "render snapshot resource budget exceeded");
-  if (snapshot.vertexShader) { ValidateShader(*snapshot.vertexShader, limits); }
+void Validate(const gpu::State& state, const gpu::VertexShader* vertexShader, std::span<const RenderResourceSnapshot> resources,
+    const RenderSnapshotLimits& limits, const RenderBindings& bindings) {
+  require(state.scissor_count <= 8, "render snapshot scissor count exceeds capacity");
+  require(resources.size() <= limits.maxResources, "render snapshot resource budget exceeded");
+  if (vertexShader) { ValidateShader(*vertexShader, limits); }
   uint64_t bytes = 0;
-  for (const auto& resource : snapshot.resources) {
+  for (const auto& resource : resources) {
     require(resource.id && resource.version, "render resource identity and version must be nonzero");
     const auto kind = resource.kind;
     require(GpuReference(kind) ? resource.payload.empty() : resource.payload.size() && resource.payload.size() <= limits.maxPayloadBytes, "invalid render resource payload size");
@@ -197,7 +221,7 @@ void Validate(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits
     }
     bytes += resource.header.size() + resource.payload.size();
     require(bytes <= limits.maxTotalBytes, "render snapshot total resource budget exceeded");
-    for (const auto& other : snapshot.resources) {
+    for (const auto& other : resources) {
       if (&other == &resource) { break; }
       require(!resource.headerAddress || other.headerAddress != resource.headerAddress, "duplicate render resource header");
       if (other.id == resource.id) {
@@ -213,39 +237,42 @@ void Validate(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits
   }
   const auto bound = [&](uint32_t address, RenderResourceKind kind) {
     if (!address) { return; }
-    require(std::any_of(snapshot.resources.begin(), snapshot.resources.end(), [&](const auto& resource) {
+    require(std::any_of(resources.begin(), resources.end(), [&](const auto& resource) {
       const bool matching = resource.kind == kind || (kind == RenderResourceKind::Texture && resource.kind == RenderResourceKind::TextureReference) ||
         (kind == RenderResourceKind::Surface && resource.kind == RenderResourceKind::SurfaceReference);
       return resource.headerAddress == address && matching;
     }), "bound render resource missing from snapshot");
   };
-  for (const auto address : snapshot.state.textures) { bound(address, RenderResourceKind::Texture); }
-  for (const auto& stream : snapshot.state.streams) { bound(stream.vb, RenderResourceKind::VertexBuffer); }
-  bound(snapshot.state.index_buffer, RenderResourceKind::IndexBuffer);
-  bound(snapshot.state.rt.header, RenderResourceKind::Surface);
-  bound(snapshot.state.zs.header, RenderResourceKind::Surface);
-  if (snapshot.state.index_data) {
-    require(std::any_of(snapshot.resources.begin(), snapshot.resources.end(), [&](const auto& resource) {
+  for (const auto address : state.textures) { bound(address, RenderResourceKind::Texture); }
+  if (bindings.vertices) {
+    for (const auto& stream : state.streams) { bound(stream.vb, RenderResourceKind::VertexBuffer); }
+    bound(state.index_buffer, RenderResourceKind::IndexBuffer);
+  }
+  if (bindings.color) { bound(state.rt.header, RenderResourceKind::Surface); }
+  if (bindings.depth) { bound(state.zs.header, RenderResourceKind::Surface); }
+  if (bindings.vertices && state.index_data) {
+    require(std::any_of(resources.begin(), resources.end(), [&](const auto& resource) {
       return (resource.kind == RenderResourceKind::IndexBuffer || resource.kind == RenderResourceKind::IndexData) &&
-        PhysicalAddress(snapshot.state.index_data) >= PhysicalAddress(resource.payloadAddress) &&
-        uint64_t(PhysicalAddress(snapshot.state.index_data)) < uint64_t(PhysicalAddress(resource.payloadAddress)) + resource.payload.size();
+        PhysicalAddress(state.index_data) >= PhysicalAddress(resource.payloadAddress) &&
+        uint64_t(PhysicalAddress(state.index_data)) < uint64_t(PhysicalAddress(resource.payloadAddress)) + resource.payload.size();
     }), "bound index data missing from snapshot");
   }
 }
 
+void Validate(const RenderSnapshot& snapshot, const RenderSnapshotLimits& limits) {
+  require(!snapshot.state.vs && !snapshot.state.ps, "render snapshot cannot contain shared shaders");
+  Validate(snapshot.state, snapshot.vertexShader ? &*snapshot.vertexShader : nullptr, snapshot.resources, limits, {});
 }
 
-RenderSnapshot CaptureRenderSnapshot(const X86Context& context, Memory& memory, const gpu::State& state,
-  std::span<const RenderResourceRequest> resources, const RenderSnapshotLimits& limits) {
+}
+
+std::vector<RenderResourceSnapshot> CaptureRenderResources(const X86Context& context, Memory& memory, const gpu::State& state,
+  std::span<const RenderResourceRequest> resources, const RenderSnapshotLimits& limits, const RenderBindings& bindings) {
   require(resources.size() <= limits.maxResources, "render snapshot resource budget exceeded");
   require(state.scissor_count <= 8, "render snapshot scissor count exceeds capacity");
   if (state.vs) { ValidateShader(*state.vs, limits); }
-  RenderSnapshot snapshot;
-  snapshot.state = state;
-  snapshot.state.vs.reset();
-  snapshot.state.ps.reset();
-  if (state.vs) { snapshot.vertexShader = *state.vs; }
-  if (state.ps) { snapshot.pixelShader = *state.ps; }
+  std::vector<RenderResourceSnapshot> captured;
+  captured.reserve(resources.size());
   auto lease = memory.Borrow();
   uint64_t total = 0;
   for (const auto& request : resources) {
@@ -271,11 +298,22 @@ RenderSnapshot CaptureRenderSnapshot(const X86Context& context, Memory& memory, 
       resource.payload.resize(request.payloadBytes);
       memory.Read(context, request.payloadAddress, resource.payload.data(), resource.payload.size());
     }
-    snapshot.resources.push_back(std::move(resource));
+    captured.push_back(std::move(resource));
   }
-  Validate(snapshot, limits);
-  WireSize wire{0, limits.maxTotalBytes};
-  SnapshotFields(wire, snapshot, limits);
+  Validate(state, state.vs.get(), captured, limits, bindings);
+  require(WireBytes(state.vs.get(), bool(state.ps), captured) <= limits.maxTotalBytes, "render snapshot wire budget exceeded");
+  return captured;
+}
+
+RenderSnapshot CaptureRenderSnapshot(const X86Context& context, Memory& memory, const gpu::State& state,
+  std::span<const RenderResourceRequest> resources, const RenderSnapshotLimits& limits) {
+  RenderSnapshot snapshot;
+  snapshot.resources = CaptureRenderResources(context, memory, state, resources, limits, {});
+  snapshot.state = state;
+  snapshot.state.vs.reset();
+  snapshot.state.ps.reset();
+  if (state.vs) { snapshot.vertexShader = *state.vs; }
+  if (state.ps) { snapshot.pixelShader = *state.ps; }
   return snapshot;
 }
 

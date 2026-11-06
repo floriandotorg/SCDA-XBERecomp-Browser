@@ -12,6 +12,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -39,8 +40,17 @@ struct Cancelled : Fault {
 };
 
 class Memory {
+  template <typename T>
+  struct PageAllocator {
+    using value_type = T;
+    PageAllocator() = default;
+    template <typename U> PageAllocator(const PageAllocator<U>&) {}
+    T* allocate(size_t count) { return static_cast<T*>(::operator new(count * sizeof(T), std::align_val_t(4096))); }
+    void deallocate(T* pointer, size_t) { ::operator delete(pointer, std::align_val_t(4096)); }
+    template <typename U> bool operator==(const PageAllocator<U>&) const { return true; }
+  };
   struct Storage {
-    std::vector<uint8_t> bytes;
+    std::vector<uint8_t, PageAllocator<uint8_t>> bytes;
     std::vector<uint8_t> committed;
     explicit Storage(uint32_t size);
   };
@@ -59,6 +69,11 @@ class Memory {
   std::array<size_t, 256> regionLookup_{};
   std::shared_ptr<Storage> physicalStorage_;
   std::vector<uint64_t> physicalVersions_;
+  std::vector<uint64_t> physicalBlockVersions_;
+  void BumpPhysical(const X86Context& ctx, uint32_t address, size_t size, size_t page) {
+    if (physicalEpoch_ == UINT64_MAX) { WriteVersionExhausted(ctx, address, size); }
+    physicalVersions_[page] = physicalBlockVersions_[page / 8] = ++physicalEpoch_;
+  }
   uint64_t physicalEpoch_ = 0;
   struct Page {
     uint8_t* bytes = nullptr;
@@ -70,6 +85,26 @@ class Memory {
     explicit PageTable(Memory& owner) : memory(owner) {}
   };
   std::unique_ptr<PageTable> pages_;
+public:
+  static constexpr size_t kFlatWrittenOffset = sizeof(uintptr_t) << 20;
+  static constexpr uintptr_t kFlatUnmapped = uintptr_t(0) - 0x10000;
+private:
+  struct FlatTable {
+    Memory* owner;
+    alignas(64) std::array<uintptr_t, 1u << 20> delta;
+    std::array<uint8_t, 1u << 20> written;
+  };
+  std::unique_ptr<FlatTable> flat_;
+  void Flatten(uint32_t page, uint8_t* host) {
+    flat_->delta[page] = host ? reinterpret_cast<uintptr_t>(host) - uintptr_t(page) * 4096 : kFlatUnmapped - uintptr_t(page) * 4096;
+  }
+  uint8_t* FlatSpan(uint32_t address, size_t size) const;
+  bool TakeFlatWrite(const uint8_t* host) {
+    auto& written = flat_->written[(reinterpret_cast<uintptr_t>(host) >> 12) & ((1u << 20) - 1)];
+    if (!written) { return false; }
+    written = 0;
+    return true;
+  }
   void InitializePages();
   static Page* PageAt(Page* pages, uint32_t address, size_t size) {
     if (!pages || !size || size > 16 || size > 4096 - (address & 4095)) { return nullptr; }
@@ -80,6 +115,10 @@ class Memory {
   [[noreturn, gnu::cold, gnu::noinline]] void WriteVersionExhausted(const X86Context& ctx, uint32_t address, size_t size);
   void MarkPageWrite(const X86Context& ctx, uint32_t address, size_t size, Page& page) {
     if (!page.version) { return; }
+#ifdef X86_FLAT_MEMORY
+    flat_->written[(reinterpret_cast<uintptr_t>(page.bytes) >> 12) & ((1u << 20) - 1)] = 1;
+    return;
+#endif
     if (physicalEpoch_ == UINT64_MAX) { WriteVersionExhausted(ctx, address, size); }
     *page.version = ++physicalEpoch_;
   }
@@ -136,6 +175,7 @@ public:
     PauseExecution& operator=(const PauseExecution&) = delete;
   };
   static void YieldExecution();
+  static void YieldExecutionNow();
   Mutation Mutate() { return Mutation(*this); }
   Lease Borrow() { return Lease(*this); }
   PageTable* BeginBlock();
@@ -209,9 +249,41 @@ public:
   void MoveRepeated(X86Context& ctx, uint32_t width);
   void StoreRepeated(X86Context& ctx, uint32_t width);
   size_t BackingBytes() const;
-  uint8_t* Base() { return reinterpret_cast<uint8_t*>(this); }
-  static Memory& From(uint8_t* base) { return *reinterpret_cast<Memory*>(base); }
+  uint8_t* Base() { return reinterpret_cast<uint8_t*>(flat_->delta.data()); }
+  static Memory& From(uint8_t* base) { return *reinterpret_cast<FlatTable*>(base - offsetof(FlatTable, delta))->owner; }
+  static void FlatRepeat(X86Context& ctx, uint8_t* base, uint32_t width, bool fill);
 };
+
+inline uint8_t* FlatHost(uint8_t* base, uint32_t address) {
+  return reinterpret_cast<uint8_t*>(reinterpret_cast<const uintptr_t*>(base)[address >> 12] + address);
+}
+
+inline uint8_t* FlatWrite(uint8_t* base, uint32_t address) {
+  auto* host = FlatHost(base, address);
+  base[Memory::kFlatWrittenOffset + ((reinterpret_cast<uintptr_t>(host) >> 12) & ((1u << 20) - 1))] = 1;
+  return host;
+}
+
+template <typename T>
+class FlatReference {
+  uint8_t* base_;
+  uint32_t address_;
+public:
+  FlatReference(uint8_t* base, uint32_t address) : base_(base), address_(address) {}
+  operator T() const {
+    T value;
+    std::memcpy(&value, FlatHost(base_, address_), sizeof(T));
+    return value;
+  }
+  FlatReference& operator=(T value) {
+    std::memcpy(FlatWrite(base_, address_), &value, sizeof(T));
+    return *this;
+  }
+  FlatReference& operator=(const FlatReference& value) { return *this = T(value); }
+};
+
+template <typename T>
+inline T* FlatPointer(uint8_t* base, uint32_t address) { return reinterpret_cast<T*>(FlatWrite(base, address)); }
 
 template <typename T, typename Backing = Memory>
 class Reference {
@@ -298,6 +370,9 @@ private:
   static constinit thread_local uint64_t workerId_;
   uint64_t RecordKernelTrace(const X86Context& ctx, uint32_t ordinal, KernelTracePhase phase, uint64_t callId);
   std::vector<X86FuncMapping> mappings_;
+  uint32_t directBase_ = 0;
+  std::vector<X86Func*> direct_;
+  std::vector<uint8_t> directContinuation_;
   std::vector<uint32_t> continuations_;
   std::vector<X86Func*> hosts_;
   std::vector<std::function<void(X86Context&, uint8_t*)>> kernels_;
@@ -352,11 +427,15 @@ private:
   void RequireImageSession(const X86Context& ctx, uint8_t* base) const;
   void ObserveInvocation(const X86Context& ctx, uint8_t* base, uint32_t target) noexcept;
 public:
+  static constinit thread_local uint32_t loopPolls;
+  [[gnu::noinline]] static void PollLoopSlow(X86Context& ctx, uint8_t* base);
+  void Charge(X86Context& ctx, uint8_t* base, uint32_t cost);
   enum class WaitResult { Changed, TimedOut };
   std::atomic<uint64_t> ticks = 0;
   size_t StackPeak() const { return stackPeak_.load(); }
   size_t StackBudget() const { const size_t budget = stackBudget_.load(); return budget == size_t(-1) ? 0 : budget; }
   void Checkpoint(const X86Context& ctx) const;
+  bool IsCancelled() const { return cancelled_.load(std::memory_order_relaxed); }
   void Cancel();
   uint64_t Sequence();
   void Wake();

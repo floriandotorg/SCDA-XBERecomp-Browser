@@ -88,7 +88,21 @@ const leaseBlocks = source => {
   return output.join('\n');
 };
 
-export const adaptMemory = (source, { blocks = false } = {}) => {
+const flatTails = source => source.replace(/\b(sub_[0-9A-F]{8})\(ctx, base\); return;/g, 'BROWSER_GUEST_TAIL $1(ctx, base);');
+
+export const adaptFlatMemory = source => {
+  const output = [];
+  let cursor = 0;
+  for (const match of source.matchAll(/^X86_FUNC\([^)]+\) \{\n[\s\S]*?^\}/gm)) {
+    output.push(flatTails(source.slice(cursor, match.index)), /^\s*try\s*\{/m.test(match[0]) ? match[0] : flatTails(match[0]));
+    cursor = match.index + match[0].length;
+  }
+  output.push(flatTails(source.slice(cursor)));
+  return output.join('');
+};
+
+export const adaptMemory = (source, { blocks = false, flat = false } = {}) => {
+  if (flat) { return adaptFlatMemory(source); }
   const adapted = leasePointers(source);
   if (!blocks) { return adapted; }
   const output = [];

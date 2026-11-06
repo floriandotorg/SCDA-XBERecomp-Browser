@@ -1245,6 +1245,7 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
         indices.resize(size_t(count) * 2);
         memory_->Read(ctx, frame[3], indices.data(), indices.size());
       }
+      renderer_->IndexSource(indices.empty() ? 0 : frame[3]);
       renderer_->Draw(state_, frame[1], id == 20 ? 0 : frame[2], count, indices.empty() ? nullptr : indices.data());
       if (state_.rt.header) { gpuWritten_.insert(0x80000000 | (state_.rt.data & 0x3ffffff)); }
       if (state_.zs.header) { gpuWritten_.insert(0x80000000 | (state_.zs.data & 0x3ffffff)); }

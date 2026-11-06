@@ -5,7 +5,8 @@
 
 namespace browser::webgpu {
 constexpr uint32_t MaxBytes = 4 * 1024 * 1024;
-enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17 };
+constexpr uint32_t ReadbackSlots = 4;
+enum class Opcode : uint32_t { Configure = 1, CreateTexture = 2, CreatePipeline = 3, Draw = 4, Readback = 5, Destroy = 6, Flush = 7, Shutdown = 8, Present = 9, Clear = 10, Copy = 11, SetGamma = 12, UploadDepth = 13, DrawBatch = 14, RenderBatch = 15, UploadBuffer = 16, UploadDrawBatch = 17, ReadbackStart = 18, ReadbackCollect = 19 };
 enum class Status : uint32_t { Ok, Error, Closed, Lost };
 struct Dimensions { uint32_t width, height; };
 struct TexturePacket { uint32_t width, height, depth; uint32_t levels = 1; };

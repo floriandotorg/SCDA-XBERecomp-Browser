@@ -163,6 +163,7 @@ struct Session {
     rendererLimits.indexedVertices = true;
     rendererLimits.residentVertices = true;
     rendererLimits.postCommands = true;
+    rendererLimits.batchCommands = true;
     rendererLimits.maxVertices = 65536;
     rendererLimits.maxExpandedVertices = 196608;
 #endif

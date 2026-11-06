@@ -13,7 +13,16 @@ typedef uint64_t __attribute__((aligned(1), may_alias)) x86_u64u;
 typedef float __attribute__((aligned(1), may_alias)) x86_f32u;
 typedef double __attribute__((aligned(1), may_alias)) x86_f64u;
 
-#if defined(X86_COMPACT_MEMORY)
+#if defined(X86_FLAT_MEMORY)
+#include "browser/cpu_runtime.h"
+#define X86_MEM8(a) browser::FlatReference<uint8_t>(base, uint32_t(a))
+#define X86_MEM16(a) browser::FlatReference<uint16_t>(base, uint32_t(a))
+#define X86_MEM32(a) browser::FlatReference<uint32_t>(base, uint32_t(a))
+#define X86_MEM64(a) browser::FlatReference<uint64_t>(base, uint32_t(a))
+#define X86_MEMF32(a) browser::FlatReference<float>(base, uint32_t(a))
+#define X86_MEMF64(a) browser::FlatReference<double>(base, uint32_t(a))
+#define X86_PTR(T, a) browser::FlatPointer<T>(base, uint32_t(a))
+#elif defined(X86_COMPACT_MEMORY)
 #include "browser/cpu_runtime.h"
 #define X86_MEM8(a) browser::Access<uint8_t>(ctx, base, uint32_t(a))
 #define X86_MEM16(a) browser::Access<uint16_t>(ctx, base, uint32_t(a))
@@ -57,16 +66,27 @@ extern "C" __attribute__((used)) inline int _fltused = 0;
 #define X86_FUNC(name) extern "C" X86_HOST_EXPORT void name(X86Context& __restrict ctx, uint8_t* base)
 #define X86_EXTERN_FUNC(name) extern "C" void name(X86Context& __restrict ctx, uint8_t* base)
 
+#if defined(X86_FLAT_MEMORY)
+#define X86_PUSH32(v)                                                  \
+    do {                                                               \
+        uint32_t _v = (v);                                             \
+        ctx.esp -= 4;                                                  \
+        std::memcpy(browser::FlatHost(base, ctx.esp), &_v, 4);         \
+    } while (0)
+#else
 #define X86_PUSH32(v)            \
     do {                         \
         uint32_t _v = (v);       \
         ctx.esp -= 4;            \
         X86_MEM32(ctx.esp) = _v; \
     } while (0)
+#endif
 
 #define X86_SAVE_FLAGS() (ctx.cf = cf, ctx.zf = zf, ctx.sf = sf, ctx.of = of, ctx.pf = pf)
 #define X86_LOAD_FLAGS() uint32_t cf = ctx.cf, zf = ctx.zf, sf = ctx.sf, of = ctx.of, pf = ctx.pf
-#ifdef X86_COMPACT_MEMORY
+#ifdef X86_FLAT_MEMORY
+#define X86_BARRIER() do { if (__builtin_expect(!--browser::Runtime::loopPolls, 0)) { browser::Runtime::PollLoopSlow(ctx, base); } __asm__ volatile("" ::: "memory"); } while (false)
+#elif defined(X86_COMPACT_MEMORY)
 #define X86_BARRIER() do { if (ctx.host) { browser::Runtime::From(ctx).PollLoop(ctx, base); } __asm__ volatile("" ::: "memory"); } while (false)
 #else
 #define X86_BARRIER() __asm__ volatile("" ::: "memory")
@@ -203,7 +223,7 @@ inline uint32_t x87_examine(X86Context& ctx) {
     return 0;
 }
 
-#if defined(X86_COMPACT_MEMORY)
+#if defined(X86_COMPACT_MEMORY) && !defined(X86_FLAT_MEMORY)
 inline double x87_load80_guest(X86Context& ctx, uint8_t* base, const uint8_t* pointer) {
     auto& memory = browser::Memory::From(base);
     const uint32_t address = memory.GuestAddress(ctx, pointer, 10);
@@ -281,7 +301,9 @@ inline uint64_t mmx_map2(uint64_t a, uint64_t b, F f) {
 
 // rep movs: element by element semantics, fast path when the ranges cannot interfere
 inline void x86_rep_movs(X86Context& ctx, uint8_t* base, uint32_t w) {
-#if defined(X86_COMPACT_MEMORY)
+#if defined(X86_FLAT_MEMORY)
+    browser::Memory::FlatRepeat(ctx, base, w, false);
+#elif defined(X86_COMPACT_MEMORY)
     if (w != 1 && w != 2 && w != 4) { throw browser::Fault(ctx, ctx.esi, w, "unsupported rep movs width"); }
     auto& memory = browser::Memory::From(base);
     const uint32_t step = ctx.df ? 0u - w : w;
@@ -316,7 +338,9 @@ inline void x86_rep_movs(X86Context& ctx, uint8_t* base, uint32_t w) {
 }
 
 inline void x86_rep_stos(X86Context& ctx, uint8_t* base, uint32_t w) {
-#if defined(X86_COMPACT_MEMORY)
+#if defined(X86_FLAT_MEMORY)
+    browser::Memory::FlatRepeat(ctx, base, w, true);
+#elif defined(X86_COMPACT_MEMORY)
     if (w != 1 && w != 2 && w != 4) { throw browser::Fault(ctx, ctx.edi, w, "unsupported rep stos width"); }
     auto& memory = browser::Memory::From(base);
     const uint32_t step = ctx.df ? 0u - w : w;

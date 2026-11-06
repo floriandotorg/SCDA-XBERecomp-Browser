@@ -55,8 +55,19 @@ struct Service {
     if (opcode == browser::webgpu::Opcode::Readback) {
       return {browser::webgpu::Status::Ok, command, resource, pixels.at(resource)};
     }
+    if (opcode == browser::webgpu::Opcode::ReadbackStart) {
+      check(started.emplace(resource, pixels.at(resource)).second, "asynchronous readback started twice");
+    }
+    if (opcode == browser::webgpu::Opcode::ReadbackCollect) {
+      auto found = started.find(resource);
+      check(found != started.end(), "asynchronous readback collected without start");
+      auto bytes = std::move(found->second);
+      started.erase(found);
+      return {browser::webgpu::Status::Ok, command, resource, std::move(bytes)};
+    }
     return {browser::webgpu::Status::Ok, command, resource, {}};
   }
+  std::map<uint32_t, std::vector<uint8_t>> started;
   void Apply(browser::webgpu::Opcode opcode, uint32_t resource, std::span<const uint8_t> bytes) {
     if (opcode == browser::webgpu::Opcode::Draw || opcode == browser::webgpu::Opcode::Clear || opcode == browser::webgpu::Opcode::Copy) {
       rendered.push_back({opcode, resource, {bytes.begin(), bytes.end()}});
@@ -345,7 +356,8 @@ int main() {
     uint32_t firstLate = pixel;
     image.memory->Read({}, state.rt.data, &firstLate, 4);
     check(firstLate == 0, "first late lock publishes real GPU bytes before returning");
-    check(service.Count(Opcode::Readback) == 3, "first late lock synchronizes absent history before recording next snapshot");
+    check(service.Count(Opcode::Readback) == 1 && service.Count(Opcode::ReadbackStart) == 2 && service.Count(Opcode::ReadbackCollect) == 1,
+      "first late lock synchronizes absent history before starting the next asynchronous snapshot");
     const auto readbackBaseline = service.Count(Opcode::Readback);
     backend.Sync(state.rt.data, 64);
     check(service.Count(Opcode::Readback) == readbackBaseline + 1, "sync reads actual target");
@@ -1729,6 +1741,9 @@ int main() {
       completionService.beforePresentCompletion = checkPending;
       completionBackend.Present(completionState.rt, false);
       completionService.beforePresentCompletion = {};
+      check(completionBackend.FencePending(firstFence) && completionBackend.FencePending(secondFence),
+        "a Present leaves its own frame in flight until the next Present");
+      completionBackend.Present(completionState.rt, false);
       check(completionService.completedSequence == completionService.sequence,
         "successful empty Present reply follows actual service queue completion contract");
       check(!completionBackend.FencePending(firstFence) && !completionBackend.FencePending(sameCommandFence) &&
@@ -1737,7 +1752,7 @@ int main() {
         !completionBackend.Busy(destination.data) && !completionBackend.Busy(destination.header),
         "successful Present retires both its source and other earlier queue targets");
       auto completed = completionBackend.Snapshot();
-      check(completed.completedCommands == completed.submittedCommands && completed.presentedFrames == 1,
+      check(completed.completedCommands == completed.submittedCommands - 1 && completed.presentedFrames == 2,
         "Present completion advances checked command accounting and successful frame count");
       auto commandsBeforeWait = completionService.commands.size();
       completionBackend.WaitGpuFrame(0);

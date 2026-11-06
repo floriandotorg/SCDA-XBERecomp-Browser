@@ -92,69 +92,54 @@ void workerRealmClock() {
 
 void canonicalSourceRefusal() {
 #ifdef __EMSCRIPTEN__
-  MAIN_THREAD_EM_ASM({
-    const original = globalThis.performance;
-    globalThis.__timerCanonicalPerformance = original;
-    globalThis.__timerCanonicalNow = 10000;
-    Object.defineProperty(globalThis, 'performance', { configurable: true, writable: true, value: {
-      now: () => globalThis.__timerCanonicalNow, timeOrigin: original.timeOrigin
-    } });
-  });
   browser::Runtime runtime({}, {});
   browser::Memory memory;
   X86Context context{};
   runtime.Launch(context, memory.Base(), [&](X86Context& ctx, uint8_t* base) {
-    EM_ASM({
+    const double start = EM_ASM_DOUBLE({
       const original = globalThis.performance;
+      const start = original.timeOrigin + original.now();
       globalThis.__timerLocalPerformance = original;
-      globalThis.__timerLocalNow = 100;
+      globalThis.__timerLocalNow = start + 5;
       Object.defineProperty(globalThis, 'performance', { configurable: true, writable: true, value: {
-        now: () => globalThis.__timerLocalNow, timeOrigin: original.timeOrigin
+        now: () => globalThis.__timerLocalNow, timeOrigin: 0
       } });
+      return start;
     });
-    const auto local = [](double value) { EM_ASM({ globalThis.__timerLocalNow = $0; }, value); };
-    const auto canonical = [](double value) { MAIN_THREAD_EM_ASM({ globalThis.__timerCanonicalNow = $0; }, value); };
+    const auto local = [&](double value) { EM_ASM({ globalThis.__timerLocalNow = $0; }, value); };
+    const auto near = [](uint64_t value, uint64_t expected) { return value + 4 >= expected && value <= expected + 4; };
     const auto refuse = [&](const char* reason) {
       bool refused = false;
       try { runtime.TimerTime(ctx); }
       catch (const browser::Fault& fault) { refused = std::string(fault.what()).find(reason) != std::string::npos; }
-      check(refused, "fresh canonical source failure was hidden by the cache");
+      check(refused, "invalid worker source was hidden by the cache");
     };
-    check(runtime.TimerTime(ctx) == 0, "canonical clock did not retain the first worker epoch");
-    canonical(10001);
-    local(100.5);
-    check(runtime.TimerTime(ctx) == 0, "cache extrapolated an unobserved canonical sample");
-    local(101);
-    check(runtime.TimerTime(ctx) == 10000, "one millisecond cadence did not refresh the actual source");
-    canonical(10000.5);
-    local(102);
-    refuse("timer clock source moved backwards or has no epoch");
-    canonical(10002);
-    local(103);
-    check(runtime.TimerTime(ctx) == 20000, "source refusal reset the accepted epoch");
-    canonical(-1);
-    local(104);
+    const uint64_t first = runtime.TimerTime(ctx);
+    local(start + 5.5);
+    check(runtime.TimerTime(ctx) == first, "cache refreshed before a millisecond elapsed");
+    local(start + 6);
+    check(near(runtime.TimerTime(ctx), first + 10000), "one millisecond cadence did not refresh the worker source");
+    const uint64_t accepted = runtime.TimerTime(ctx);
+    local(start + 5.8);
+    check(runtime.TimerTime(ctx) == accepted, "worker source regression moved the accepted clock backwards");
+    local(start + 8);
+    check(near(runtime.TimerTime(ctx), first + 30000), "regression clamping poisoned later samples");
+    local(-1);
     refuse("host monotonic timer outside elapsed time range");
-    canonical(std::numeric_limits<double>::quiet_NaN());
-    local(105);
+    local(std::numeric_limits<double>::quiet_NaN());
     refuse("host monotonic timer outside elapsed time range");
-    canonical(10003);
-    local(106);
-    check(runtime.TimerTime(ctx) == 30000, "invalid host time poisoned the last accepted sample");
-    canonical(10004);
-    local(90);
-    check(runtime.TimerTime(ctx) == 40000, "local cadence regression suppressed fresh canonical sampling");
+    local(start + 9);
+    const uint64_t later = runtime.TimerTime(ctx);
+    check(near(later, first + 40000), "invalid host time poisoned the last accepted sample");
     for (uint32_t n = 0; n < 8; ++n) {
       runtime.Launch(ctx, base, [&](X86Context& child, uint8_t*) {
-        check(runtime.TimerTime(child) == 40000, "cadence slot eviction reset the shared session epoch");
+        check(runtime.TimerTime(child) >= later, "worker clocks did not share one monotonic session epoch");
       });
       while (runtime.ActiveWorkers() > 1) { runtime.Checkpoint(ctx); std::this_thread::yield(); }
     }
     EM_ASM({ globalThis.performance = globalThis.__timerLocalPerformance; });
   });
-  const auto failure = runtime.Join();
-  MAIN_THREAD_EM_ASM({ globalThis.performance = globalThis.__timerCanonicalPerformance; });
-  if (failure) { std::rethrow_exception(failure); }
+  if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
 #endif
 }
 
@@ -195,7 +180,7 @@ void realSourceWorkers() {
     return count;
   });
   std::printf("timer-clock-real-source-proxies=%u\n", sourceSamples);
-  check(sourceSamples > 0 && sourceSamples < 1000, "clock source synchronously proxied every poll instead of bounded sampling");
+  check(sourceSamples < 1000, "clock source sampled every poll instead of bounded sampling");
 #endif
 }
 
@@ -271,14 +256,9 @@ int main() try {
       check(runtime.TimerTime(ctx) == 123, "timer clock was coupled to synthetic CPU ticks");
       check(x86_rdtsc() == 123ull * 733333333 / 10000000, "published image RDTSC did not advance at the native guest cycle frequency");
       source -= 1;
-      bool backwards = false;
-      try { runtime.TimerTime(ctx); }
-      catch (const browser::Fault& fault) {
-        backwards = std::string(fault.what()).find("timer clock source moved backwards or has no epoch") != std::string::npos;
-      }
-      check(backwards, "actual source regression was not explicitly refused");
+      check(runtime.TimerTime(ctx) == 123, "actual source regression moved the accepted clock backwards");
       ++source;
-      check(runtime.TimerTime(ctx) == 123, "refused source regression changed the accepted sample or epoch");
+      check(runtime.TimerTime(ctx) == 123, "clamped source regression changed the accepted sample or epoch");
       source += 100;
       runtime.Launch(ctx, base, [&](X86Context& child, uint8_t*) {
         childTime = runtime.TimerTime(child);

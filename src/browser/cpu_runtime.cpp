@@ -92,14 +92,57 @@ void Memory::YieldExecution() {
   std::this_thread::yield();
 }
 
+void Memory::YieldExecutionNow() {
+  auto* execution = Execution::current_;
+  if (!execution || !execution->lease_ || threadBorrows_ != 1) { return; }
+  execution->checkpoints_ = 0;
+  PauseExecution pause;
+  std::this_thread::yield();
+}
+
+void Memory::FlatRepeat(X86Context& ctx, uint8_t* base, uint32_t width, bool fill) {
+  if (width != 1 && width != 2 && width != 4) { throw Fault(ctx, fill ? ctx.edi : ctx.esi, width, "unsupported repeated memory width"); }
+  const uint32_t step = ctx.df ? 0u - width : width;
+  while (ctx.ecx) {
+    uint32_t count = 1;
+    if (!ctx.df) {
+      const uint32_t room = std::min(pageSize - (ctx.edi & (pageSize - 1)), fill ? pageSize : pageSize - (ctx.esi & (pageSize - 1))) / width;
+      count = std::max(1u, std::min(ctx.ecx, room));
+    }
+    const uint32_t bytes = count * width;
+    auto* to = FlatWrite(base, ctx.edi);
+    if (fill) {
+      if (width == 1) { std::memset(to, uint8_t(ctx.eax), bytes); }
+      else {
+        for (uint32_t n = 0; n < count; ++n) { std::memcpy(to + n * width, &ctx.eax, width); }
+      }
+    } else {
+      const auto* from = FlatHost(base, ctx.esi);
+      if (count == 1 || ctx.edi - ctx.esi >= bytes || ctx.edi <= ctx.esi) { std::memmove(to, from, bytes); }
+      else {
+        for (uint32_t n = 0; n < count; ++n) { std::memcpy(to + n * width, from + n * width, width); }
+      }
+      ctx.esi += step * count;
+    }
+    ctx.edi += step * count;
+    ctx.ecx -= count;
+  }
+}
+
 Memory::Storage::Storage(uint32_t size) : bytes(size), committed(size / pageSize) {}
 
-Memory::Memory() {
+Memory::Memory() : flat_(std::make_unique<FlatTable>()) {
+  flat_->owner = this;
+  for (uint32_t page = 0; page < flat_->delta.size(); ++page) { Flatten(page, nullptr); }
   Map(0x80000000, 64u << 20);
   std::fill(regions_[0].storage->committed.begin(), regions_[0].storage->committed.end(), 1);
   regions_.push_back({0xF0000000, regions_[0].storage});
   physicalStorage_ = regions_[0].storage;
   physicalVersions_.resize(physicalStorage_->committed.size());
+  physicalBlockVersions_.resize((physicalVersions_.size() + 7) / 8);
+  for (const auto& region : regions_) {
+    for (size_t n = 0; n < physicalVersions_.size(); ++n) { Flatten(region.address / pageSize + uint32_t(n), physicalStorage_->bytes.data() + n * pageSize); }
+  }
 }
 
 Memory::PageTable* Memory::BeginBlock() {
@@ -216,9 +259,10 @@ void Memory::Discard(uint32_t address, uint32_t size) {
       throw Fault({}, address, size, "discard crosses backing ownership");
     }
   }
-  if (pages_) {
-    const size_t limit = size_t((end + pageSize - 1) / pageSize);
-    for (size_t n = address / pageSize; n < limit; ++n) { pages_->entries[n] = {}; }
+  const size_t limit = size_t((end + pageSize - 1) / pageSize);
+  for (size_t n = address / pageSize; n < limit; ++n) {
+    if (pages_) { pages_->entries[n] = {}; }
+    Flatten(uint32_t(n), nullptr);
   }
   std::erase_if(regions_, [&](const Region& region) { return region.address >= address && uint64_t(region.address) < end; });
 }
@@ -331,21 +375,70 @@ void Memory::WriteVersionExhausted(const X86Context& ctx, uint32_t address, size
 
 void Memory::MarkPhysicalWrite(const X86Context& ctx, const Region& region, size_t offset, size_t size) {
   if (region.storage != physicalStorage_ || !size) { return; }
+#ifdef X86_FLAT_MEMORY
+  for (size_t n = offset / pageSize; n <= (offset + size - 1) / pageSize; ++n) {
+    flat_->written[((reinterpret_cast<uintptr_t>(physicalStorage_->bytes.data()) >> 12) + n) & ((1u << 20) - 1)] = 1;
+  }
+  return;
+#endif
   if (physicalEpoch_ == UINT64_MAX) { throw Fault(ctx, region.address + uint32_t(offset), size, "physical write version exhausted"); }
   const uint64_t version = ++physicalEpoch_;
-  for (size_t n = offset / pageSize; n <= (offset + size - 1) / pageSize; ++n) { physicalVersions_[n] = version; }
+  for (size_t n = offset / pageSize; n <= (offset + size - 1) / pageSize; ++n) { physicalVersions_[n] = physicalBlockVersions_[n / 8] = version; }
 }
 
 std::optional<uint64_t> Memory::PhysicalWriteVersion(const X86Context& ctx, uint32_t address, size_t size) {
   std::unique_lock lock(memoryLock_, std::defer_lock);
   if (!HasAccess()) { lock.lock(); }
-  Validate(ctx, address, size);
-  if (!size || physicalSpan_) { return std::nullopt; }
-  const auto& region = RegionAt(ctx, address, size);
-  const size_t offset = address - region.address;
-  if (region.storage != physicalStorage_ || size > region.storage->bytes.size() - offset) { return std::nullopt; }
+  size_t offset = 0;
+  const auto* physical = physicalStorage_->bytes.data();
+#ifdef X86_FLAT_MEMORY
+  const auto* host = size ? FlatHost(Base(), address) : nullptr;
+  if (host >= physical && host < physical + physicalStorage_->bytes.size() && size <= physicalStorage_->bytes.size() - size_t(host - physical)) {
+    if (physicalSpan_) { return std::nullopt; }
+    offset = size_t(host - physical);
+    const size_t first = offset / pageSize, last = (offset + size - 1) / pageSize;
+    const uintptr_t index = (reinterpret_cast<uintptr_t>(physical) >> 12) & ((1u << 20) - 1);
+    uint64_t version = 0;
+    if (index + physicalVersions_.size() > (1u << 20)) {
+      for (size_t n = first; n <= last; ++n) {
+        if (TakeFlatWrite(physical + n * pageSize)) { BumpPhysical(ctx, address, size, n); }
+        version = std::max(version, physicalVersions_[n]);
+      }
+      return version;
+    }
+    auto* written = flat_->written.data() + index;
+    for (size_t n = first; n <= last;) {
+      if (n % 8 == 0 && n + 8 <= last + 1) {
+        uint64_t flags;
+        std::memcpy(&flags, written + n, 8);
+        if (flags) {
+          for (size_t page = n; page < n + 8; ++page) {
+            if (written[page]) { written[page] = 0; BumpPhysical(ctx, address, size, page); }
+          }
+        }
+        version = std::max(version, physicalBlockVersions_[n / 8]);
+        n += 8;
+      } else {
+        if (written[n]) { written[n] = 0; BumpPhysical(ctx, address, size, n); }
+        version = std::max(version, physicalVersions_[n]);
+        ++n;
+      }
+    }
+    return version;
+  }
+#endif
+  {
+    Validate(ctx, address, size);
+    if (!size || physicalSpan_) { return std::nullopt; }
+    const auto& region = RegionAt(ctx, address, size);
+    offset = address - region.address;
+    if (region.storage != physicalStorage_ || size > region.storage->bytes.size() - offset) { return std::nullopt; }
+  }
   uint64_t version = 0;
-  for (size_t n = offset / pageSize; n <= (offset + size - 1) / pageSize; ++n) { version = std::max(version, physicalVersions_[n]); }
+  for (size_t n = offset / pageSize; n <= (offset + size - 1) / pageSize; ++n) {
+    if (TakeFlatWrite(physicalStorage_->bytes.data() + n * pageSize)) { BumpPhysical(ctx, address, size, n); }
+    version = std::max(version, physicalVersions_[n]);
+  }
   return version;
 }
 
@@ -376,13 +469,34 @@ uint32_t Memory::GuestAddress(const X86Context& ctx, const void* pointer, size_t
   throw Fault(ctx, 0, size, "host pointer has no guest backing");
 }
 
+uint8_t* Memory::FlatSpan(uint32_t address, size_t size) const {
+  if (!size || size > (1ull << 32) - address) { return nullptr; }
+  const auto& delta = flat_->delta;
+  const uint32_t first = address / pageSize, last = uint32_t((uint64_t(address) + size - 1) / pageSize);
+  const uintptr_t base = delta[first];
+  if (base + uintptr_t(first) * pageSize == kFlatUnmapped) { return nullptr; }
+  for (uint32_t page = first + 1; page <= last; ++page) {
+    if (delta[page] != base) { return nullptr; }
+  }
+  return reinterpret_cast<uint8_t*>(base + address);
+}
+
 void Memory::CheckRange(const X86Context& ctx, uint32_t address, size_t size) {
+#ifdef X86_FLAT_MEMORY
+  if (FlatSpan(address, size)) { return; }
+#endif
   std::unique_lock lock(memoryLock_, std::defer_lock);
   if (!HasAccess()) { lock.lock(); }
   Validate(ctx, address, size);
 }
 
 void Memory::Read(const X86Context& ctx, uint32_t address, void* output, size_t size) {
+#ifdef X86_FLAT_MEMORY
+  if (const auto* host = FlatSpan(address, size)) {
+    std::memcpy(output, host, size);
+    return;
+  }
+#endif
   std::unique_lock lock(memoryLock_, std::defer_lock);
   if (!HasAccess()) { lock.lock(); }
   if (auto* page = PageAt(address, size)) {
@@ -410,6 +524,15 @@ void Memory::Read(const X86Context& ctx, uint32_t address, void* output, size_t 
 }
 
 void Memory::Write(const X86Context& ctx, uint32_t address, const void* input, size_t size) {
+#ifdef X86_FLAT_MEMORY
+  if (auto* host = FlatSpan(address, size)) {
+    for (uintptr_t page = reinterpret_cast<uintptr_t>(host) >> 12; page <= (reinterpret_cast<uintptr_t>(host) + size - 1) >> 12; ++page) {
+      flat_->written[page & ((1u << 20) - 1)] = 1;
+    }
+    std::memcpy(host, input, size);
+    return;
+  }
+#endif
   std::unique_lock lock(memoryLock_, std::defer_lock);
   if (!HasAccess()) { lock.lock(); }
   if (auto* page = PageAt(address, size)) {
@@ -471,7 +594,11 @@ void Memory::Repeat(X86Context& ctx, uint32_t width, bool fill) {
     auto* input = !fill && bytes <= 4096 - (source & 4095) ? PageAt(source, width) : nullptr;
     if (output && (fill || input) && (!output->version || physicalEpoch_ <= UINT64_MAX - count)) {
       auto* to = output->bytes + (destination & 4095);
+#ifdef X86_FLAT_MEMORY
+      if (output->version) { flat_->written[(reinterpret_cast<uintptr_t>(output->bytes) >> 12) & ((1u << 20) - 1)] = 1; }
+#else
       if (output->version) { *output->version = physicalEpoch_ += count; }
+#endif
       if (fill) {
         if (width == 1) { std::memset(to, uint8_t(ctx.eax), bytes); }
         else {
@@ -526,6 +653,7 @@ void Memory::Pages(uint32_t address, uint32_t size, bool committed) {
         state = committed;
       }
       if (pages_) { pages_->entries[cursor / pageSize] = {committed ? region.storage->bytes.data() + offset : nullptr, nullptr}; }
+      Flatten(uint32_t(cursor / pageSize), committed ? region.storage->bytes.data() + offset : nullptr);
     }
     cursor += pageSize;
   }
@@ -552,6 +680,25 @@ constinit thread_local uint64_t Runtime::workerId_ = 0;
 constinit thread_local Runtime* Runtime::clock_ = nullptr;
 constinit thread_local bool Runtime::polling_ = false;
 constinit thread_local uint32_t Runtime::loopPollBudget_ = 0;
+constinit thread_local uint32_t Runtime::loopPolls = 1;
+
+void Runtime::Charge(X86Context& ctx, uint8_t* base, uint32_t cost) {
+  if (loopPolls > cost) {
+    loopPolls -= cost;
+    if (cancelled_.load(std::memory_order_relaxed)) { throw Cancelled(ctx); }
+    return;
+  }
+  PollLoopSlow(ctx, base);
+}
+
+void Runtime::PollLoopSlow(X86Context& ctx, uint8_t* base) {
+  loopPolls = 2048;
+  if (!ctx.host) { return; }
+  auto& runtime = From(ctx);
+  runtime.progress_.fetch_add(2047, std::memory_order_relaxed);
+  runtime.Poll(ctx, base);
+  Memory::YieldExecutionNow();
+}
 
 Runtime::Runtime(std::span<const X86FuncMapping> mappings, std::span<const uint32_t> continuations,
     std::function<uint64_t()> timerSource, size_t workerCapacity)
@@ -565,7 +712,7 @@ Runtime::Runtime(std::span<const X86FuncMapping> mappings, std::span<const uint3
           if (slot.worker == workerId_) { refresh = &slot; break; }
         }
         if (sample && refresh && local >= refresh->local && local - refresh->local < 1) { return *sample; }
-        const double milliseconds = MAIN_THREAD_EM_ASM_DOUBLE({ return performance.now(); });
+        const double milliseconds = emscripten_get_now();
         if (!(milliseconds >= 0 && milliseconds < double(UINT64_MAX / 10000))) {
           throw Fault({}, 149, 0, "host monotonic timer outside elapsed time range");
         }
@@ -588,6 +735,15 @@ Runtime::Runtime(std::span<const X86FuncMapping> mappings, std::span<const uint3
   for (size_t n = 0; n < mappings_.size(); ++n) {
     if (!mappings_[n].host || (n && mappings_[n - 1].guest == mappings_[n].guest) || mappings_[n].guest >= 0xFD000000) {
       throw Fault({}, mappings_[n].guest, 0, "invalid dispatch metadata");
+    }
+  }
+  if (!mappings_.empty() && mappings_.back().guest - mappings_.front().guest < (64u << 20)) {
+    directBase_ = mappings_.front().guest;
+    direct_.assign(mappings_.back().guest - directBase_ + 1, nullptr);
+    for (const auto& mapping : mappings_) { direct_[mapping.guest - directBase_] = mapping.host; }
+    directContinuation_.assign(direct_.size(), 0);
+    for (uint32_t target : continuations_) {
+      if (target - directBase_ < directContinuation_.size()) { directContinuation_[target - directBase_] = 1; }
     }
   }
   for (uint32_t target : continuations_) {
@@ -772,6 +928,7 @@ Runtime& Runtime::From(X86Context& ctx) {
 }
 
 X86Func* Runtime::Find(uint32_t target) const {
+  if (!direct_.empty()) { return target - directBase_ < direct_.size() ? direct_[target - directBase_] : nullptr; }
   const auto entry = std::lower_bound(mappings_.begin(), mappings_.end(), target,
     [](const auto& mapping, uint32_t address) { return mapping.guest < address; });
   return entry != mappings_.end() && entry->guest == target ? entry->host : nullptr;
@@ -799,7 +956,24 @@ void Runtime::Invoke(X86Context& ctx, uint8_t* base, uint32_t target) {
 #if defined(__EMSCRIPTEN__) && defined(BROWSER_MENU_TRACE_ABORTS) && BROWSER_MENU_TRACE_ABORTS
   browser_abort_record_context(uint32_t(workerId_), target, ctx.esp, ctx.ecx, ctx.ebx, ctx.esi, ctx.edi);
 #endif
+#ifdef X86_FLAT_MEMORY
+  if (const uint32_t index = target - directBase_; index < direct_.size() && !directContinuation_[index]) {
+    if (auto* function = direct_[index]) {
+      if (!--loopPolls) { PollLoopSlow(ctx, base); }
+      ctx.last_icall = target;
+      if (invocationObserver_) { ObserveInvocation(ctx, base, target); }
+      if (Memory::HasBorrow()) { function(ctx, base); return; }
+      if (auto* memory = imageMemory_.load(std::memory_order_acquire)) { InvokeGenerated(*memory, function, ctx, base); return; }
+      function(ctx, base);
+      return;
+    }
+  }
+  if (target < 0xFD000000) {
+    if (!--loopPolls) { PollLoopSlow(ctx, base); }
+  }
+#else
   if (target < 0xFD000000) { PollLoop(ctx, base); }
+#endif
   else if (target < 0xFE000000) { Poll(ctx, base); }
   else { Checkpoint(ctx); RequireImageSession(ctx, base); }
   ctx.last_icall = target;
@@ -898,7 +1072,11 @@ uint32_t Runtime::KernelTarget(uint32_t ordinal) {
 
 void Runtime::Kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal) {
   Memory::PauseExecution pause;
+#ifdef X86_FLAT_MEMORY
+  Charge(ctx, base, 16);
+#else
   Poll(ctx, base);
+#endif
   const std::function<void(X86Context&, uint8_t*)>* function = nullptr;
   {
     std::lock_guard lock(lock_);
@@ -978,7 +1156,11 @@ void Runtime::ObserveInvocation(const X86Context& ctx, uint8_t* base, uint32_t t
   try {
     if (!invocationReturns_.empty()) {
       if (!invocationMemory_ || base != invocationMemory_->Base()) { return; }
+#ifdef X86_FLAT_MEMORY
+      const uint32_t returnAddress = FlatReference<uint32_t>(base, ctx.esp);
+#else
       const uint32_t returnAddress = invocationMemory_->Load<uint32_t>(ctx, ctx.esp);
+#endif
       if (std::find(invocationReturns_.begin(), invocationReturns_.end(), returnAddress) == invocationReturns_.end()) { return; }
     }
     Memory::PauseExecution pause;
@@ -996,7 +1178,11 @@ bool Runtime::ObserveSdkEntry(X86Context& ctx, uint8_t* base, uint32_t id) {
       !runtime->sdkMemory_ || runtime->imageMemory_.load() != runtime->sdkMemory_ || base != runtime->sdkMemory_->Base()) {
     throw Fault(ctx, ctx.esp, 0, "SDK observation requires its bound current image worker without a backing lease");
   }
+#ifdef X86_FLAT_MEMORY
+  runtime->Charge(ctx, base, 16);
+#else
   runtime->Poll(ctx, base);
+#endif
   return runtime->sdkObserver_(ctx, id, workerId_);
 }
 
@@ -1074,8 +1260,8 @@ uint64_t Runtime::TimerTime(const X86Context& ctx) {
   }
 #endif
   std::lock_guard lock(timerLock_);
-  const uint64_t sample = timerSource_();
-  if (!timerEpoch_ || sample < timerSample_) { throw Fault(ctx, 149, 0, "timer clock source moved backwards or has no epoch"); }
+  const uint64_t sample = std::max(timerSource_(), timerSample_);
+  if (!timerEpoch_) { throw Fault(ctx, 149, 0, "timer clock source has no epoch"); }
   timerSample_ = sample;
   const uint64_t elapsed = sample - *timerEpoch_;
   timerElapsed_.store(elapsed, std::memory_order_release);
