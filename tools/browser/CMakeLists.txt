@@ -95,7 +95,7 @@ endif()
 if(BROWSER_BOOT)
     file(GLOB kernel_declarations CONFIGURE_DEPENDS ${root}/src/kernel/*.cpp)
 endif()
-set(BROWSER_GAME_HOOKS "magma_time;intro" CACHE STRING "Native game hooks from src/game compiled into a menu story module")
+set(BROWSER_GAME_HOOKS "magma_time;intro;fpsfixes;camera_shake;root_motion" CACHE STRING "Native game hooks from src/game compiled into a menu story module")
 # A guest address a browser source already overrides, and that source: a selected hook at the same address is compiled
 # as game_sub_<address>, which the browser override calls in place of the recompiled body.
 set(browser_hook_renames 00039AD4:mission-input 0004B525:mission-input 004B8EC0:loading-io 0018697A:menu-route)
@@ -103,8 +103,9 @@ set(browser_hooks)
 set(browser_hook_definitions)
 set(browser_applied_renames)
 if(BROWSER_MENU)
-    # crt_math is not optional: the recompiled x87 acos, asin and pow return NaN at random and twist skinned bones
-    set(browser_hooks ${BROWSER_GAME_HOOKS} crt_math)
+    # crt_math is not optional: the recompiled x87 acos, asin and pow return NaN at random and twist skinned bones.
+    # Neither is bink: above 30 FPS movies otherwise advance a frame per presented frame and play too fast.
+    set(browser_hooks ${BROWSER_GAME_HOOKS} crt_math bink)
     list(REMOVE_DUPLICATES browser_hooks)
     list(SORT browser_hooks)
     foreach(rename IN LISTS browser_hook_renames)

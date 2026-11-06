@@ -91,3 +91,96 @@ None. Native applies these fixes unconditionally and has no setting for them; th
 ## Out of scope
 
 versus/frame_rate.cpp and versus/camera_shake.cpp (C13); changes to MissionStepper or MissionInput scheduling; a browser frame cap; any setting for these fixes.
+
+## Implementation notes
+
+What C02 built, and two related 60 FPS defects fixed alongside it (movies playing too fast, stuttering audio).
+
+### Hooks
+
+- `BROWSER_GAME_HOOKS` defaults to `magma_time;intro;fpsfixes;camera_shake;root_motion`. The three sources compile
+  unchanged; none of their addresses has a browser override, so no rename was needed.
+- `bink` (src/xdk/bink.cpp) is always compiled, like `crt_math`. Native links it unconditionally: `BinkDoFrame` and
+  `BinkNextFrame` hold a movie frame until `BinkWait` says it is due, and `BinkGetSummary` keeps its 32 bit division from
+  overflowing. Without it every movie advanced one frame per presented frame, which at 60 FPS is twice the speed of a
+  30 FPS movie.
+- The configuration string carries the hook list, so the build identity changes with it (`out/boot-hooks`
+  `ffbb25c7...`, `out/boot-fps` `6445e66e...`).
+- In a mission build (`out/boot-fps`) Diagnostics lists all 17 hook addresses as bound, and development start reaches
+  the mission without a fault.
+
+### Contract tests
+
+- `tests/browser/high-fps-hooks.cpp` covers the seven cases of task 1 (camera shake, root motion, texture tick, JBA
+  glitch, interference scroll, grain, cloth), each reported on its own line. Without the three sources all seven fail;
+  with them all pass in native compact and flat (ASan/UBSan) and wasm compact and flat.
+- Camera times are offset by a quarter step (1/120 s), so no update lands on a 1/30 s boundary where float rounding
+  would decide the step count.
+- The grain hold leaves the first two rolls after a long gap fresh: the first sets `next` to now, so the second is due
+  at once. The test warms up one roll first. This is native behaviour.
+- `tests/browser/bink.cpp`: one second of 60 Hz game frames with a 30 FPS `BinkWait` decodes and advances 30 frames, and
+  a large read in 0 ms no longer overflows the summary. Both fail without the source.
+
+### Task 3: statics across `image_restart`
+
+Accepted, no generation keying:
+
+| Static | Restart safe because |
+| --- | --- |
+| camera_shake `g_cams` | A new level starts TimeSeconds again, so time goes back and the entry restarts from the fields. Entries are never erased, at most one per camera address ever used. |
+| root_motion `g_sign` | Relearned on the next turn above 8 units; at most one wrong small turn. |
+| fpsfixes `g_rolls`, glitch `time` | Under 1/30 s of held grain or glitch time. |
+| fpsfixes `g_cloths` | A body at a reused address with the same vertex count blends one frame toward the old body's last steps, then follows the new one. Never erased. |
+| bink `g_held` | A movie held when the image stopped is erased by the next `BinkNextFrame` at that address, one skipped advance at most. |
+
+### Task 4: `float& delta` across guest calls
+
+Valid. A region's storage is allocated once with its size and held by `shared_ptr`
+(`Memory::Storage`, cpu_runtime.h); it is only released by `Discard` of that allocation, and the flat build maps
+memory at fixed host addresses. A paused execution can let other workers run but not move the LevelInfo of a body
+being updated. No extra contract test.
+
+### Task 5: tick or draw path
+
+Not measured with a debug counter. `sub_00175437`, the only caller of the cloth update, is reached only through a
+vtable, so static search does not settle it. At 60 FPS every presented frame is one tick and one draw, so this only
+matters on hitch frames above 66.7 ms; if cloth is in the draw path, it then misses the earlier steps' time and slows
+down during the hitch. Acceptable until a scene with cloth shows otherwise.
+
+### Perf
+
+`PERF_SOAK=60 node out/perf-60/bench.mjs`, same session conditions, C01 build (`out/boot-hooks`) against
+`out/boot-fps`:
+
+| Window | Baseline mean | Hooks mean | Baseline update | Hooks update |
+| --- | --- | --- | --- | --- |
+| Opening | 16.4 ms | 16.4 ms | 4.21 ms | 4.27 ms |
+| Control | 18.6 ms | 18.7 ms | 4.71 ms | 4.80 ms |
+| 60 s walk | 16.8 ms | 16.8 ms | 5.69 ms | 5.74 ms |
+
+Frame means are within 0.1 ms and update time within 0.09 ms. Both runs are slower than the 06 table because
+of host load; compare within this table only.
+
+### Audio stutter
+
+The guest-side sink (`SilentAudioSink`) queues up to 8,192 frames (170 ms) ahead of the guest clock and copies each
+submission into the page's ring. Whenever the page empties the ring (the first activation after a gesture, every
+blur and focus, a context state change), the guest queue stays full, so from then on each frame reaches the ring just
+before the worklet plays it. Measured in the mission: about 8,200 frames queued before a blur and focus, then 270 to
+740 frames (6 to 15 ms) for the rest of the session. Any producer delay above that is an underrun. The two clocks agree
+(48,001.9 frames per second against `performance.now` over two minutes), so drift is not the cause.
+
+Fix (src/browser/silent-audio.cpp): when a submission finds the ring empty while the guest clock still has at least
+`kRefillFrames` (1,024) frames to play, those frames are written again first. After a blur and focus the ring is back
+at about 8,200 frames, with no underruns or drops. A refill can only happen into an empty ring, so the extra latency
+it can add is bounded by one queue. Contract: `outputCushion` in tests/browser/silent-audio.cpp, which failed before
+the change. Two audio-provider cases emptied the ring while the guest still had 8,192 frames queued, which the page
+never does without a flush; they now leave the ring as it is.
+
+### Open
+
+- Subjective checks for the user's playtest: camera shake length after damage or a hard landing, night vision and
+  thermal grain at about 30 Hz, ledge and corner turns, movie speed in cutscenes and the menu background, audio with
+  focus changes.
+- 10 minute soak (`PERF_SOAK=600`) and the A/B build without the three hooks were not run.
+- Display rates above 60 Hz remain unconfirmed.

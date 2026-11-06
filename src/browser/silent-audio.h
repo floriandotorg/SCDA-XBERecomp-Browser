@@ -10,6 +10,7 @@ struct AudioOutput {
   std::array<float, kFrames * ::audio::kChannels> samples{};
   void Reset();
   bool Submit(std::span<const float> source);
+  bool Drained() const;
 };
 
 struct SilentAudioSnapshot {
@@ -36,6 +37,9 @@ class SilentAudioSink {
   static bool AdvanceState(SilentAudioSnapshot& state, ClockState& clock, uint64_t now100ns);
 public:
   static constexpr uint32_t kCapacityFrames = audio::kRate;
+  // A browser ring the page emptied (a focus change or the first activation) while the guest clock still has this
+  // many frames to play gets them again, so it keeps the queue's cushion instead of playing just in time.
+  static constexpr uint32_t kRefillFrames = 1024;
   SilentAudioSink(Runtime& runtime, PreparedImage& image, std::shared_ptr<AudioOutput> output = {});
   bool NeedsSamples() const;
   bool HasOutput() const { return bool(output_); }

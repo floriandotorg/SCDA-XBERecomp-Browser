@@ -1019,7 +1019,6 @@ void audibleBuffer() {
     guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_SetMixBinVolumes), {buffer, kMixBins}, 2);
     guest.Call(BROWSER_AUDIO_GUEST(IDirectSoundBuffer_SetVolume), {buffer, uint32_t(-10000)}, 2);
     const uint32_t before = output->header[0];
-    output->header[1] = before;
     fixture.source = 10000000;
     fixture.queue->Drive(context, base);
     check(output->header[0] > before && output->samples[(before % browser::AudioOutput::kFrames) * 6] == 0,
@@ -1049,7 +1048,6 @@ void audibleStreamAfterPriming() {
       guest.WriteDesc(kPacketDesc, {kPayload + 64, 4, kOut + 24, kOut + 28, 0});
       check(guest.Call(BROWSER_AUDIO_GUEST(CDirectSoundStream_Process), {stream, kPacketDesc, 0}, 3) == 0, "short speech packet rejected");
       const uint32_t before = output->header[0];
-      output->header[1] = before;
       fixture.source = (n + 1) * 100000;
       fixture.queue->Drive(context, base);
       const uint32_t offset = before % browser::AudioOutput::kFrames * 6;

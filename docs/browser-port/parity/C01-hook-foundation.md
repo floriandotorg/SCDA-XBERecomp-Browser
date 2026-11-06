@@ -106,7 +106,7 @@ What C01 built, for the chunks that follow.
 ### Adding a hook
 
 1. Add the file name (without `.cpp`) to `BROWSER_GAME_HOOKS` (tools/browser/CMakeLists.txt). The default is
-   `magma_time;intro`. Hooks are compiled only into `BROWSER_MENU` builds; inventory rejects them otherwise.
+   `magma_time;intro;fpsfixes;camera_shake;root_motion` since C02; `crt_math` and `bink` are always added. Hooks are compiled only into `BROWSER_MENU` builds; inventory rejects them otherwise.
 2. Configure. inventory.mjs checks the includes against the allowlist and every strong `sub_X` (also `GUEST(name)` and
    `HLE_*`) against the browser overrides, then writes `hook_manifest.h`, which Diagnostics reads.
 3. If the address already has a browser override, add `address:owner` to `browser_hook_renames` and make the owner

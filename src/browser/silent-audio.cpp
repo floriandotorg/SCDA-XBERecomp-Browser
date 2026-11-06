@@ -28,6 +28,10 @@ bool AudioOutput::Submit(std::span<const float> source) {
   return true;
 }
 
+bool AudioOutput::Drained() const {
+  return header[3].load(std::memory_order_acquire) && header[0].load(std::memory_order_relaxed) == header[1].load(std::memory_order_acquire);
+}
+
 SilentAudioSink::SilentAudioSink(Runtime& runtime, PreparedImage& image, std::shared_ptr<AudioOutput> output)
   : runtime_(runtime), image_(image), memory_(image.memory.get()), output_(std::move(output)) {
   runtime_.Checkpoint({});
@@ -70,6 +74,7 @@ void SilentAudioSink::SubmitAtTime(const X86Context& context, uint64_t now, std:
     auto state = state_;
     auto clock = clock_;
     consumed = AdvanceState(state, clock, now);
+    const uint64_t pending = state.queuedFrames, pendingStart = state.submittedFrames - pending;
     if (frames > kCapacityFrames - state.queuedFrames) {
       throw Fault(context, 0, 0, "silent audio queue capacity exhausted");
     }
@@ -88,6 +93,12 @@ void SilentAudioSink::SubmitAtTime(const X86Context& context, uint64_t now, std:
     }
     state_ = state;
     clock_ = clock;
+    if (output_ && frames && pending >= kRefillFrames && output_->Drained()) {
+      const size_t start = size_t(pendingStart % kCapacityFrames) * audio::kChannels, count = size_t(pending) * audio::kChannels;
+      const size_t first = std::min(count, samples_.size() - start);
+      output_->Submit(std::span(samples_).subspan(start, first));
+      output_->Submit(std::span(samples_).first(count - first));
+    }
     if (output_) { output_->Submit(samples); }
   }
   if (consumed) { runtime_.Wake(); }

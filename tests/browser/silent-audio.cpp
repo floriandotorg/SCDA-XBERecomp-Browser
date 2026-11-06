@@ -20,12 +20,12 @@ struct Fixture {
   browser::PreparedImage image;
   std::shared_ptr<browser::TimerQueue> queue;
   std::shared_ptr<browser::SilentAudioSink> sink;
-  explicit Fixture(std::function<void(const X86Context&, uint64_t)> beforeAdvance = {}) {
+  explicit Fixture(std::function<void(const X86Context&, uint64_t)> beforeAdvance = {}, std::shared_ptr<browser::AudioOutput> output = {}) {
     image.memory = std::make_unique<browser::Memory>();
     image.memory->Ensure(0x10000, 4096);
     queue = browser::InstallTimerProvider(runtime, image);
     const auto tick = browser::InstallTimerTickCount(runtime, image, queue);
-    sink = std::make_shared<browser::SilentAudioSink>(runtime, image);
+    sink = std::make_shared<browser::SilentAudioSink>(runtime, image, std::move(output));
     browser::InstallTimerClockObserver(runtime, image, queue,
       [sink = sink, beforeAdvance = std::move(beforeAdvance)](const X86Context& context, uint64_t now) {
         if (beforeAdvance) { beforeAdvance(context, now); }
@@ -345,8 +345,36 @@ void outputRing() {
     "browser output counters failed to wrap at uint32");
 }
 
+void outputCushion() {
+  const auto output = std::make_shared<browser::AudioOutput>();
+  Fixture fixture({}, output);
+  output->header[3] = 1;
+  const auto frames = [](uint32_t first, uint32_t count) {
+    std::vector<float> samples(size_t(count) * audio::kChannels);
+    for (uint32_t n = 0; n < count; ++n) { samples[size_t(n) * audio::kChannels] = float(first + n); }
+    return samples;
+  };
+  const auto queued = [&] { return output->header[0].load() - output->header[1].load(); };
+  const auto first = [&] { return output->samples[size_t(output->header[1].load() % browser::AudioOutput::kFrames) * audio::kChannels]; };
+  fixture.Run([&](X86Context& context, uint8_t*) {
+    fixture.sink->SubmitAtTime(context, 0, frames(0, 8192));
+    check(queued() == 8192, "the first submission did not fill the browser ring");
+    output->header[1] += 2400;
+    output->header[1] = output->header[0].load();
+    fixture.sink->SubmitAtTime(context, 500000, frames(8192, 2400));
+    check(queued() == 8192, "a flushed browser ring did not get the frames the guest has not played yet");
+    check(first() == 2400, "the refilled browser ring does not start where the guest clock is");
+    output->header[1] += 5792;
+    check(first() == 8192, "the refilled browser ring is not followed by the new frames");
+    output->header[1] = output->header[0].load();
+    fixture.sink->SubmitAtTime(context, 500000 + 1700000, frames(10592, 2400));
+    check(queued() == 2400 && first() == 10592, "a browser ring drained with the guest clock replayed old frames");
+  });
+}
+
 int main() {
   outputRing();
+  outputCushion();
   arithmetic();
   submitAfterIdle();
   ownership();
