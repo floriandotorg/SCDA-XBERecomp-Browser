@@ -38,7 +38,11 @@ int main() {
   check(R32(0x30000) == 0x11223344 && R16(0x30004) == 0x5566 && R64(0x30008) == 0x0102030405060708ull, "word round trip");
   check(R8(0x30000) == 0x44 && R8(0x30003) == 0x11, "byte read is not little endian");
 
+#ifdef X86_FLAT_MEMORY
+  check(G<uint32_t>(0x30000) == 0x11223344, "flat memory hands out host references without a lease, as generated code reads it");
+#else
   check(Faults([] { G<uint32_t>(0x30000); }), "a host reference was taken without a backing lease");
+#endif
   {
     auto lease = memory.Borrow();
     G<float>(0x30010) = 2.5f;

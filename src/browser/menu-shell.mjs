@@ -7,15 +7,18 @@ import { createSettings, SETTINGS } from './settings.mjs';
 import { ACTIONS, PAD_ACTIONS, PAD_BUTTONS, keyNamed, keyOfButton, keyOfVk, keyOfWheel, vkOfCode } from './input-actions.mjs';
 import { bind, bindPad, keyBinding, label as keyLabel, padBinding } from './input-bindings.mjs';
 import { createWheelAccumulator } from './keyboard-input.mjs';
+import { frameShape } from './frame-shape.mjs';
 
-const FRAME = Object.freeze({ width: 640, height: 480 });
 const onOff = Object.freeze({ true: 'On', false: 'Off' });
 const KEEP_CAPS = new Set(['EEV', 'OPSAT', 'EMF', 'HUD', 'COOP', 'LS', 'RS', 'LB', 'RB', 'LT', 'RT']);
 const sentence = text => text.split(' ').map((word, n) => KEEP_CAPS.has(word) ? word : n ? word.toLowerCase() : word[0] + word.slice(1).toLowerCase()).join(' ');
 const TABS = Object.freeze([
   { id: 'display', label: 'Display', rows: [
     { setting: 'scaling', label: 'Picture', values: { fit: 'Fit to window', integer: 'Pixel perfect', stretch: 'Stretch' } },
+    { setting: 'aspect', label: 'Aspect ratio', values: { auto: 'Auto: match window', '4:3': '4:3', '16:10': '16:10', '16:9': '16:9', '21:9': '21:9' } },
     { setting: 'filter', label: 'Upscaling', values: { smooth: 'Smooth', sharp: 'Sharp' } },
+    { setting: 'fov', label: 'Field of view', format: value => value === 75 ? '75 (default)' : String(value) },
+    { setting: 'fmvScale', label: 'Full screen movies', values: { fill: 'Fill', '4:3': '4:3' } },
     { fullscreen: true, label: 'Fullscreen' },
   ] },
   { id: 'audio', label: 'Audio', rows: [{ setting: 'volume', label: 'Master volume', format: value => `${value}%` }] },
@@ -95,20 +98,19 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     diagnostic.hidden = !settings.get('showDiagnostics');
     if (!diagnostic.hidden) { diagnostic.textContent = JSON.stringify(evidence, null, 2); }
   };
+  let shape = { aspect: 4 / 3 }, hostSettings, layoutTimer;
   const layout = () => {
-    const mode = settings.get('scaling');
-    const width = window.innerWidth, height = window.innerHeight, ratio = window.devicePixelRatio || 1;
-    let frameWidth = width, frameHeight = height;
-    if (mode !== 'stretch') {
-      const fit = Math.min(width / FRAME.width, height / FRAME.height);
-      const whole = Math.floor(fit * ratio);
-      const scale = mode === 'integer' && whole >= 1 ? whole / ratio : fit;
-      frameWidth = FRAME.width * scale;
-      frameHeight = FRAME.height * scale;
-    }
-    stage.style.setProperty('--frame-width', `${frameWidth}px`);
-    stage.style.setProperty('--frame-height', `${frameHeight}px`);
+    shape = frameShape({ aspect: settings.get('aspect'), scaling: settings.get('scaling'), width: window.innerWidth,
+      height: window.innerHeight, ratio: window.devicePixelRatio || 1 });
+    stage.style.setProperty('--frame-width', `${shape.width}px`);
+    stage.style.setProperty('--frame-height', `${shape.height}px`);
     stage.dataset.filter = settings.get('filter');
+    hostSettings?.refresh();
+  };
+  // a window drag resizes many times a second: the guest's shape follows once it settles
+  const resized = () => {
+    clearTimeout(layoutTimer);
+    layoutTimer = setTimeout(layout, 150);
   };
 
   const activeLayer = () => panel === 'settings' ? settingsLayer : panel === 'pause' ? pauseLayer :
@@ -427,6 +429,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const controller = createShellController({ onChange: state => render(state), createRuntime: () => createMenuRuntime({
     developmentStart: settings.get('developmentStart'), settings, createMotion, createAudio,
     onKeyboard: value => { keyboard = value; show(); },
+    hostComputed: () => ({ effectiveAspect: shape.aspect }),
+    onHostSettings: value => { hostSettings = value; },
     acquireCanvas: () => {
       if (!globalThis.navigator?.gpu || typeof canvas.transferControlToOffscreen !== 'function') {
         throw Object.assign(new Error('WebGPU and an offscreen canvas are required in this browser.'), { code: 'CAPABILITY' });
@@ -576,7 +580,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     void select(file, startAfter);
   };
   const stopSettings = settings.subscribe(name => {
-    if (name === 'scaling' || name === 'filter') { layout(); }
+    if (name === 'scaling' || name === 'filter' || name === 'aspect') { layout(); }
     if (name === 'volume') { audio?.setVolume(settings.get('volume') / 100); }
     if (name === 'showFps') { show(); }
     if (name === 'showDiagnostics') { showDiagnostics(); }
@@ -596,7 +600,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   window.addEventListener('keyup', keyup, true);
   window.addEventListener('mousedown', captureMouse, true);
   window.addEventListener('wheel', captureWheelEvent, { capture: true, passive: false });
-  window.addEventListener('resize', layout);
+  window.addEventListener('resize', resized);
   layout();
   showDiagnostics();
   renderSettings();
@@ -625,7 +629,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       window.removeEventListener('keyup', keyup, true);
       window.removeEventListener('mousedown', captureMouse, true);
       window.removeEventListener('wheel', captureWheelEvent, { capture: true, passive: false });
-      window.removeEventListener('resize', layout);
+      window.removeEventListener('resize', resized);
+      clearTimeout(layoutTimer);
       await controller.stop();
     },
     beginMeasurement: () => { measurement.begin(); },

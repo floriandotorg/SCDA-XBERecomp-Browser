@@ -52,6 +52,8 @@ app::Settings Decode(const Snapshot& snapshot) {
     const float value = std::bit_cast<float>(snapshot.words[entry.word]);
     if (snapshot.words[entry.word] && std::isfinite(value)) { settings.*entry.field = value; }
   }
+  if (snapshot.words[kFovWord]) { settings.fov = std::clamp<uint32_t>(snapshot.words[kFovWord], 45, 140); }
+  settings.fmv_scale = snapshot.words[kFmvScaleWord] ? 1 : 0;
   hostValues.clear();
   std::string_view text = snapshot.text;
   while (!text.empty()) {
@@ -67,6 +69,16 @@ std::string HostValue(std::string_view key) {
   app::Get();
   const auto found = hostValues.find(key);
   return found == hostValues.end() ? std::string() : found->second;
+}
+
+namespace {
+std::atomic<float> latchedAspect = 4.0f / 3.0f;
+}
+
+float LatchAspect() {
+  const float aspect = std::bit_cast<float>(Shared().words[kAspectWord].load(std::memory_order_acquire));
+  latchedAspect.store(std::isfinite(aspect) && aspect >= 4.0f / 3.0f ? std::min(aspect, 4.0f) : 4.0f / 3.0f, std::memory_order_release);
+  return latchedAspect.load(std::memory_order_acquire);
 }
 
 Block& Shared() {
@@ -122,8 +134,11 @@ uint32_t SettingsRevision() {
   return hs::Shared().words[hs::kRevisionWord].load(std::memory_order_acquire) / 2;
 }
 
-// the guest frame is a fixed 640 x 480
-float Aspect() { return 4.0f / 3.0f; }
+// the guest frame stays 640 x 480 and is shown this wide, as on a native window of that shape
+float Aspect() {
+  namespace hs = browser::host_settings;
+  return hs::latchedAspect.load(std::memory_order_acquire);
+}
 
 float FovScale() {
   constexpr double kRadians = 3.14159265358979323846 / 360.0;

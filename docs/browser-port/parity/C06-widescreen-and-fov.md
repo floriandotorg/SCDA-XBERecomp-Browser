@@ -214,3 +214,76 @@ for Configure. The kernel bit is read once at InstallKernelProvider.
 - Render scale and output-matched canvas size (C07).
 - The menu cursor's aspect handling (src/app/cursor.cpp:133) and the in-game options rows (`app::rows`).
 - HDR output, brightness/contrast rows.
+
+## Implementation notes
+
+What C06 built.
+
+### Shape and settings
+
+- `src/browser/frame-shape.mjs`: `frameShape` (Auto is the window's shape, at least 4:3; a fixed ratio letterboxes or
+  pillarboxes; Pixel perfect steps whole multiples of 480 device rows) and `canvasSize`. Tests in
+  `tests/browser/frame-shape.test.mjs`.
+- settings.mjs: `aspect` (auto, 4:3, 16:10, 16:9, 21:9), `fov` (45 to 140, 75) and `fmvScale` (fill, 4:3); Display tab
+  rows Aspect ratio, Field of view and Full screen movies; in-game RECOMP SETTINGS > DISPLAY rows ASPECT RATIO, FIELD
+  OF VIEW and FMV SCALE.
+- Host settings words 7 (`fov`), 8 (`fmv_scale`, from the option's index) and 9 (the effective aspect, a value the page
+  computes: `createHostSettingsWriter({ computed })`, rewritten by `refresh()` when the window settles 150 ms after a
+  resize).
+- `app::Aspect()` returns the shape latched at the last Present (`browser::host_settings::LatchAspect`, called by
+  MenuBackend's output source), so one frame's hooks and its presentation agree. `Narrow`, `Widescreen` and
+  `FovScale` are the native inline formulas over it. Checked in `tests/browser/host-settings.cpp` (Narrow(16/9) is
+  3/4, FovScale(90), a portrait shape stays 4:3).
+
+### Renderer
+
+- `MenuBackend::SetOutputSource` asks once a frame for the canvas size (`round(480 * aspect)` x 480 until C07) and the
+  upscaling filter; a changed size is configured before that Present's packet, on the same ordered path.
+- The Present packet's flags word carries `PresentPillarbox` and `PresentLinear`; the presentation pass has a
+  bilinear entry point (`fs_linear`, four loads, then the gamma ramp) beside the point sampled one. Sharp keeps the
+  point sampler.
+- Pillarbox state machine: `HookGraphics::SplashDraw` before every draw and `SplashPresent` at Swap, as d3d8.cpp keeps
+  `gpu::g_splash`, `g_splash_next` and `g_shown_splash`; Present gets the latched flag.
+- `AvGetSavedDataAddress` and the hooks' `kernel::SavedDataAddress()` now return the kept display only until the
+  first Present, as native's Swap clears it (before, the browser returned it for the whole session).
+
+### Hooks
+
+- `fov`, `hud` and `movie_aspect` are in the default hook list (movie_aspect's BinkWait menu pacing fix included, as
+  native links it). `gpu/backend.h` and `game/loading.h` are on the include allowlist.
+- `src/browser/loading-screen.cpp`, built with the hooks when `hud` is selected, is the part of loading.cpp hud.cpp
+  needs: `BeforeShowScreen` notes the ESRB notice, `PaintEdges` blacks columns 0 and 639 of a 4:3 loading picture
+  (through a sized span, so every page is uploaded again), and `BothBuffers` runs the game's own ShowScreen.
+- prompts.cpp's element draws, `app::DrawFps` and `app::DrawWatermark` are weak no-ops in game-stubs.cpp.
+- Hook helpers in flat memory builds (`G`, `HostPtr`) translate through the flat page table without a backing lease,
+  as generated code does: hooks also run under host paths that hold none (fov.cpp's FCameraSceneNode hook under the
+  mission tick faulted with "host span requires a backing lease"). Checked builds still require the lease.
+
+### Kernel flag
+
+Kept off (task 3's alternative). The hooks keep `ri + 0x4D04` equal to `Widescreen()` and refit movies, so the
+CreateDevice contract stays unchanged.
+
+### Checked in the browser (out/parity, development start)
+
+- 1280x720: canvas 853 x 480, round objects stay round, HUD on the right edge, subtitles on the left, the pause menu
+  centred 4:3 with its backdrop full width.
+- 1680x720: canvas 1120 x 480, same placement.
+- 1280x960: canvas 640 x 480 as before.
+- No WebGPU validation errors in any of the three.
+
+### Not checked
+
+Loading pictures with black edges during fades, the ESRB notice, 16:9 cinematics, the menu background movie, the
+OPSAT and sniper scope at 16:9, keypad and lock pick model scale with FOV 90, and live window resizing are left for
+the user's playtest. The perf harness was not run.
+
+### Static lifetime
+
+| Static | Restart safe because |
+| --- | --- |
+| fov.cpp `g_view`, `g_scale`, `g_world_to_screen` | Set by the next frame view |
+| hud.cpp page and mask state | Set per draw; the mask restores only values it wrote |
+| movie_aspect thread locals | Per draw |
+| loading-screen `g_edges` | Set by the next ShowScreen |
+| host-settings latched aspect | Latched again at every Present |

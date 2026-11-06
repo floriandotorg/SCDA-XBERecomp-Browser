@@ -22,6 +22,9 @@ inline constexpr uint32_t kMouseSensitivityWord = 3;
 inline constexpr uint32_t kFreeLookSensitivityWord = 4;
 inline constexpr uint32_t kWeaponSensitivityWord = 5;
 inline constexpr uint32_t kSniperSensitivityWord = 6;
+inline constexpr uint32_t kFovWord = 7;
+inline constexpr uint32_t kFmvScaleWord = 8;
+inline constexpr uint32_t kAspectWord = 9;
 
 struct Block {
   std::array<std::atomic<uint32_t>, kWords> words{};
@@ -40,6 +43,9 @@ Block& Shared();
 // a browser setting the in-game options pages show (host.<key>=<value> lines) as the calling thread's app::Get() last
 // read it, empty when the page sent none
 std::string HostValue(std::string_view key);
+// app::Aspect() for the frame being drawn: the page's shape, taken once a Present so one frame's hooks and its
+// presentation agree (MenuBackend's output source calls it)
+float LatchAspect();
 // false while a writer holds the block or it changed under every attempt
 bool Read(const Block& block, Snapshot& snapshot);
 

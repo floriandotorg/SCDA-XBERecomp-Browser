@@ -12,11 +12,15 @@ export const HOST_SETTINGS_FIELDS = Object.freeze([
   Object.freeze({ field: 'free_look_sensitivity', key: 'sensitivity', type: 'f32', word: 4 }),
   Object.freeze({ field: 'weapon_sensitivity', key: 'weaponSensitivity', type: 'f32', word: 5 }),
   Object.freeze({ field: 'sniper_sensitivity', key: 'sniperSensitivity', type: 'f32', word: 6 }),
+  Object.freeze({ field: 'fov', key: 'fov', type: 'u32', word: 7 }),
+  Object.freeze({ field: 'fmv_scale', key: 'fmvScale', type: 'u32', word: 8, values: Object.freeze(['fill', '4:3']) }),
+  // the frame's shape the page shows (frame-shape.mjs), computed from the aspect setting and the window
+  Object.freeze({ field: 'aspect', key: 'effectiveAspect', type: 'f32', word: 9, computed: true }),
   Object.freeze({ field: 'keys', key: 'keys', type: 'map' }),
   Object.freeze({ field: 'pad_buttons', key: 'padButtons', type: 'map' }),
   // browser settings the in-game options pages show and step (settings-rows.cpp), as host.<key>=<value> lines
   ...['scaling', 'filter', 'volume', 'showFps', 'skipIntros', 'pauseOnFocusLoss', 'sensitivity', 'weaponSensitivity',
-    'sniperSensitivity', 'invertY'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
+    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
 ]);
 const REVISION = 0, SCHEMA = 1, FLAGS = 2;
 const ATTEMPTS = 1 << 16;
@@ -36,8 +40,9 @@ export const encodeHostSettings = values => {
       if (typeof value !== 'boolean') { invalid(); }
       if (value) { words[FLAGS] |= 1 << entry.bit; }
     } else if (entry.type === 'u32') {
-      if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) { invalid(); }
-      words[entry.word] = value;
+      const number = entry.values ? entry.values.indexOf(value) : value;
+      if (!Number.isInteger(number) || number < 0 || number > 0xffffffff) { invalid(); }
+      words[entry.word] = number;
     } else if (entry.type === 'f32') {
       if (!Number.isFinite(value)) { invalid(); }
       words[entry.word] = new Uint32Array(Float32Array.of(value).buffer)[0];
@@ -107,17 +112,18 @@ export const readHostSettings = ({ words, bytes }, { attempts = ATTEMPTS } = {})
   return undefined;
 };
 
-export const createHostSettingsWriter = ({ buffer, byteOffset, settings, onWrite = () => {} }) => {
+// computed: values the page works out (the frame's shape), merged over the settings; refresh writes them again
+export const createHostSettingsWriter = ({ buffer, byteOffset, settings, computed = () => ({}), onWrite = () => {} }) => {
   if (typeof settings?.snapshot !== 'function' || typeof settings.subscribe !== 'function') { fail('Host settings writer requires settings.'); }
   const view = createHostSettingsView(buffer, byteOffset);
   let revision;
   const write = () => {
-    revision = writeHostSettings(view, encodeHostSettings(settings.snapshot()));
+    revision = writeHostSettings(view, encodeHostSettings({ ...settings.snapshot(), ...computed() }));
     onWrite(revision);
   };
   write();
   const unsubscribe = settings.subscribe(name => { if (keys.has(name)) { write(); } });
-  return Object.freeze({ dispose: unsubscribe, get revision() { return revision; } });
+  return Object.freeze({ dispose: unsubscribe, refresh: write, get revision() { return revision; } });
 };
 
 // hook-graphics.h kHookStatusWords: fog latched by the last presented frame, optional effects left undrawn and the

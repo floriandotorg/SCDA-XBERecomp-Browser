@@ -8,6 +8,9 @@ const normalizePads = value => Object.fromEntries(Object.entries(value).filter((
 export const SETTINGS = Object.freeze({
   scaling: Object.freeze({ initial: 'fit', options: Object.freeze(['fit', 'integer', 'stretch']) }),
   filter: Object.freeze({ initial: 'smooth', options: Object.freeze(['smooth', 'sharp']) }),
+  aspect: Object.freeze({ initial: 'auto', options: Object.freeze(['auto', '4:3', '16:10', '16:9', '21:9']) }),
+  fov: Object.freeze({ initial: 75, min: 45, max: 140, step: 1 }),
+  fmvScale: Object.freeze({ initial: 'fill', options: Object.freeze(['fill', '4:3']) }),
   volume: Object.freeze({ initial: 100, min: 0, max: 100, step: 5 }),
   sensitivity: Object.freeze({ initial: 1, min: 0.1, max: 5, step: 0.1 }),
   weaponSensitivity: Object.freeze({ initial: 1, min: 0.1, max: 5, step: 0.1 }),

@@ -22,6 +22,7 @@
 #include <emscripten/heap.h>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <mutex>
 #include <optional>
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
@@ -193,6 +194,11 @@ struct Session {
 #endif
     auto backend = std::make_unique<browser::MenuBackend>(runtime, *image, std::make_shared<browser::webgpu::Transport>(), rendererLimits);
     renderer = backend.get();
+    // the page's shape, latched for the frame: the canvas is as wide as it at the frame's 480 rows
+    renderer->SetOutputSource([] {
+      const float aspect = browser::host_settings::LatchAspect();
+      return browser::MenuBackend::Output{uint32_t(std::lround(480 * aspect)), 480, browser::host_settings::HostValue("filter") != "sharp"};
+    });
     graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), graphics_mode, std::move(backend));
     graphics->ConfigurePresentCheckpoint(BROWSER_MENU_TRACE_FRAMES);
 #else
@@ -289,7 +295,7 @@ struct Session {
         provider->Tick(context, now);
       });
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
-    browser::InstallAvProvider(runtime, *image->memory, [this] { return savedDisplay; });
+    browser::InstallAvProvider(runtime, *image->memory, [this] { return graphics->Hooks().SavedDisplay(); });
     browser::InstallDelayProvider(runtime);
     input = std::make_shared<browser::MenuInput>(runtime, *image, story ? story->input : nullptr);
     launcher = std::make_shared<browser::MenuLaunch>(runtime, *image, bool(story));
@@ -354,6 +360,7 @@ struct Session {
     if (story->display) {
       const auto& display = *story->display;
       savedDisplay = allocate(uint32_t(display.pixels.size()) + 64);
+      graphics->Hooks().SetSavedDisplay(savedDisplay);
       const std::array<uint32_t, 5> header = {(display.common & 0xffff0000) | 1u, (savedDisplay + 64) & 0x1fffffffu, 0, display.format, display.size};
       image->memory->Write(context, savedDisplay, header.data(), sizeof(header));
       image->memory->Write(context, savedDisplay + 64, display.pixels.data(), display.pixels.size());

@@ -40,7 +40,15 @@ public:
   void FilterShadows(const float* m);
   void ApplyShadows();
   uint64_t UnsupportedEffects() const { return unsupported_.load(std::memory_order_relaxed); }
+  // AvGetSavedDataAddress: the display a story restart kept, shown until the title presents its own (native Swap
+  // clears it)
+  void SetSavedDisplay(uint32_t surface) { savedDisplay_.store(surface, std::memory_order_release); }
+  uint32_t SavedDisplay() const { return savedDisplay_.load(std::memory_order_acquire); }
+  // gpu::g_splash at a draw and a Present, as the native HLE keeps it: true when the frame to show is a 4:3 picture
+  void SplashDraw();
+  bool SplashPresent();
 private:
+  std::atomic<uint32_t> savedDisplay_ = 0;
   bool Supported(GraphicsEffect effect);
   gpu::State& state_;
   std::recursive_mutex& lock_;

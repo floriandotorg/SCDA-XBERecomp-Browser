@@ -64,10 +64,37 @@ enum : uint32_t {
   kCannotDelete = 0xC0000121,
 };
 
-// valid while the calling guest worker keeps its backing lease: not across a CallGuest that may wait
+}
+
+namespace browser::hooks {
+// a host pointer to size guest bytes, its pages marked written. Flat memory keeps every page at a fixed host address,
+// so no lease is needed, as generated code takes none; hooks also run under host paths that hold none (a mission
+// tick). Checked memory needs the caller's backing lease.
+inline uint8_t* Span(uint32_t va, size_t size) {
+#ifdef X86_FLAT_MEMORY
+  uint8_t* base = Base();
+  const auto* delta = reinterpret_cast<const uintptr_t*>(base);
+  const uint32_t first = va >> 12, last = uint32_t((uint64_t(va) + size - 1) >> 12);
+  if (!size || last > 0xFFFFF || delta[first] + uintptr_t(first) * 4096 == Memory::kFlatUnmapped) {
+    throw Fault(NoContext(), va, uint32_t(size), "unmapped guest memory");
+  }
+  for (uint32_t page = first; page <= last; ++page) {
+    if (delta[page] != delta[first]) { throw Fault(NoContext(), va, uint32_t(size), "noncontiguous host span"); }
+    FlatWrite(base, page == first ? va : page << 12);
+  }
+  return FlatHost(base, va);
+#else
+  return Bound().Span(NoContext(), va, size);
+#endif
+}
+}
+
+namespace kernel {
+
+// valid while the guest memory is: not across a CallGuest that may free what it points at
 template <typename T>
 inline T& G(uint32_t va) {
-  return *reinterpret_cast<T*>(browser::hooks::Bound().Span(browser::hooks::NoContext(), va, sizeof(T)));
+  return *reinterpret_cast<T*>(browser::hooks::Span(va, sizeof(T)));
 }
 inline uint8_t R8(uint32_t va) { return browser::hooks::Load<uint8_t>(va); }
 inline uint16_t R16(uint32_t va) { return browser::hooks::Load<uint16_t>(va); }
@@ -77,9 +104,11 @@ inline void W16(uint32_t va, uint16_t v) { browser::hooks::Store(va, v); }
 inline void W32(uint32_t va, uint32_t v) { browser::hooks::Store(va, v); }
 inline void W64(uint32_t va, uint64_t v) { browser::hooks::Store(va, v); }
 // contiguous to the end of the guest allocation; only its first page is marked written
-inline void* HostPtr(uint32_t va) { return browser::hooks::Bound().Span(browser::hooks::NoContext(), va, 1); }
+inline void* HostPtr(uint32_t va) { return browser::hooks::Span(va, 1); }
 
 std::string ReadAnsiString(uint32_t str);
+// the display a story restart kept, until the title presents its own frame; 0 then (hook-d3d.cpp)
+uint32_t SavedDataAddress();
 std::string ReadCString(uint32_t va, size_t max = 4096);
 
 struct Args {

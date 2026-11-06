@@ -28,7 +28,7 @@ const waitReady = async (ready, signal, timeoutMs) => {
 
 export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRuntime, createGPU = startGPUWorker,
   gamepad = true, createGamepad = createGamepadInput, createInput = createMenuInput, createKeyboard = createKeyboardInput, createMotion = createMissionControls, createAudio = createBrowserAudio, onPresented = () => {}, onAdapter = () => {}, onDiagnostic = () => {},
-  onKeyboard = () => {}, onHostMessage,
+  onKeyboard = () => {}, onHostMessage, hostComputed = () => ({}), onHostSettings = () => {},
   readyTimeoutMs = 20000, settings, ...runtimeOptions } = {}) => {
   if (typeof acquireCanvas !== 'function') { throw new TypeError('A fresh owned canvas is required for each menu runtime.'); }
   if (!Number.isInteger(readyTimeoutMs) || readyTimeoutMs < 1 || readyTimeoutMs > 30000) { throw new RangeError('Invalid GPU initialization deadline.'); }
@@ -153,8 +153,9 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
             if (data.metricsOffset) { metrics = new Uint32Array(data.buffer, data.metricsOffset, MISSION_METRICS_WORDS); }
             if (data.hookStatusOffset) { hookStatus = new Uint32Array(data.buffer, data.hookStatusOffset, 8); }
             if (settings && data.settingsOffset) {
-              hostSettings = createHostSettingsWriter({ buffer: data.buffer, byteOffset: data.settingsOffset, settings,
+              hostSettings = createHostSettingsWriter({ buffer: data.buffer, byteOffset: data.settingsOffset, settings, computed: hostComputed,
                 onWrite: revision => { if (live()) { onDiagnostic({ settings: { revision } }); } } });
+              onHostSettings(hostSettings);
             }
             if (data.motionOffset) {
               motion = createMotion({ buffer: data.buffer, byteOffset: data.motionOffset, signal,

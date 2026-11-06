@@ -37,6 +37,8 @@ static_assert(sizeof(BufferUpload) == 8 && sizeof(ResidentDraw) == 204 && sizeof
 struct DepthUploadPacket { uint32_t width, height, depth_bits, stencil_mask[8]; };
 static_assert(sizeof(DepthUploadPacket) == 44);
 struct ClearPacket { float color[4], depth; uint32_t stencil, flags, depth_target; uint32_t rect_count = 0; };
+// pillarbox: PresentPillarbox shows a 4:3 picture in the middle, PresentLinear samples the frame bilinearly
+enum : uint32_t { PresentPillarbox = 1, PresentLinear = 2 };
 struct PresentPacket { uint32_t pillarbox; };
 struct CopyPacket { uint32_t source, width, height; uint32_t source_x = 0, source_y = 0, destination_x = 0, destination_y = 0, force_opaque = 0; };
 static_assert(sizeof(CopyPacket) == 32);

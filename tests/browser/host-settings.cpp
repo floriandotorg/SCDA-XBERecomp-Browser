@@ -1,5 +1,7 @@
 #include "app/app.h"
 #include "browser/host-settings.h"
+#include <bit>
+#include <cmath>
 #include <cstdio>
 #include <stdexcept>
 #include <thread>
@@ -60,5 +62,17 @@ int main() {
   check(observed > 0, "readers never ran");
   Publish(block, true, "fra");
   check(app::Get().skip_intros && app::Get().language == "fra", "the final write was not read");
+  block.words[settings::kAspectWord].store(std::bit_cast<uint32_t>(16.0f / 9.0f));
+  check(app::Aspect() == 4.0f / 3.0f, "the shape changed before a Present latched it");
+  check(settings::LatchAspect() == 16.0f / 9.0f && app::Narrow() == 0.75f && app::Widescreen(), "Narrow(16/9) is 3/4");
+  block.words[settings::kAspectWord].store(std::bit_cast<uint32_t>(1.0f));
+  check(settings::LatchAspect() == 4.0f / 3.0f && app::Narrow() == 1.0f && !app::Widescreen(), "a portrait shape stays 4:3");
+  auto& revision = block.words[settings::kRevisionWord];
+  revision.store(revision.load() + 1);
+  block.words[settings::kFovWord].store(90);
+  block.words[settings::kFmvScaleWord].store(1);
+  revision.store(revision.load() + 1);
+  const float expected = float(std::tan(90 * 3.14159265358979323846 / 360) / std::tan(75 * 3.14159265358979323846 / 360));
+  check(std::abs(app::FovScale() - expected) < 1e-6f && app::Get().fmv_scale == 1, "FovScale(90) and the movie scale");
   std::puts("host-settings-contracts-ok");
 }

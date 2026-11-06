@@ -36,6 +36,13 @@ public:
     ShaderInventory inventory;
   };
   void SetMetricsSink(std::function<void(const FrameMetrics&)> sink);
+  // the page's output for the next Present, asked once a frame: the canvas size in pixels and the upscaling filter.
+  // A changed size is configured before that Present's packet, in order with it.
+  struct Output {
+    uint32_t width = 0, height = 0;
+    bool linear = false;
+  };
+  void SetOutputSource(std::function<Output()> source);
   struct SnapshotData {
     uint32_t pipelineCount = 0;
     uint32_t resourceCount = 0;

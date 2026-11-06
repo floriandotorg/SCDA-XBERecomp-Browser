@@ -112,6 +112,7 @@ constexpr uint64_t TextureBudget = 256ull * 1024 * 1024;
 uint32_t canvas_width = 0, canvas_height = 0;
 WGPUTexture gamma_texture;
 WGPURenderPipeline presentation_pipeline;
+WGPURenderPipeline presentation_linear_pipeline;
 WGPUBindGroupLayout presentation_bindings;
 WGPUPipelineLayout presentation_layout;
 Texture presentation_target{};
@@ -498,14 +499,27 @@ struct Output { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f3
   let position = positions[vertex];
   var output: Output; output.position = vec4<f32>(position,0,1); output.uv = vec2<f32>((position.x+1)*0.5,(1-position.y)*0.5); return output;
 }
-@fragment fn fs_main(input: Output) -> @location(0) vec4<f32> {
-  let dimensions = textureDimensions(source);
-  let at = clamp(vec2<i32>(floor(input.uv * vec2<f32>(dimensions))),vec2<i32>(0),vec2<i32>(dimensions)-vec2<i32>(1));
-  let color = textureLoad(source,at,0);
+fn ramped(color: vec4<f32>) -> vec4<f32> {
   let r = textureLoad(ramp,vec2<i32>(i32(round(clamp(color.r,0,1)*255)),0),0).r;
   let g = textureLoad(ramp,vec2<i32>(i32(round(clamp(color.g,0,1)*255)),0),0).g;
   let b = textureLoad(ramp,vec2<i32>(i32(round(clamp(color.b,0,1)*255)),0),0).b;
   return vec4<f32>(r,g,b,color.a);
+}
+@fragment fn fs_main(input: Output) -> @location(0) vec4<f32> {
+  let dimensions = textureDimensions(source);
+  let at = clamp(vec2<i32>(floor(input.uv * vec2<f32>(dimensions))),vec2<i32>(0),vec2<i32>(dimensions)-vec2<i32>(1));
+  return ramped(textureLoad(source,at,0));
+}
+@fragment fn fs_linear(input: Output) -> @location(0) vec4<f32> {
+  let last = vec2<i32>(textureDimensions(source)) - vec2<i32>(1);
+  let position = input.uv * vec2<f32>(textureDimensions(source)) - vec2<f32>(0.5);
+  let corner = floor(position);
+  let weight = position - corner;
+  let a = clamp(vec2<i32>(corner), vec2<i32>(0), last);
+  let b = clamp(vec2<i32>(corner) + vec2<i32>(1), vec2<i32>(0), last);
+  let top = mix(textureLoad(source,a,0), textureLoad(source,vec2<i32>(b.x,a.y),0), weight.x);
+  let bottom = mix(textureLoad(source,vec2<i32>(a.x,b.y),0), textureLoad(source,b,0), weight.x);
+  return ramped(mix(top, bottom, weight.y));
 })";
     auto source = WGPU_SHADER_SOURCE_WGSL_INIT; source.code = text(code);
     auto shader_descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT; shader_descriptor.nextInChain = &source.chain;
@@ -517,7 +531,8 @@ struct Output { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f3
     auto target = WGPU_COLOR_TARGET_STATE_INIT; target.format = WGPUTextureFormat_RGBA8Unorm;
     auto fragment = WGPU_FRAGMENT_STATE_INIT; fragment.module = shader; fragment.entryPoint = text("fs_main"); fragment.targetCount = 1; fragment.targets = &target;
     auto descriptor = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT; descriptor.layout = presentation_layout; descriptor.vertex.module = shader; descriptor.vertex.entryPoint = text("vs_main"); descriptor.fragment = &fragment;
-    presentation_pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor); wgpuShaderModuleRelease(shader);
+    presentation_pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor);
+    fragment.entryPoint = text("fs_linear"); presentation_linear_pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor); wgpuShaderModuleRelease(shader);
   }
   if (presentation_target.width != canvas_width || presentation_target.height != canvas_height) {
     const uint64_t old_size = uint64_t(presentation_target.width) * presentation_target.height * 4;
@@ -729,6 +744,7 @@ void release_resources() {
   release_presentation_target();
   if (gamma_texture) { wgpuTextureDestroy(gamma_texture); wgpuTextureRelease(gamma_texture); gamma_texture = nullptr; }
   if (presentation_pipeline) { wgpuRenderPipelineRelease(presentation_pipeline); presentation_pipeline = nullptr; }
+  if (presentation_linear_pipeline) { wgpuRenderPipelineRelease(presentation_linear_pipeline); presentation_linear_pipeline = nullptr; }
   if (presentation_layout) { wgpuPipelineLayoutRelease(presentation_layout); presentation_layout = nullptr; }
   if (presentation_bindings) { wgpuBindGroupLayoutRelease(presentation_bindings); presentation_bindings = nullptr; }
   for (auto& entry : textures) { release_views(entry.second); wgpuTextureDestroy(entry.second.handle); wgpuTextureRelease(entry.second.handle); }
@@ -802,7 +818,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_start() {
 #ifdef WEBGPU_SERVICE_TESTING
 EMSCRIPTEN_KEEPALIVE void webgpu_test_loss() { wgpuDeviceDestroy(device); }
 #endif
-EMSCRIPTEN_KEEPALIVE uint32_t webgpu_resources() { return textures.size() + pipelines.size() + resident_buffers.size() + sampler_cache.size() + cached_views + (gamma_texture ? 1 : 0) + (presentation_pipeline ? 1 : 0) + (presentation_target.handle ? 1 : 0) + (depth_upload_pipeline ? 1 : 0) + (depth_readback_pipeline ? 1 : 0) + std::count_if(partial_clear_pipelines.begin(), partial_clear_pipelines.end(), [](auto pipeline) { return pipeline != nullptr; }); }
+EMSCRIPTEN_KEEPALIVE uint32_t webgpu_resources() { return textures.size() + pipelines.size() + resident_buffers.size() + sampler_cache.size() + cached_views + (gamma_texture ? 1 : 0) + (presentation_pipeline ? 1 : 0) + (presentation_linear_pipeline ? 1 : 0) + (presentation_target.handle ? 1 : 0) + (depth_upload_pipeline ? 1 : 0) + (depth_readback_pipeline ? 1 : 0) + std::count_if(partial_clear_pipelines.begin(), partial_clear_pipelines.end(), [](auto pipeline) { return pipeline != nullptr; }); }
 EMSCRIPTEN_KEEPALIVE void webgpu_shutdown() {
   closed = true;
   if (active) { active = false; completed(2, nullptr, 0, "GPU service shutdown"); }
@@ -1017,7 +1033,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
     case Opcode::Present: {
       auto present = packet<PresentPacket>(bytes); exact(bytes, 0);
       auto& source = texture(resource);
-      if (source.depth || source.cube || source.volumeDepth > 1 || present.pillarbox > 1) { throw std::runtime_error("unsupported presentation source or flags"); }
+      if (source.depth || source.cube || source.volumeDepth > 1 || present.pillarbox > (PresentPillarbox | PresentLinear)) { throw std::runtime_error("unsupported presentation source or flags"); }
       prepare_presentation();
       auto current = WGPU_SURFACE_TEXTURE_INIT; wgpuSurfaceGetCurrentTexture(surface, &current);
       if (!current.texture) { throw std::runtime_error("canvas surface unavailable"); }
@@ -1030,9 +1046,9 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &color;
       auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr); auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
       float width = canvas_width, height = canvas_height;
-      if (present.pillarbox) { if (width * 3 > height * 4) { width = height * 4 / 3; } else { height = width * 3 / 4; } }
+      if (present.pillarbox & PresentPillarbox) { if (width * 3 > height * 4) { width = height * 4 / 3; } else { height = width * 3 / 4; } }
       wgpuRenderPassEncoderSetViewport(pass, (canvas_width - width) / 2, (canvas_height - height) / 2, width, height, 0, 1);
-      wgpuRenderPassEncoderSetPipeline(pass, presentation_pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr); wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
+      wgpuRenderPassEncoderSetPipeline(pass, present.pillarbox & PresentLinear ? presentation_linear_pipeline : presentation_pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr); wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
       auto from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; from.texture = presentation_target.handle; auto to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; to.texture = current.texture; WGPUExtent3D extent{canvas_width, canvas_height, 1}; wgpuCommandEncoderCopyTextureToTexture(encoder, &from, &to, &extent);
       submit(encoder);
       wgpuBindGroupRelease(group); wgpuTextureViewRelease(source_view); wgpuTextureViewRelease(ramp_view); wgpuTextureViewRelease(target_view); wgpuTextureRelease(current.texture);

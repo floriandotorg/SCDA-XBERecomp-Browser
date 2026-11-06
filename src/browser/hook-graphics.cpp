@@ -122,3 +122,18 @@ void PublishHookStatus(const HookGraphics& graphics, FogLatch presented) {
 }
 
 }
+
+namespace browser {
+
+void HookGraphics::SplashDraw() {
+  if (!gpu::g_in_splash) { gpu::g_splash = false; }
+}
+
+bool HookGraphics::SplashPresent() {
+  savedDisplay_.store(0, std::memory_order_release);
+  if (gpu::g_splash_next.exchange(false)) { gpu::g_splash = true; }
+  gpu::g_shown_splash = gpu::g_splash.load();
+  return gpu::g_shown_splash;
+}
+
+}

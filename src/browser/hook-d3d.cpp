@@ -28,3 +28,10 @@ void ApplyShadows() { browser::hooks::Graphics().ApplyShadows(); }
 void ViewScale(float xy) { browser::hooks::Graphics().ViewScale(xy); }
 
 }
+
+namespace kernel {
+
+uint32_t SavedDataAddress();
+uint32_t SavedDataAddress() { return browser::hooks::Graphics().SavedDisplay(); }
+
+}

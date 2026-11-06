@@ -1250,6 +1250,7 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
         hooks_.LatchFog(ramp);
       }
       renderer_->IndexSource(indices.empty() ? 0 : frame[3]);
+      hooks_.SplashDraw();
       renderer_->Draw(state_, frame[1], id == 20 ? 0 : frame[2], count, indices.empty() ? nullptr : indices.data());
       if (state_.rt.header) { gpuWritten_.insert(0x80000000 | (state_.rt.data & 0x3ffffff)); }
       if (state_.zs.header) { gpuWritten_.insert(0x80000000 | (state_.zs.data & 0x3ffffff)); }
@@ -1284,7 +1285,7 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
       const gpu::Surface front{resources_[1].header, header[1], header[3], header[4]};
       uint32_t count;
       memory_->Read(ctx, device + 0x2478, &count, 4);
-      renderer_->Present(front, false);
+      renderer_->Present(front, hooks_.SplashPresent());
       PublishHookStatus(hooks_, hooks_.Fog());
       hooks_.ClearFog();
       for (uint32_t n = 0; n < payload.size(); ++n) {

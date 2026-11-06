@@ -312,6 +312,8 @@ struct MenuBackend::Impl {
   uint64_t uploadSequence = 0;
   uint32_t white = 0;
   uint32_t width = 0, height = 0;
+  uint32_t canvasWidth = 0, canvasHeight = 0;
+  std::function<MenuBackend::Output()> outputSource;
   uint32_t submitted = 0, completed = 0;
   uint64_t submittedCount = 0, completedCount = 0;
   uint32_t nextFence = 0, completedFence = 0;
@@ -1033,6 +1035,7 @@ bool MenuBackend::Init(uint32_t width, uint32_t height) {
   require(width && height && width <= 4096 && height <= 4096, "menu backend target dimension budget exceeded");
   impl_->sendPacket(webgpu::Opcode::Configure, 0, webgpu::Dimensions{width, height});
   impl_->width = width; impl_->height = height; impl_->initialized = true;
+  impl_->canvasWidth = width; impl_->canvasHeight = height;
   return true;
 }
 void MenuBackend::IndexSource(uint32_t address) {
@@ -1574,12 +1577,24 @@ bool MenuBackend::HasGpuContents(uint32_t location) const {
   const auto found = impl_->resources.find(uint64_t(address(location)) * 2);
   return found != impl_->resources.end() && found->second.renderTarget && found->second.dirty;
 }
+void MenuBackend::SetOutputSource(std::function<Output()> source) {
+  std::lock_guard lock(impl_->mutex);
+  impl_->outputSource = std::move(source);
+}
 void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
   std::lock_guard lock(impl_->mutex);
   impl_->feedbackPins.clear();
   require(impl_->initialized, "menu backend present before initialization");
   auto& item = impl_->surface(front);
-  const auto result = impl_->sendPacket(webgpu::Opcode::Present, item.id, webgpu::PresentPacket{uint32_t(pillarbox)});
+  const Output output = impl_->outputSource ? impl_->outputSource() : Output{};
+  if (output.width && output.height && (output.width != impl_->canvasWidth || output.height != impl_->canvasHeight)) {
+    require(output.width <= 8192 && output.height <= 8192, "menu backend canvas dimension budget exceeded");
+    impl_->sendPacket(webgpu::Opcode::Configure, 0, webgpu::Dimensions{output.width, output.height});
+    impl_->canvasWidth = output.width;
+    impl_->canvasHeight = output.height;
+  }
+  const uint32_t flags = (pillarbox ? webgpu::PresentPillarbox : 0) | (output.linear ? webgpu::PresentLinear : 0);
+  const auto result = impl_->sendPacket(webgpu::Opcode::Present, item.id, webgpu::PresentPacket{flags});
   item.command = result.command; ++impl_->frames;
   if (impl_->metricsSink) {
     impl_->metricsSink({impl_->frames, impl_->commandWaitMicroseconds, impl_->readbackWaitMicroseconds, impl_->uploadWaitMicroseconds,
