@@ -333,7 +333,7 @@ export const readMissionDiagnostic = (module) => {
 
 export const createBootSession = ({ create, manifest, postMessage, prepare = prepareDiscImage, onProgress = () => {} }) => {
   let started = false;
-  return async ({ data: { port, mailbox, generation, ownership, size, webgpuMailbox, developmentStart = false, hostSettings } }) => {
+  return async ({ data: { port, mailbox, generation, ownership, size, webgpuMailbox, developmentStart = false, hostSettings, carry } }) => {
     if (started) {
       port?.close();
       postMessage({ ok: false, generation, code: 'SESSION', message: 'A boot worker owns one session only.' });
@@ -360,6 +360,9 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
     try {
       if (typeof developmentStart !== 'boolean') { throw Object.assign(new Error('Invalid development start option.'), { code: 'DEVELOPMENT_START' }); }
       if (hostSettings !== undefined) { validateHostSettings(hostSettings); }
+      if (carry !== undefined && (!(carry instanceof Uint8Array) || carry.length < 8 || carry.length > 64 * 2 ** 20)) {
+        throw Object.assign(new Error('Invalid image switch carry.'), { code: 'IMAGE_SWITCH_PROTOCOL' });
+      }
       const read = createWasmIsoReader({ port, mailbox, generation, ownership, getHeap: () => module.HEAPU8 });
       ownershipChecked = true;
       signal.throwIfAborted();
@@ -409,7 +412,15 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
         layout: { base: manifest.ranges.X86ImageBase, end: manifest.ranges.X86ImageEnd, entry: manifest.ranges.X86EntryPoint },
       });
       signal.throwIfAborted();
-      if (developmentStart && module._image_development_boot?.() !== 1) {
+      // the image this one replaces handed over its launch page, display and profile
+      if (carry) {
+        const address = module._image_carry_allocate?.(carry.length) ?? 0;
+        if (!address) { throw Object.assign(new Error('This build cannot take over from another image.'), { code: 'IMAGE_SWITCH_PROTOCOL' }); }
+        module.HEAPU8.set(carry, address >>> 0);
+        if (module._image_carry_in() !== 1) { throw Object.assign(new Error('The previous image\'s hand over was rejected.'), { code: 'IMAGE_SWITCH_PROTOCOL' }); }
+      }
+      signal.throwIfAborted();
+      if (developmentStart && !carry && module._image_development_boot?.() !== 1) {
         throw Object.assign(new Error('This build cannot start a development mission directly.'), { code: 'DEVELOPMENT_START' });
       }
       onProgress({ generation, phase: 'booting' });
@@ -507,6 +518,16 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
         }
       }
       signal.throwIfAborted();
+      // the guest launched the other image: the page starts its module with this one's carry
+      const target = module._image_switch_target?.() ?? 0;
+      if (target === 1 || target === 2) {
+        const address = module._image_carry_out() >>> 0;
+        const bytes = address ? module.HEAPU8.slice(address, address + module._image_carry_size()) : undefined;
+        if (!bytes) { throw Object.assign(new Error('The image switch hand over could not be packed.'), { code: 'IMAGE_SWITCH_PROTOCOL' }); }
+        postMessage({ ok: false, generation, code: 'IMAGE_SWITCH', image: target === 2 ? 'versus' : 'story', carry: bytes,
+          message: target === 2 ? 'Switching to Versus.' : 'Returning to story.', identity: manifest.identity });
+        return;
+      }
       const result = {
         ok: false, generation, runtimeRestarts: module._image_restart_count?.() ?? 0, code: 'EXPORT_UNAVAILABLE',
         message: 'Production kernel export binding is incomplete.', ...execution,

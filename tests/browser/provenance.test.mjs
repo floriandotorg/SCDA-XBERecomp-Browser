@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { verifyGeneration, generationInputs, generationOutputs } from '../../tools/browser/provenance.mjs';
+import { verifyGeneration, generationInputs, generationOutputs, imageGeneration, recordGeneration } from '../../tools/browser/provenance.mjs';
 
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const fixture = () => {
@@ -59,4 +59,20 @@ test('a proof cannot authorize changed executable bytes, generated partitions or
     files.set(path, Buffer.from('changed'));
     assert.throws(() => verifyGeneration(record, read), /generation/i);
   }
+});
+
+test('a versus record binds sc4_adv.xbe, its own config and 64 partitions, and names the versus disc files', () => {
+  const { inputs, outputs } = imageGeneration('sc4_adv.xbe');
+  assert.ok(inputs.includes('config/sc4_adv.toml') && inputs.includes('config/xdk_symbols_adv.toml') && !inputs.includes('config/scda_v2.toml'));
+  assert.equal(outputs.filter((path) => /x86_recomp\.\d+\.cpp$/.test(path)).length, 64);
+  assert.ok(outputs.every((path) => path.startsWith('generated/versus/')));
+  const files = new Map([...inputs, ...outputs, 'assets/sc4_adv.xbe'].map((path) => [path, Buffer.from(path)]));
+  const read = (path) => files.get(path) ?? (() => { throw new Error('Missing input'); })();
+  const record = recordGeneration('sc4_adv.xbe', read, (name) => files.get(`generated/versus/${name}`));
+  const manifest = verifyGeneration(record, read);
+  assert.equal(manifest.image, 'sc4_adv.xbe');
+  assert.ok(manifest.requiredStoryFiles.some((file) => file.path === 'adv/System/Entry.lin'));
+  files.set('generated/versus/x86_recomp.63.cpp', Buffer.from('changed'));
+  assert.throws(() => verifyGeneration(record, read), /generation/i);
+  assert.throws(() => recordGeneration('sc4_adv.xbe', read, (name) => name === 'x86_recomp.5.cpp' ? Buffer.from('other') : files.get(`generated/versus/${name}`)), /reproduce/);
 });

@@ -40,6 +40,7 @@ export const SETTINGS = Object.freeze({
   skipIntros: Object.freeze({ initial: false }),
   pauseOnFocusLoss: Object.freeze({ initial: true }),
   developmentStart: Object.freeze({ initial: false }),
+  startInVersus: Object.freeze({ initial: false }),
   showFps: Object.freeze({ initial: false }),
   showDiagnostics: Object.freeze({ initial: false }),
   console: Object.freeze({ initial: false }),

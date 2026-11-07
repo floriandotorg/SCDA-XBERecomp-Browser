@@ -78,7 +78,22 @@
   X(DirectSoundCreateBuffer, 130, 2) \
   X(DirectSoundCreateStream, 131, 2)
 
+// sc4_adv.xbe (versus) links two the story image lacks and lacks twelve it has; an entry absent from the image sits at
+// a placeholder address nothing calls, and the provider leaves it alone
+#define BROWSER_AUDIO_EXTRA_FIRST_ID 137
+#define BROWSER_AUDIO_EXTRA_ENTRIES(X) \
+  X(CDirectSoundStream_SetFormat, 137, 2) \
+  X(IDirectSound_SetDistanceFactor, 138, 3)
+#define BROWSER_AUDIO_EXTRA_LAST_ID 138
+
+#ifdef BROWSER_VERSUS
+#define BROWSER_AUDIO_PRESENT(name, id, args)
+#define BROWSER_AUDIO_ABSENT_PLACEHOLDERS \
+  static_assert(HAS_CDirectSoundStream_SetFormat == 1 && HAS_IDirectSound_SetDistanceFactor == 1, \
+    "versus audio entries must be present");
+#else
 #define BROWSER_AUDIO_PRESENT(name, id, args) static_assert(HAS_##name == 1, "audio entry requires a present retained symbol");
 #define BROWSER_AUDIO_ABSENT_PLACEHOLDERS \
   static_assert(HAS_CDirectSoundStream_SetFormat == 0 && HAS_IDirectSound_SetDistanceFactor == 0, \
     "absent audio placeholders must stay unbound");
+#endif

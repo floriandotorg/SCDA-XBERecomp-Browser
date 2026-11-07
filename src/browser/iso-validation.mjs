@@ -23,8 +23,10 @@ const storyPath = (path) => {
   }
   return normalized;
 };
+// the two recompiled executables a build may boot: story or versus
+const images = new Set(['default.xbe', 'sc4_adv.xbe']);
 const snapshotManifest = (manifest) => {
-  if (manifest?.schema !== 1 || manifest.image !== 'default.xbe' ||
+  if (manifest?.schema !== 1 || !images.has(manifest.image) ||
       typeof manifest.xbeSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(manifest.xbeSha256) ||
       !Number.isSafeInteger(manifest.xbeSize) || manifest.xbeSize < 1 || manifest.xbeSize > maxImageBytes ||
       !Array.isArray(manifest.requiredStoryFiles) || manifest.requiredStoryFiles.length < 1 ||
@@ -40,7 +42,7 @@ const snapshotManifest = (manifest) => {
     seen.add(path);
     return { path, minBytes: file.minBytes };
   });
-  return { size: manifest.xbeSize, sha256: manifest.xbeSha256, story };
+  return { image: manifest.image, size: manifest.xbeSize, sha256: manifest.xbeSha256, story };
 };
 const regularFile = (entry) => entry?.dir === false && Number.isSafeInteger(entry.size) &&
   entry.size >= 0 && entry.size <= 0xffffffff;
@@ -61,8 +63,8 @@ export const validateDiscImage = async ({ disc, manifest, signal }) => {
     checkpoint(signal);
     return result;
   };
-  const image = await access('default.xbe', () => disc.find('default.xbe'));
-  if (!regularFile(image)) { fail('MISSING_IMAGE', 'The disc has no story executable.'); }
+  const image = await access(identity.image, () => disc.find(identity.image));
+  if (!regularFile(image)) { fail('MISSING_IMAGE', `The disc has no ${identity.image === 'default.xbe' ? 'story' : 'versus'} executable.`); }
   if (image.size !== identity.size) { fail('IMAGE_SIZE', 'The executable size does not match this build.'); }
   for (const file of identity.story) {
     const entry = await access(file.path, () => disc.find(file.path));
@@ -73,7 +75,7 @@ export const validateDiscImage = async ({ disc, manifest, signal }) => {
   const bytes = new Uint8Array(identity.size);
   for (let n = 0; n < bytes.length; n += maxRequestBytes) {
     const length = Math.min(maxRequestBytes, bytes.length - n);
-    const part = await access('default.xbe', () => disc.read('default.xbe', n, length));
+    const part = await access(identity.image, () => disc.read(identity.image, n, length));
     if (!(part instanceof Uint8Array) || part.length !== length) {
       fail('SHORT_READ', 'The selected executable could not be read completely.');
     }

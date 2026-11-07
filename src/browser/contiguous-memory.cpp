@@ -101,7 +101,9 @@ public:
 
   void Invoke(Runtime& runtime, Memory& memory, X86Context& ctx, uint32_t ordinal) {
     if (Memory::HasBorrow()) { throw Fault(ctx, ctx.esp, 0, "contiguous allocation requires no inherited backing lease"); }
-    const uint32_t frameSize = ordinal == 166 ? 24 : 8;
+    // 165 MmAllocateContiguousMemory, 166 its Ex form, 167 MmAllocateSystemMemory (versus), 171 MmFreeContiguousMemory,
+    // 172 MmFreeSystemMemory (versus); system memory is page aligned contiguous memory, as native's mem::AllocSystem
+    const uint32_t frameSize = ordinal == 166 ? 24 : ordinal == 167 || ordinal == 172 ? 12 : 8;
     const uint64_t stackEnd = uint64_t(ctx.esp) + frameSize;
     if (stackEnd > UINT32_MAX) { throw Fault(ctx, ctx.esp, frameSize, "contiguous allocation stack cleanup overflow"); }
     auto mutation = memory.Mutate();
@@ -110,6 +112,11 @@ public:
     runtime.Checkpoint(ctx);
     if (ordinal == 171) {
       Release(ctx, frame[1]);
+    } else if (ordinal == 172) {
+      Release(ctx, frame[1]);
+      ctx.eax = frame[2];
+    } else if (ordinal == 167) {
+      ctx.eax = Allocate(ctx, memory, frame[1], 0, UINT32_MAX, 0x1000);
     } else {
       const uint32_t low = ordinal == 166 ? frame[2] : 0;
       const uint32_t high = ordinal == 166 ? frame[3] : UINT32_MAX;
@@ -127,12 +134,13 @@ public:
 
 SnapshotContiguousMemory InstallContiguousMemory(Runtime& runtime, Memory& memory, QueryContiguousMemoryUsage* usage,
   ContiguousMemoryAccess* access) {
-  if (runtime.ActiveWorkers() || runtime.KernelTarget(165) || runtime.KernelTarget(166) || runtime.KernelTarget(171) || runtime.KernelTarget(178)) {
+  if (runtime.ActiveWorkers() || runtime.KernelTarget(165) || runtime.KernelTarget(166) || runtime.KernelTarget(167) || runtime.KernelTarget(171) ||
+      runtime.KernelTarget(172) || runtime.KernelTarget(178)) {
     throw Fault({}, 165, 0, "contiguous allocation installation requires an unused stopped runtime");
   }
   runtime.Checkpoint({});
   auto allocations = std::make_shared<ContiguousMemory>();
-  for (const uint32_t ordinal : {165u, 166u, 171u, 178u}) {
+  for (const uint32_t ordinal : {165u, 166u, 167u, 171u, 172u, 178u}) {
     runtime.RegisterKernel(ordinal, [&runtime, &memory, allocations, ordinal](X86Context& ctx, uint8_t* base) {
       if (&Runtime::From(ctx) != &runtime || base != memory.Base() || !runtime.OwnsCurrentContext(ctx)) {
         throw Fault(ctx, ordinal, 0, "contiguous allocation requires its owned session worker");

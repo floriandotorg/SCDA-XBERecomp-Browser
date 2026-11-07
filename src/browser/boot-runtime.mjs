@@ -2,8 +2,11 @@ import { createWorkerBroker } from './boot-worker-broker.mjs';
 import { createIsoMailbox, finishIsoRead, isoMailboxHeader } from './iso-mailbox.mjs';
 import { validateHostSettings } from './host-settings.mjs';
 
-export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createWorkerBroker, createServices, observeIo = false, developmentStart = false, hostSettings } = {}) => {
+// image: the recompiled module this boot runs, story or versus; carry: the hand over from the image it replaces
+export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createWorkerBroker, createServices, observeIo = false, developmentStart = false, hostSettings,
+  image = 'story', carry } = {}) => {
   if (typeof developmentStart !== 'boolean') { throw new TypeError('Invalid development start option.'); }
+  if (!['story', 'versus'].includes(image) || (carry !== undefined && !(carry instanceof Uint8Array))) { throw new TypeError('Invalid image switch.'); }
   if (hostSettings !== undefined) { validateHostSettings(hostSettings); }
   const broker = createBroker({ WorkerClass });
   const pending = new Map();
@@ -132,9 +135,10 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
         await initialization;
         checkpoint(signal);
       }
-      const guest = broker.create(new URL('./boot-worker.mjs', import.meta.url), { type: 'module', name: 'story-boot' }, publish, workerError);
+      const entry = image === 'versus' ? './versus-boot-worker.mjs' : './boot-worker.mjs';
+      const guest = broker.create(new URL(entry, import.meta.url), { type: 'module', name: `${image}-boot` }, publish, workerError);
       guest.postMessage({ port: channel.port2, mailbox, generation, ownership, size: source.size,
-        developmentStart, ...(hostSettings ? { hostSettings } : {}),
+        developmentStart, ...(hostSettings ? { hostSettings } : {}), ...(carry ? { carry } : {}),
         ...(services?.webgpuMailbox ? { webgpuMailbox: services.webgpuMailbox } : {}) }, [channel.port2]);
       if (observeIo) {
         ioTimer = setInterval(() => { sample?.(); }, 1000);

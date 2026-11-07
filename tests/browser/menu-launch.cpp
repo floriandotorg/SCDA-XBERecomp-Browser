@@ -12,6 +12,9 @@ X86_FUNC(__imp__sub_000530A7) { throw std::runtime_error("original utility mount
 X86_FUNC(sub_00055666);
 
 int main() {
+  for (const char* path : {"\\Device\\CdRom0;sc4_adv.xbe", "D:\\sc4_adv.xbe", "sc4_adv.xbe", "D:\\SC4_ADV.XBE"}) { check(browser::LaunchImage(path) == browser::kVersusImage, "versus launch not matched"); }
+  for (const char* path : {"d:\\DEFAULT.XBE", "\\DEVICE\\CDROM0;default.xbe", "default.xbe"}) { check(browser::LaunchImage(path) == browser::kStoryImage, "story launch not matched"); }
+  for (const char* path : {"y:\\xboxdash.xbe", "D:\\downloader.xbe", "xsc4_adv.xbe", "D:\\xdefault.xbe", ""}) { check(browser::LaunchImage(path) == 0, "foreign launch matched"); }
   const auto development = browser::DevelopmentIcelandLaunchPage();
   const auto launchWord = [&](uint32_t offset) { uint32_t value; std::memcpy(&value, development.data() + offset, 4); return value; };
   check(launchWord(0) == 0 && launchWord(4) == 0x5553005e, "development launch has the wrong title or type");
@@ -56,7 +59,7 @@ int main() {
         image.memory->Write(ctx, ctx.esp, frame.data(), sizeof(frame));
         check(launch.Dispatch(ctx, base, 136) && image.memory->Load<uint32_t>(ctx, ctx.esp + 4) == (n ? 0u : 1u), "development utility mount did not initialize exactly once through the original function");
       }
-      for (const char* path : {static_cast<const char*>(nullptr), "", "D:\\sc4_adv.xbe", "D:\\other.xbe", "xdefault.xbe"}) {
+      for (const char* path : {static_cast<const char*>(nullptr), "", "D:\\other.xbe", "xdefault.xbe"}) {
         check(!invoke(path, 0), "unsupported launch delegated");
         check(ctx.eax == 2 && ctx.esp == 0x20f0c, "rejected launch ABI");
       }

@@ -932,3 +932,37 @@ test('game hook bindings and game log lines reach the page while the guest runs'
   await createBootSession(malformed.options)({ data: malformed.data });
   assert.equal(malformed.messages[0].code, 'HOOK_PROTOCOL');
 });
+
+test('a launch of the other image posts its hand over, and the next module takes it in before binding', async () => {
+  const out = executedFixture();
+  const carry = Uint8Array.from({ length: 12 }, (_, n) => n + 1);
+  out.module.HEAPU8.set(carry, 96);
+  Object.assign(out.module, { _image_execute: () => 0, _image_can_restart: () => 0, _image_switch_target: () => 2,
+    _image_carry_out: () => 96, _image_carry_size: () => carry.length, _image_graphics_checkpoint: () => 0, _image_launch_word: () => 0 });
+  await createBootSession(out.options)({ data: out.data });
+  assert.equal(out.messages.length, 1);
+  assert.deepEqual([out.messages[0].code, out.messages[0].image], ['IMAGE_SWITCH', 'versus']);
+  assert.deepEqual(out.messages[0].carry, carry);
+  assert.ok(out.calls.includes('reset') && out.calls.includes('close'));
+
+  const into = executedFixture();
+  const received = [];
+  Object.assign(into.module, {
+    _image_carry_allocate: size => { into.calls.push('allocate'); return size === carry.length ? 64 : 0; },
+    _image_carry_in: () => { received.push(into.module.HEAPU8.slice(64, 64 + carry.length)); into.calls.push('carry'); return 1; },
+    _image_bind: () => { into.calls.push('bind'); return 1; },
+  });
+  await createBootSession(into.options)({ data: { ...into.data, carry, developmentStart: true } });
+  assert.deepEqual(received[0], carry);
+  assert.ok(into.calls.indexOf('carry') < into.calls.indexOf('bind'));
+
+  for (const bad of [new Uint8Array(2), 'carry']) {
+    const rejected = executedFixture();
+    await createBootSession(rejected.options)({ data: { ...rejected.data, carry: bad } });
+    assert.equal(rejected.messages[0].code, 'IMAGE_SWITCH_PROTOCOL');
+  }
+  const refused = executedFixture();
+  Object.assign(refused.module, { _image_carry_allocate: () => 64, _image_carry_in: () => 0 });
+  await createBootSession(refused.options)({ data: { ...refused.data, carry } });
+  assert.equal(refused.messages[0].code, 'IMAGE_SWITCH_PROTOCOL');
+});

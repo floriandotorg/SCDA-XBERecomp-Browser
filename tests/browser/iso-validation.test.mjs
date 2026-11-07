@@ -41,7 +41,7 @@ test('absent trusted provenance blocks validation before any disc access', async
     { xbeSize: 64 * 2 ** 20 + 1 }, { xbeSize: 0 }, { xbeSize: 1.5 },
     { requiredStoryFiles: null }, { requiredStoryFiles: [] }, { requiredStoryFiles: new Array(1) },
     { requiredStoryFiles: new Array(257).fill({ path: 'story.dat', minBytes: 1 }) },
-    { schema: 2 }, { image: 'sc4_adv.xbe' },
+    { schema: 2 }, { image: 'update.xbe' }, { image: 'dashupdate.xbe' },
   ]) {
     const source = fixture();
     Object.assign(source.manifest, change);
@@ -159,4 +159,21 @@ test('required mission failures name the logical asset and operation without lea
     assert.ok(!error.message.includes('/private/'));
     return true;
   });
+});
+
+test('a versus manifest validates sc4_adv.xbe from the same disc; a story manifest never accepts it', async () => {
+  const versus = Uint8Array.from({ length: 23 }, (_, n) => (n * 7) % 251);
+  const source = fixture();
+  source.files.set('sc4_adv.xbe', versus);
+  source.files.set('adv/system/entry.lin', new Uint8Array(4));
+  const manifest = { ...source.manifest, image: 'sc4_adv.xbe', xbeSize: versus.length, xbeSha256: createHash('sha256').update(versus).digest('hex'),
+    requiredStoryFiles: [{ path: 'adv/System/Entry.lin', minBytes: 1 }] };
+  const result = await validateDiscImage({ disc: source.disc, manifest });
+  assert.deepEqual(result.bytes, versus);
+  assert.ok(source.reads.every(({ path }) => path === 'sc4_adv.xbe'));
+  await assert.rejects(validateDiscImage({ disc: source.disc, manifest: { ...manifest, xbeSize: versus.length + 1 } }), code('IMAGE_SIZE'));
+  await assert.rejects(validateDiscImage({ disc: source.disc, manifest: { ...manifest, xbeSha256: '0'.repeat(64) } }), code('IMAGE_HASH'));
+  await assert.rejects(validateDiscImage({ disc: source.disc, manifest: { ...source.manifest, xbeSize: versus.length,
+    xbeSha256: manifest.xbeSha256 } }), code('IMAGE_SIZE'));
+  await assert.rejects(validateDiscImage({ disc: source.disc, manifest: { ...manifest, image: 'update.xbe' } }), code('MANIFEST'));
 });

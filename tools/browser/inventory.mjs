@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { generationInputs, generationOutputs, verifyGeneration } from './provenance.mjs';
+import { imageById, imageGeneration, verifyGeneration } from './provenance.mjs';
 import { exportCatalog } from './export-catalog.mjs';
 import { optimizerIdentity } from './tail-call-postlink.mjs';
 
@@ -15,9 +15,10 @@ const unique = (names, category) => {
   return result;
 };
 
-export const validateImageSymbols = (config, header) => {
-  if (!/^path = "assets\/default\.xbe"$/m.test(config) || !/^#define IMAGE_XBE "default\.xbe"$/m.test(header)) {
-    throw new Error('story image identity mismatch');
+export const validateImageSymbols = (config, header, xbe = 'default.xbe') => {
+  const name = xbe.replaceAll('.', '\\.');
+  if (!new RegExp(`^path = "assets\\/${name}"$`, 'm').test(config) || !new RegExp(`^#define IMAGE_XBE "${name}"$`, 'm').test(header)) {
+    throw new Error(`${xbe === 'default.xbe' ? 'story' : 'versus'} image identity mismatch`);
   }
   const section = config.split('[symbols]')[1]?.split(/^\[/m)[0];
   if (!section) {
@@ -140,21 +141,24 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const wasmOptimization = actualTailCalls ? optimizerIdentity(optimizerTool, { simd }) : { mode: 'off', flags: [] };
   const wasmRequirements = [...(actualTailCalls ? ['tail-call'] : []), ...(simd ? ['simd128'] : [])];
   const read = (path) => readFileSync(resolve(root, path));
-  const config = read('config/scda_v2.toml').toString();
-  const count = Number(config.match(/^partitions = (\d+)$/m)?.[1]);
-  if (count !== 128) {
-    throw new Error(`expected 128 story partitions, found ${count}`);
+  const image = imageById(configuration.split(';').find((entry) => entry.startsWith('image='))?.slice(6) || 'story');
+  if (!image) { throw new Error('unknown browser image'); }
+  const generated = image.generated;
+  const config = read(image.config).toString();
+  const count = Number(config.match(/^partitions = (\d+)/m)?.[1]);
+  if (count !== image.partitions) {
+    throw new Error(`expected ${image.partitions} ${image.id} partitions, found ${count}`);
   }
-  const sources = Array.from({ length: count }, (_, n) => `generated/game/x86_recomp.${n}.cpp`);
-  const actual = readdirSync(resolve(root, 'generated/game')).filter((name) => /^x86_recomp\.\d+\.cpp$/.test(name));
+  const sources = Array.from({ length: count }, (_, n) => `${generated}/x86_recomp.${n}.cpp`);
+  const actual = readdirSync(resolve(root, generated)).filter((name) => /^x86_recomp\.\d+\.cpp$/.test(name));
   if (actual.length !== count) {
     throw new Error(`expected ${count} partitions, found ${actual.length}`);
   }
-  const mapping = read('generated/game/x86_func_mapping.cpp').toString();
-  const namedSymbolCount = validateImageSymbols(config, read('generated/game/image_symbols.h').toString());
-  const functionCount = validateSymbols(read('generated/game/x86_recomp_shared.h').toString(), sources.map((path) => read(path).toString()), mapping);
+  const mapping = read(`${generated}/x86_func_mapping.cpp`).toString();
+  const namedSymbolCount = validateImageSymbols(config, read(`${generated}/image_symbols.h`).toString(), image.xbe);
+  const functionCount = validateSymbols(read(`${generated}/x86_recomp_shared.h`).toString(), sources.map((path) => read(path).toString()), mapping);
   const ranges = Object.fromEntries([...mapping.matchAll(/^const uint32_t (X86\w+) = (0x[\dA-Fa-f]+)u;/gm)].map((match) => [match[1], Number(match[2])]));
-  const paths = [...sources, 'generated/game/x86_func_mapping.cpp', 'generated/game/x86_recomp_shared.h', 'generated/game/image_symbols.h', 'config/scda_v2.toml', 'config/xdk_symbols.toml', 'src/cpu/x86_ops.h', 'src/cpu/x86_context.h', 'CMakeLists.txt', 'src/browser/diagnostic_service.h', 'src/browser/diagnostic.cpp', 'src/browser/placeholders.cpp', 'src/browser/index.html', 'src/browser/diagnostic.mjs', 'tools/browser/CMakeLists.txt', 'tools/browser/inventory.mjs'];
+  const paths = [...sources, `${generated}/x86_func_mapping.cpp`, `${generated}/x86_recomp_shared.h`, `${generated}/image_symbols.h`, image.config, image.symbols, 'src/cpu/x86_ops.h', 'src/cpu/x86_context.h', 'CMakeLists.txt', 'src/browser/diagnostic_service.h', 'src/browser/diagnostic.cpp', 'src/browser/placeholders.cpp', 'src/browser/index.html', 'src/browser/diagnostic.mjs', 'tools/browser/CMakeLists.txt', 'tools/browser/inventory.mjs'];
   if (configuration.includes('full-cpu=ON') || configuration.includes('boot=ON')) {
     paths.push('src/browser/cpu_runtime.h', 'src/browser/cpu_runtime.cpp', 'tests/browser/cpu.cpp', 'tests/browser/full-cpu.html', 'tools/browser/adapt-memory.mjs', 'tools/browser/adapt-arithmetic.mjs', 'tools/browser/prepare-cpu.mjs');
   }
@@ -177,7 +181,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       'tests/browser/audio-core.cpp', 'tests/browser/audio-core.test.mjs', 'tests/browser/audio-effects.cpp', 'tests/browser/audio-effects.test.mjs',
       'tests/browser/audio-provider.cpp', 'tests/browser/audio-provider.test.mjs', 'tests/browser/audio-boot.test.mjs');
     if (configuration.includes('menu=ON') || configuration.includes('menu-capture=ON')) {
-      paths.push('src/browser/av-provider.h', 'src/browser/av-provider.cpp', 'src/browser/delay-provider.h', 'src/browser/delay-provider.cpp', 'src/browser/menu-input.h', 'src/browser/menu-input.cpp', 'src/browser/menu-launch.h', 'src/browser/menu-launch.cpp',
+      paths.push('src/browser/image-carry.h', 'src/browser/image-carry.cpp', 'src/browser/av-provider.h', 'src/browser/av-provider.cpp', 'src/browser/delay-provider.h', 'src/browser/delay-provider.cpp', 'src/browser/menu-input.h', 'src/browser/menu-input.cpp', 'src/browser/menu-launch.h', 'src/browser/menu-launch.cpp',
         'src/browser/menu-route.h', 'src/browser/menu-route.cpp');
     }
     if (configuration.includes('menu=ON')) {
@@ -205,12 +209,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   }
   paths.push('tools/browser/provenance.mjs', 'tools/browser/tail-call-postlink.mjs');
   const discIdentity = generationRecord ? verifyGeneration(JSON.parse(readFileSync(generationRecord, 'utf8')), read) : {
-    image: 'default.xbe', xbeSha256: null, xbeSize: null, requiredStoryFiles: null,
+    image: image.xbe, xbeSha256: null, xbeSize: null, requiredStoryFiles: null,
     provenance: 'Generated input hashes captured. Trusted generation XBE identity is absent; real boot is blocked. Never derive trust from the selected ISO.',
   };
   if (configuration.split(';').includes('mission=ON')) {
     paths.push('src/browser/loading-io.cpp', 'src/browser/mission-input.h', 'src/browser/mission-input.cpp', 'src/browser/mission-controls.mjs', 'src/browser/mission-metrics.mjs', 'src/browser/mission-clock.h', 'src/browser/mission-stepper.h');
-    if (discIdentity.requiredStoryFiles) {
+    if (discIdentity.image !== image.xbe) { throw new Error('The generation record is for another image.'); }
+    if (discIdentity.requiredStoryFiles && image.id === 'story') {
       discIdentity.requiredStoryFiles.push({ path: 'Default/DataXb/LMaps/x01_Iceland_a/x01_Iceland_a.lin', minBytes: 13681301 });
     }
   }
@@ -233,15 +238,18 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       validateHookIncludes({ hooks: sources, shadowed: compat });
       const browserSources = Object.fromEntries([...new Set(paths)].filter((path) => /^src\/browser\/[^/]+\.(cpp|h)$/.test(path)).map((path) => [path, read(path).toString()]));
       hookEntries = validateHookOverrides({ browser: browserSources, hooks: sources, renames: option('hook-renames').split(',').filter(Boolean),
-        symbols: read('generated/game/image_symbols.h').toString() });
+        symbols: read(`${generated}/image_symbols.h`).toString() });
       paths.push(...hooks.map((name) => hookSource(root, name)), 'src/game/magma.h');
     }
   } else if (hooks.length) {
     throw new Error('Game hooks require menu mode.');
   }
-  if (generationRecord) { paths.push(...generationInputs, ...generationOutputs); }
+  if (generationRecord) {
+    const { inputs: generationInputs, outputs: generationOutputs } = imageGeneration(image.xbe);
+    paths.push(...generationInputs, ...generationOutputs);
+  }
   const inputs = Object.fromEntries([...new Set(paths)].map((path) => [path, hash(read(path))]));
-  const manifest = { schema: 1, wasmOptimization, wasmRequirements, compatibility: (configuration.includes('full-cpu=ON') || configuration.includes('boot=ON')) ? 'wasm-compact-leased-v1' : 'wasm-weak-alias-v1', toolchain, configuration, partitionCount: count, functionCount, namedSymbolCount, ranges, ...discIdentity, ...(kernelExports ? { kernelExports } : {}), inputs };
+  const manifest = { schema: 1, ...(image.id === 'story' ? {} : { imageId: image.id }), wasmOptimization, wasmRequirements, compatibility: (configuration.includes('full-cpu=ON') || configuration.includes('boot=ON')) ? 'wasm-compact-leased-v1' : 'wasm-weak-alias-v1', toolchain, configuration, partitionCount: count, functionCount, namedSymbolCount, ranges, ...discIdentity, ...(kernelExports ? { kernelExports } : {}), inputs };
   const identity = hash(JSON.stringify(manifest));
   const emit = (name, content) => {
     const path = resolve(output, name);

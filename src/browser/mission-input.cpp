@@ -7,6 +7,8 @@
 #include <optional>
 #include <chrono>
 
+// story addresses: the versus module links the class only, it never installs it
+#ifndef BROWSER_VERSUS
 X86_FUNC(__imp__sub_001D2A4E);
 X86_FUNC(__imp__sub_001CDA8A);
 BROWSER_GAME_CHAIN(00039AD4)
@@ -19,6 +21,10 @@ X86_FUNC(sub_001D2A4E) {
 X86_FUNC(sub_001CDA8A) {
   if (browser::Runtime::ObserveSdkEntry(ctx, base, 134)) { __imp__sub_001CDA8A(ctx, base); }
 }
+#else
+X86_FUNC(__imp__sub_001D2A4E) __attribute__((weak));
+X86_FUNC(__imp__sub_001CDA8A) __attribute__((weak));
+#endif
 
 namespace browser {
 thread_local MissionInput* MissionInput::stepping_ = nullptr;

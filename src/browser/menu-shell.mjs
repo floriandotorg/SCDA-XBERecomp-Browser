@@ -72,6 +72,7 @@ const TABS = Object.freeze([
   ] },
   { id: 'developer', label: 'Developer', rows: [
     { setting: 'developmentStart', label: 'Skip to first mission' },
+    { setting: 'startInVersus', label: 'Start in Versus' },
     { setting: 'showFps', label: 'Frame rate' },
     { setting: 'showDiagnostics', label: 'Diagnostics' },
     { setting: 'console', label: 'Console' },
@@ -111,6 +112,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const stage = find('#stage'), input = find('#iso'), boot = find('#boot');
   const detail = find('#detail'), diagnostic = find('#gpu'), fps = find('#fps'), gear = find('#gear');
   const front = find('#front'), mainMenu = find('#main-menu'), loadingLayer = find('#loading'), errorLayer = find('#error');
+  const loadingText = loadingLayer.querySelector('p'), loadingDefault = loadingText?.textContent ?? 'Loading';
   const pauseLayer = find('#pause'), settingsLayer = find('#settings'), consoleLayer = find('#console');
   const consoleLog = consoleLayer.querySelector('.log'), consoleLine = consoleLayer.querySelector('.line');
   const tabList = settingsLayer.querySelector('.tabs'), rowList = settingsLayer.querySelector('.rows');
@@ -484,7 +486,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   };
 
   const render = state => {
-    const active = ['validating', 'booting', 'running'].includes(state.phase);
+    const active = ['validating', 'booting', 'running', 'switching'].includes(state.phase);
     boot.disabled = active || state.stopping || state.code === 'TEARDOWN';
     boot.setAttribute('aria-busy', String(active || state.stopping));
     if (!active && !state.stopping) { quitting = false; }
@@ -507,8 +509,16 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     audio = createBrowserAudio({ ...options, volume: settings.get('volume') / 100, output: settings.get('audioOutput') });
     return audio;
   };
-  const controller = createShellController({ onChange: state => render(state), createRuntime: () => createMenuRuntime({
-    developmentStart: settings.get('developmentStart'), settings, createMotion, createAudio,
+  // the guest launched the other image (Versus, or back to story): its module starts with this one's hand over
+  const switchImage = state => {
+    if (state.phase !== 'switching' || state.stopping || !state.next) { return; }
+    loadingText.textContent = state.next.image === 'versus' ? 'Switching to Versus' : 'Returning to story';
+    const next = state.next;
+    presented = false;
+    queueMicrotask(() => { void controller.start(next); });
+  };
+  const controller = createShellController({ onChange: state => { render(state); switchImage(state); }, createRuntime: (options = {}) => createMenuRuntime({ ...options,
+    developmentStart: settings.get('developmentStart') && options.image !== 'versus', settings, createMotion, createAudio,
     onKeyboard: value => { keyboard = value; show(); },
     onHostMessages: value => { hostMessages = value; },
     onHostMessage: message => routeHostMessage(message, {
@@ -588,7 +598,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const begin = async () => {
     dismissed = false;
     presented = false;
-    void controller.start();
+    loadingText.textContent = loadingDefault;
+    void controller.start(settings.get('startInVersus') ? { image: 'versus' } : {});
   };
   const start = async () => {
     if (controller.state.source) { await begin(); return; }
