@@ -3,7 +3,7 @@ import { createMenuRuntime } from './menu-runtime.mjs';
 import { createMissionMetrics } from './mission-metrics.mjs';
 import { createMissionControls } from './mission-controls.mjs';
 import { createBrowserAudio } from './browser-audio.mjs';
-import { createSettings, SETTINGS } from './settings.mjs';
+import { createSettings, GRAPHICS_PRESETS, graphicsPreset, SETTINGS } from './settings.mjs';
 import { ACTIONS, PAD_ACTIONS, PAD_BUTTONS, keyNamed, keyOfButton, keyOfVk, keyOfWheel, vkOfCode } from './input-actions.mjs';
 import { bind, bindPad, keyBinding, label as keyLabel, padBinding } from './input-bindings.mjs';
 import { createWheelAccumulator } from './keyboard-input.mjs';
@@ -39,6 +39,7 @@ const TABS = Object.freeze([
     { fullscreen: true, label: 'Fullscreen' },
   ] },
   { id: 'graphics', label: 'Graphics', rows: [
+    { preset: true, label: 'Preset', values: { original: 'Original', high: 'High quality', custom: 'Custom' } },
     { setting: 'anisotropy', label: 'Anisotropic filtering', values: { 0: 'Off', 2: '2x', 4: '4x', 8: '8x', 16: '16x' } },
     { setting: 'msaa', label: 'Multisampling (MSAA)', restart: true, values: { 0: 'Off', 4: '4x' } },
     { setting: 'smaa', label: 'SMAA' },
@@ -268,7 +269,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     list[next].focus({ preventScroll: true });
   };
 
-  const choiceText = row => row.fullscreen ? onOff[Boolean(root.fullscreenElement)] :
+  const choiceText = row => row.fullscreen ? onOff[Boolean(root.fullscreenElement)] : row.preset ? row.values[graphicsPreset(settings.snapshot())] :
     row.values ? row.values[settings.get(row.setting)] : onOff[settings.get(row.setting)];
   const toggleFullscreen = () => {
     const request = root.fullscreenElement ? root.exitFullscreen() : root.documentElement.requestFullscreen();
@@ -276,6 +277,11 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   };
   const step = (row, direction) => {
     if (row.fullscreen) { toggleFullscreen(); return; }
+    if (row.preset) {
+      const names = Object.keys(GRAPHICS_PRESETS), index = names.indexOf(graphicsPreset(settings.snapshot()));
+      settings.applyPreset(names[index < 0 ? 0 : (index + direction + names.length) % names.length]);
+      return;
+    }
     const options = SETTINGS[row.setting].options;
     if (!options) { settings.set(row.setting, !settings.get(row.setting)); return; }
     const index = options.indexOf(settings.get(row.setting));

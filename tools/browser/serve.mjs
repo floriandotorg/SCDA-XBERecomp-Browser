@@ -35,7 +35,7 @@ export const localCertificate = async directory => {
   const names = ['DNS:localhost', 'IP:127.0.0.1', ...lanAddresses().map(address => `IP:${address}`)].join(',');
   const current = await readFile(resolve(directory, 'names.txt'), 'utf8').catch(() => '');
   if (current !== names) {
-    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-sha256', '-days', '825', '-subj', '/CN=Deep Cover local server',
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-sha256', '-days', '825', '-subj', '/CN=SCDA local server',
       '-addext', `subjectAltName=${names}`, '-keyout', key, '-out', cert], { stdio: 'ignore' });
     await writeFile(resolve(directory, 'names.txt'), names);
   }

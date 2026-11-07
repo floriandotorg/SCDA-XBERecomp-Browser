@@ -106,6 +106,22 @@ bool MotionSensor() {
   return words && (*words)[browser::input_core::kMotionFlags].load() & browser::input_core::kMotionSensor;
 }
 
+// PRESET: no setting of its own, it reads and sets the graphics rows as settings.mjs GRAPHICS_PRESETS
+constexpr int kGraphicsPreset = 46;
+struct Preset {
+  const char* label;
+  std::vector<std::pair<int, const char*>> values;
+};
+const std::vector<Preset>& Presets() {
+  static const std::vector<Preset> list = {
+    {"ORIGINAL", {{13, "console"}, {18, "0"}, {21, "0"}, {22, "false"}, {23, "512"}, {24, "console"}, {25, "1"}, {26, "1.1"},
+                  {27, "false"}, {28, "false"}, {30, "off"}}},
+    {"HIGH QUALITY", {{13, "window"}, {18, "16"}, {21, "4"}, {22, "false"}, {23, "2048"}, {24, "soft"}, {25, "4"}, {26, "3.0"},
+                      {27, "true"}, {28, "true"}, {30, "gtao"}}},
+  };
+  return list;
+}
+
 constexpr Row kSettingsRows[] = {
   {Kind::Heading, -1, "DISPLAY"},
   {Kind::Value, 0, "PICTURE"},
@@ -120,6 +136,7 @@ constexpr Row kSettingsRows[] = {
   {Kind::Value, 17, "MAX FRAME RATE"},
   {Kind::Value, 31, "COLOUR BLIND MODE"},
   {Kind::Heading, -1, "GRAPHICS"},
+  {Kind::Value, kGraphicsPreset, "PRESET"},
   {Kind::Value, 2, "FPS COUNTER"},
   {Kind::Value, 18, "ANISOTROPIC FILTERING"},
   {Kind::Value, 21, "MSAA"},
@@ -241,6 +258,24 @@ void StepSetting(const Setting& setting, int step) {
   }
 }
 
+// the preset the graphics rows match, -1 when they match none
+int PresetIndex() {
+  const std::vector<Preset>& presets = Presets();
+  for (size_t n = 0; n < presets.size(); ++n) {
+    const bool matches = std::all_of(presets[n].values.begin(), presets[n].values.end(),
+                                     [](const auto& value) { return Current(*Find(value.first)) == value.second; });
+    if (matches) { return int(n); }
+  }
+  return -1;
+}
+
+void ApplyPreset(size_t index) {
+  for (const auto& [id, value] : Presets()[index].values) {
+    const Setting& setting = *Find(id);
+    if (Current(setting) != value) { Send(setting, value); }
+  }
+}
+
 // native's menu.cpp: the HDR rows only act at shader model 3.0, HDR output only on an HDR display
 bool ShaderModel3() {
   const Setting* model = Find(26);
@@ -284,6 +319,10 @@ std::string Value(const Row& row) {
     return keys;
   }
   if (row.kind == Kind::Value && row.id == kGyroCalibrate) { return gyro::Calibrating() ? "KEEP STILL" : "START"; }
+  if (row.kind == Kind::Value && row.id == kGraphicsPreset) {
+    const int index = PresetIndex();
+    return index < 0 ? "CUSTOM" : Presets()[size_t(index)].label;
+  }
   const Setting* setting = row.kind == Kind::Value ? Find(row.id) : nullptr;
   if (setting && !Usable(row.id)) { return row.id == 29 ? "NOT SUPPORTED" : "OFF"; }
   return setting ? Text(*setting, Current(*setting)) : std::string();
@@ -292,6 +331,12 @@ std::string Value(const Row& row) {
 void Step(const Row& row, int step) {
   if (row.kind == Kind::Value && row.id == kGyroCalibrate) {
     if (step) { gyro::StartCalibration(); }
+    return;
+  }
+  if (row.kind == Kind::Value && row.id == kGraphicsPreset) {
+    if (!step) { return; }
+    const int count = int(Presets().size()), index = PresetIndex();
+    ApplyPreset(size_t(index < 0 ? 0 : ((index + step) % count + count) % count));
     return;
   }
   if (const Setting* setting = row.kind == Kind::Value && step && Usable(row.id) ? Find(row.id) : nullptr) { StepSetting(*setting, step); }
@@ -310,6 +355,12 @@ void Defaults(int page) {
 
 std::vector<std::string> Choices(const Row& row, int* current) {
   *current = 0;
+  if (row.kind == Kind::Value && row.id == kGraphicsPreset) {
+    *current = std::max(PresetIndex(), 0);
+    std::vector<std::string> out;
+    for (const Preset& preset : Presets()) { out.push_back(preset.label); }
+    return out;
+  }
   const Setting* setting = row.kind == Kind::Value ? Find(row.id) : nullptr;
   if (!setting) { return {}; }
   if (setting->toggle) {
@@ -323,6 +374,10 @@ std::vector<std::string> Choices(const Row& row, int* current) {
 }
 
 void Choose(const Row& row, int index) {
+  if (row.kind == Kind::Value && row.id == kGraphicsPreset) {
+    if (index >= 0 && index < int(Presets().size())) { ApplyPreset(size_t(index)); }
+    return;
+  }
   const Setting* setting = row.kind == Kind::Value ? Find(row.id) : nullptr;
   if (!setting || index < 0) { return; }
   if (setting->toggle) { Send(*setting, index ? "true" : "false"); }

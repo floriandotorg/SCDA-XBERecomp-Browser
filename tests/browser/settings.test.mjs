@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createSettings } from '../../src/browser/settings.mjs';
+import { createSettings, GRAPHICS_PRESETS, graphicsPreset } from '../../src/browser/settings.mjs';
 
 const memory = (initial) => {
   const values = new Map(initial ? [['scda.settings', initial]] : []);
@@ -172,4 +172,32 @@ test('the upstream input, colour and gyro settings default to native', () => {
   assert.equal(settings.get('gyroAxis'), 'yaw');
   settings.set('vibration', 250);
   assert.equal(settings.get('vibration'), 200);
+});
+
+test('graphics presets: the defaults are Original, a preset applies all its settings at once, any change makes it custom', () => {
+  const storage = memory();
+  const settings = createSettings({ storage });
+  assert.equal(graphicsPreset(settings.snapshot()), 'original');
+  const seen = [];
+  settings.subscribe(name => seen.push(name));
+  settings.applyPreset('high');
+  assert.equal(graphicsPreset(settings.snapshot()), 'high');
+  for (const [name, value] of Object.entries(GRAPHICS_PRESETS.high)) { assert.equal(settings.get(name), value, name); }
+  assert.ok(seen.includes('shaderModel') && seen.includes('ambientOcclusion'));
+  assert.equal(graphicsPreset(createSettings({ storage }).snapshot()), 'high');
+  settings.set('shadowResolution', 1024);
+  assert.equal(graphicsPreset(settings.snapshot()), 'custom');
+  settings.applyPreset('original');
+  assert.equal(graphicsPreset(settings.snapshot()), 'original');
+  assert.throws(() => settings.applyPreset('ultra'), /preset/i);
+});
+
+test('presets only use values their settings accept', () => {
+  for (const preset of Object.values(GRAPHICS_PRESETS)) {
+    const settings = createSettings({ storage: memory() });
+    for (const [name, value] of Object.entries(preset)) {
+      settings.set(name, value);
+      assert.equal(settings.get(name), value, name);
+    }
+  }
 });

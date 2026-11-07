@@ -1,10 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" fill="#050706"/>
-  <rect x="40" y="40" width="432" height="432" fill="#0d120f" stroke="#56645a" stroke-width="10"/>
-  <circle cx="256" cy="196" r="64" fill="#1f2a10" stroke="#8fae3a" stroke-width="14"/>
-  <circle cx="170" cy="330" r="64" fill="#1f2a10" stroke="#8fae3a" stroke-width="14"/>
-  <circle cx="342" cy="330" r="64" fill="#1f2a10" stroke="#8fae3a" stroke-width="14"/>
-  <circle cx="256" cy="196" r="22" fill="#c8e26a"/>
-  <circle cx="170" cy="330" r="22" fill="#c8e26a"/>
-  <circle cx="342" cy="330" r="22" fill="#c8e26a"/>
+  <rect width="512" height="512" fill="#08090b"/>
+  <rect x="40" y="40" width="432" height="432" fill="#121418" stroke="#4a4f58" stroke-width="10"/>
+  <circle cx="256" cy="256" r="150" fill="#1b1e24" stroke="#c9ced6" stroke-width="14"/>
+  <circle cx="256" cy="256" r="104" fill="none" stroke="#3a3f48" stroke-width="6"/>
+  <circle cx="256" cy="256" r="40" fill="#08090b" stroke="#c9ced6" stroke-width="10"/>
+  <path d="M243 238 L273 256 L243 274 Z" fill="#c9ced6"/>
 </svg>

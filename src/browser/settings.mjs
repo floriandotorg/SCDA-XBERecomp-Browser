@@ -66,6 +66,17 @@ export const SETTINGS = Object.freeze({
   console: Object.freeze({ initial: false }),
 });
 
+// Original is the console's look and the defaults; High quality is the enhanced rendering at the window's resolution
+export const GRAPHICS_PRESETS = Object.freeze({
+  original: Object.freeze({ resolution: 'console', anisotropy: 0, msaa: 0, smaa: false, shadowResolution: 512, shadowFilter: 'console',
+    shadowDistance: 1, shaderModel: '1.1', hdrRendering: false, toneMapping: false, ambientOcclusion: 'off' }),
+  high: Object.freeze({ resolution: 'window', anisotropy: 16, msaa: 4, smaa: false, shadowResolution: 2048, shadowFilter: 'soft',
+    shadowDistance: 4, shaderModel: '3.0', hdrRendering: true, toneMapping: true, ambientOcclusion: 'gtao' }),
+});
+
+export const graphicsPreset = values => Object.keys(GRAPHICS_PRESETS)
+  .find(name => Object.entries(GRAPHICS_PRESETS[name]).every(([key, value]) => values[key] === value)) ?? 'custom';
+
 const normalize = (name, value) => {
   const setting = SETTINGS[name];
   if (setting.map) { return value && typeof value === 'object' && !Array.isArray(value) ? Object.freeze(setting.map(value)) : undefined; }
@@ -116,6 +127,12 @@ export const createSettings = ({ storage = globalThis.localStorage, key = 'scda.
     set: (name, value) => {
       if (!Object.hasOwn(SETTINGS, name)) { throw new RangeError(`Unknown setting ${name}.`); }
       if (assign(name, value)) { save(); }
+    },
+    applyPreset: name => {
+      if (!Object.hasOwn(GRAPHICS_PRESETS, name)) { throw new RangeError(`Unknown graphics preset ${name}.`); }
+      let changed = false;
+      for (const [setting, value] of Object.entries(GRAPHICS_PRESETS[name])) { changed = assign(setting, value) || changed; }
+      if (changed) { save(); }
     },
     reset: () => {
       let changed = false;
