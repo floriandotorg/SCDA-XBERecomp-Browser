@@ -50,3 +50,13 @@ test('a selected game hook may only include headers the browser provides', async
   assert.throws(() => validateHookIncludes({ hooks: { mouse: '#include "core/input.h"\n#include "gpu/backend.h"\n' }, shadowed: [] }), /mouse.*gpu\/backend\.h/);
   assert.throws(() => validateHookIncludes({ hooks: { d3d: '#include "xdk/d3d8.h"\n#include "kernel/memory.h"\n' }, shadowed: ['xdk/d3d8.h'] }), /kernel\/memory\.h/);
 });
+
+test('each image takes hooks from its own directory only', async () => {
+  const { hookSource } = await import('../../tools/browser/inventory.mjs');
+  assert.equal(hookSource('.', 'mesh_lod', 'versus'), 'src/versus/mesh_lod.cpp');
+  assert.equal(hookSource('.', 'crt_math', 'versus'), 'src/xdk/crt_math.cpp');
+  assert.equal(hookSource('.', 'camera_shake', 'story'), 'src/game/camera_shake.cpp');
+  assert.equal(hookSource('.', 'camera_shake', 'versus'), 'src/versus/camera_shake.cpp');
+  assert.throws(() => hookSource('.', 'mesh_lod', 'story'), /src\/game or src\/xdk/);
+  assert.throws(() => hookSource('.', 'fov', 'versus'), /src\/versus or src\/xdk/);
+});

@@ -108,10 +108,12 @@ export const validateHookOverrides = ({ browser, hooks, renames, symbols }) => {
   return entries;
 };
 
-// Game hooks live in src/game; CRT fixes the native build links from src/xdk are selected the same way.
-export const hookSource = (root, name) => {
-  const source = ['game', 'xdk'].map((directory) => `src/${directory}/${name}.cpp`).find((path) => existsSync(resolve(root, path)));
-  if (!source) { throw new Error(`hook ${name} has no source in src/game or src/xdk`); }
+// Game hooks live in src/game (story) or src/versus (versus); CRT fixes the native build links from src/xdk are selected
+// the same way. An image never takes the other image's hooks.
+export const hookSource = (root, name, image = 'story') => {
+  const directories = image === 'versus' ? ['versus', 'xdk'] : ['game', 'xdk'];
+  const source = directories.map((directory) => `src/${directory}/${name}.cpp`).find((path) => existsSync(resolve(root, path)));
+  if (!source) { throw new Error(`hook ${name} has no source in ${directories.map((directory) => `src/${directory}`).join(' or ')}`); }
   return source;
 };
 
@@ -234,12 +236,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       'src/app/translations.h', 'src/app/translations.cpp', 'src/core/input.h', 'src/game/console.h', 'src/game/unreal.h',
       'src/xdk/hle.h', 'src/xdk/d3d8.h', 'src/app/app.h', 'src/core/log.h');
     if (hooks.length) {
-      const sources = Object.fromEntries(hooks.map((name) => [name, read(hookSource(root, name)).toString()]));
+      const sources = Object.fromEntries(hooks.map((name) => [name, read(hookSource(root, name, image.id)).toString()]));
       validateHookIncludes({ hooks: sources, shadowed: compat });
       const browserSources = Object.fromEntries([...new Set(paths)].filter((path) => /^src\/browser\/[^/]+\.(cpp|h)$/.test(path)).map((path) => [path, read(path).toString()]));
       hookEntries = validateHookOverrides({ browser: browserSources, hooks: sources, renames: option('hook-renames').split(',').filter(Boolean),
         symbols: read(`${generated}/image_symbols.h`).toString() });
-      paths.push(...hooks.map((name) => hookSource(root, name)), 'src/game/magma.h');
+      paths.push(...hooks.map((name) => hookSource(root, name, image.id)), 'src/game/magma.h');
     }
   } else if (hooks.length) {
     throw new Error('Game hooks require menu mode.');

@@ -193,6 +193,32 @@ struct Target {
   KeyEvent event = KeyEvent::None;
 };
 constexpr int kHostKey = -2;
+#ifdef BROWSER_VERSUS
+// input.cpp's kVersusActions: versus binds the pad differently, its own ids keep rebinds in one game
+constexpr Target kActions[] = {
+  {{"move_forward", "MOVE FORWARD", "W"}, 16},
+  {{"move_back", "MOVE BACK", "S"}, 17},
+  {{"strafe_left", "MOVE LEFT", "A"}, 18},
+  {{"strafe_right", "MOVE RIGHT", "D"}, 19},
+  {{"fire", "FIRE", "LMB"}, 7},
+  {{"alt_fire", "ALTERNATE FIRE", "RMB"}, 6},
+  {{"versus_interact", "INTERACT", "Shift"}, 0},
+  {{"versus_jump", "JUMP", "Space"}, 3},
+  {{"crouch", "CROUCH", "C"}, 1},
+  {{"versus_zoom_in", "ZOOM IN / ACCELERATE", "Wheel Up"}, -1, false, KeyEvent::ZoomIn},
+  {{"versus_zoom_out", "ZOOM OUT / DECELERATE", "Wheel Down"}, -1, false, KeyEvent::ZoomOut},
+  {{"versus_scope", "USE / EQUIP", "E"}, 2},
+  {{"reload", "RELOAD", "R"}, -1, true, KeyEvent::Reload},
+  {{"versus_zoom", "ZOOM / LOOK BACK", "MMB"}, 15},
+  {{"laser", "LASER", "B"}, 8},
+  {{"night_vision", "NIGHT VISION", "Tab"}, 10},
+  {{"previous_camera", "PREVIOUS CAMERA", "V"}, 9, true},
+  {{"help", "HELP", "F1"}, 4},
+  {{"pause", "PAUSE", "Escape"}, 12},
+  {{"push_to_talk", "PUSH TO TALK", "T"}, kHostKey, false, KeyEvent::PushToTalk},
+  {{"settings_panel", "SETTINGS PANEL", "F10"}, kHostKey, false, KeyEvent::SettingsPanel},
+};
+#else
 // input.cpp's kStoryActions; the browser reserves Ctrl (Ctrl with W closes the tab), so quick inventory is Tab
 constexpr Target kActions[] = {
   {{"move_forward", "MOVE FORWARD", "W"}, 16},
@@ -226,6 +252,7 @@ constexpr Target kActions[] = {
   {{"hide_hud", "TOGGLE HUD", ""}, kHostKey, false, KeyEvent::HideHud},
   {{"settings_panel", "SETTINGS PANEL", "F10"}, kHostKey, false, KeyEvent::SettingsPanel},
 };
+#endif
 constexpr size_t kCount = std::size(kActions);
 static_assert(kCount <= 32);
 struct PadAction {
@@ -234,6 +261,24 @@ struct PadAction {
   int button;
   KeyEvent event = KeyEvent::None;
 };
+#ifdef BROWSER_VERSUS
+// input.cpp's kVersusPadActions, as the game's own controls page
+constexpr PadAction kPadActions[] = {
+  {"versus_fire", "FIRE", 7},
+  {"versus_alt_fire", "ALTERNATE FIRE", 6},
+  {"versus_interact", "INTERACT", 0},
+  {"versus_jump", "JUMP / RELOAD", 3},
+  {"versus_crouch", "CROUCH", 1},
+  {"versus_scope", "USE / EQUIP", 2},
+  {"versus_zoom", "ZOOM / LOOK BACK", 15},
+  {"versus_laser", "LASER", 8},
+  {"versus_night_vision", "NIGHT VISION", 10},
+  {"versus_previous_camera", "PREVIOUS CAMERA", 9},
+  {"versus_help", "HELP", 4},
+  {"versus_pause", "PAUSE", 12},
+  {"versus_push_to_talk", "PUSH TO TALK", -1, KeyEvent::PushToTalk},
+};
+#else
 constexpr PadAction kPadActions[] = {
   {"jump", "JUMP / SPLIT JUMP", 3},
   {"crouch", "CROUCH / STAND UP / EXIT INTERACTION", 1},
@@ -256,6 +301,7 @@ constexpr PadAction kPadActions[] = {
   {"push_to_talk", "PUSH TO TALK", -1, KeyEvent::PushToTalk},
   {"toggle_hud", "TOGGLE HUD", -1, KeyEvent::HideHud},
 };
+#endif
 constexpr size_t kPadCount = std::size(kPadActions);
 constexpr int kPadControls = 16;
 constexpr WORD kTouchpadLeft = 0x0400;
