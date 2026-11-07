@@ -34,6 +34,7 @@ game patch therefore waits for C01, which makes native hooks build and run on br
 | [C14a](C14a-network-transport.md) Network transport | Complex | C01 (C13a for versus checks) | Virtual LAN rooms over WebRTC with WebSocket relay, `xnet.cpp` port, relay server, hosting panel |
 | [C14b](C14b-coop-and-local-players.md) Co-op and local players | Complex | C01, C14a, C03 | Co-op lockstep and co-op mouse, second local player and controller ports |
 | [C14c](C14c-voice.md) Voice | Complex | C01, C14a, C13a, C03, C05 | Microphone capture, Communicator HLE, game voice first, Opus link second |
+| [C15](C15-upstream-v3.md) Upstream V3 | Complex | C01, C03, C05, C10, C12 | Ragdoll and water fixes, mouse and controller options, rumble, gyro aiming, Chaos Theory tone mapping, colour blind modes |
 
 Durable saves are a browser gap, not a D3D12 feature. They are planned in
 [07-campaign-and-saves.md](../07-campaign-and-saves.md) (P7.1) and are a soft prerequisite for C13a, because profiles

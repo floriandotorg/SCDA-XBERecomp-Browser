@@ -229,7 +229,8 @@ struct Session {
         bool(flags >> hs::kSmaaBit & 1),
         written && words[hs::kShadowResolutionWord].load() ? words[hs::kShadowResolutionWord].load() : 512u,
         model3 && (flags >> hs::kHdrRenderingBit & 1), model3 && (flags >> hs::kToneMappingBit & 1),
-        (flags >> hs::kHdrOutputBit & 1) && (flags >> hs::kHdrDisplayBit & 1), std::isfinite(headroom) && headroom >= 1 ? headroom : 5.0f};
+        (flags >> hs::kHdrOutputBit & 1) && (flags >> hs::kHdrDisplayBit & 1), std::isfinite(headroom) && headroom >= 1 ? headroom : 5.0f,
+        written ? std::min(words[hs::kColourBlindWord].load(), 3u) : 0u};
     });
     graphics = std::make_shared<browser::DiagnosticGraphics>(runtime, *image, std::move(contiguousAccess), graphics_mode, std::move(backend));
     graphics->ConfigurePresentCheckpoint(BROWSER_MENU_TRACE_FRAMES);
@@ -376,6 +377,7 @@ struct Session {
     browser::hooks::BindRuntime(&runtime);
     browser::input_core::BindGamepad(&input->Gamepad());
     input->SetPadSource(browser::input_core::Sample);
+    input->SetRumbleSink(browser::input_core::Rumble);
 #endif
 #else
     sdkObserver = browser::InstallSdkProvider(runtime, *image, browser::SdkPolicy::UnavailableXNet, graphics, {}, {}, {}, audioProvider);

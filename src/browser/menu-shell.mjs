@@ -35,6 +35,7 @@ const TABS = Object.freeze([
     { setting: 'contrast', label: 'Contrast', format: value => String(value) },
     { setting: 'frameCap', label: 'Frame rate cap', values: { 0: 'Display rate', 30: '30', 60: '60' } },
     { setting: 'fmvScale', label: 'Full screen movies', values: { fill: 'Fill', '4:3': '4:3' } },
+    { setting: 'colourBlind', label: 'Colour blind mode', values: { off: 'Off', protanopia: 'Protanopia', deuteranopia: 'Deuteranopia', tritanopia: 'Tritanopia' } },
     { fullscreen: true, label: 'Fullscreen' },
   ] },
   { id: 'graphics', label: 'Graphics', rows: [
@@ -59,12 +60,25 @@ const TABS = Object.freeze([
     { setting: 'sensitivity', label: 'Free look sensitivity', format: value => value.toFixed(1) },
     { setting: 'weaponSensitivity', label: 'Weapon sensitivity', format: value => value.toFixed(1) },
     { setting: 'sniperSensitivity', label: 'Sniper sensitivity', format: value => value.toFixed(1) },
-    { setting: 'invertY', label: 'Invert look' },
+    { setting: 'verticalSensitivity', label: 'Vertical sensitivity', format: value => value.toFixed(1) },
+    { setting: 'invertX', label: 'Invert X axis' },
+    { setting: 'invertY', label: 'Invert Y axis' },
     { heading: 'Keyboard and mouse' },
     ...ACTIONS.filter(action => !action.hidden).map(action => ({ bind: action.id, label: sentence(action.label) })),
     { reset: 'keys', label: 'Restore defaults' },
   ] },
   { id: 'controller', label: 'Controller', rows: [
+    { setting: 'padSensitivity', label: 'Horizontal sensitivity', format: value => value.toFixed(1) },
+    { setting: 'padVerticalSensitivity', label: 'Vertical sensitivity', format: value => value.toFixed(1) },
+    { setting: 'padAimSensitivity', label: 'Aim horizontal sensitivity', format: value => value.toFixed(1) },
+    { setting: 'padAimVerticalSensitivity', label: 'Aim vertical sensitivity', format: value => value.toFixed(1) },
+    { setting: 'padInvertX', label: 'Invert X axis' },
+    { setting: 'padInvertY', label: 'Invert Y axis' },
+    { setting: 'padDeadZone', label: 'Dead zone', values: Object.fromEntries(SETTINGS.padDeadZone.options.map(value => [value, value ? value.toFixed(1) : 'Default (0.3)'])) },
+    { setting: 'vibration', label: 'Vibration strength', format: value => `${value}%` },
+    { setting: 'gyroAiming', label: 'Gyro aiming', shown: shell => shell.motionSensor },
+    { setting: 'gyroSensitivity', label: 'Gyro sensitivity', format: value => value.toFixed(1), shown: shell => shell.motionSensor },
+    { setting: 'gyroAxis', label: 'Gyro axis', values: { yaw: 'Yaw', roll: 'Roll', world: 'World' }, shown: shell => shell.motionSensor },
     ...PAD_ACTIONS.filter(action => !action.hidden).map(action => ({ padBind: action.id, label: sentence(action.label) })),
     { reset: 'padButtons', label: 'Restore defaults' },
   ] },
@@ -179,7 +193,15 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const hdrQuery = window.matchMedia?.('(dynamic-range: high)');
   const hdrCanvas = typeof GPUCanvasContext !== 'undefined' && 'getConfiguration' in GPUCanvasContext.prototype;
   const hdrDisplay = () => Boolean(hdrQuery?.matches && hdrCanvas);
-  const rowShell = { settings, hdrDisplay, saves };
+  // gyro aiming turns the view with the device's own motion sensor: a phone or tablet held as the controller
+  const motionSensor = typeof window.DeviceMotionEvent === 'function' && (window.navigator?.maxTouchPoints ?? 0) > 0;
+  const rowShell = { settings, hdrDisplay, saves, motionSensor };
+  // iOS reads motion only once the player allowed it, which a tap has to ask for
+  let motionAllowed = typeof window.DeviceMotionEvent?.requestPermission !== 'function';
+  const allowMotion = () => {
+    if (motionAllowed || !settings.get('gyroAiming')) { return; }
+    void window.DeviceMotionEvent.requestPermission().then(state => { motionAllowed = state === 'granted'; }, () => {});
+  };
   hdrQuery?.addEventListener?.('change', () => {
     hostSettings?.refresh();
     if (panel === 'settings') { renderSettings(); }
@@ -887,6 +909,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     if (name === 'showFps') { show(); }
     if (name === 'showDiagnostics') { showDiagnostics(); }
     if (name === 'pauseOnFocusLoss') { motion?.refresh(); }
+    if (name === 'gyroAiming') { allowMotion(); }
     if (panel === 'settings') { refreshRows(); }
   });
 
@@ -895,6 +918,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   input.addEventListener('change', picked);
   progressFile.addEventListener('change', pickedProgress);
   root.addEventListener('click', clicks);
+  root.addEventListener('pointerup', allowMotion);
   root.addEventListener('pointermove', hover);
   root.addEventListener('mousemove', activity);
   root.addEventListener('pointerlockchange', activity);
@@ -927,6 +951,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       input.removeEventListener('change', picked);
       progressFile.removeEventListener('change', pickedProgress);
       root.removeEventListener('click', clicks);
+      root.removeEventListener('pointerup', allowMotion);
       root.removeEventListener('pointermove', hover);
       root.removeEventListener('mousemove', activity);
       root.removeEventListener('pointerlockchange', activity);

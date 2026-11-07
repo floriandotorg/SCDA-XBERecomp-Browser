@@ -10,7 +10,7 @@ await mkdir(temporary, { recursive: true });
 const env = { ...process.env, TMPDIR: temporary };
 const compiler = '/opt/homebrew/opt/emscripten/bin/em++';
 const args = [
-  '-std=c++20', '-O1', '-fexceptions', '-DWEBGPU_SERVICE_TESTING=1',
+  '-std=c++20', '-O1', '-fexceptions', '-DWEBGPU_SERVICE_TESTING=1', '-I', resolve(root, 'src'),
   '--use-port=emdawnwebgpu',
   resolve(root, 'src/browser/webgpu-service.cpp'),
   '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=web,worker', '-sALLOW_MEMORY_GROWTH=1',

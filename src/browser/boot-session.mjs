@@ -5,6 +5,7 @@ import { prepareDiscImage } from './iso-image.mjs';
 import { readMenuStateDiagnostic, readMenuFileDiagnostics } from './menu-state-report.mjs';
 import { createHostSettingsView, validateHostSettings, writeHostSettings, HOST_SETTINGS_SPAN, HOST_SETTINGS_WORDS } from './host-settings.mjs';
 import { KEYBOARD_INPUT } from './keyboard-input.mjs';
+import { GAMEPAD_INPUT } from './gamepad-input.mjs';
 import { HOST_MESSAGES_WORDS } from './host-messages.mjs';
 
 const requireBuildIdentity = (module, manifest) => {
@@ -240,8 +241,8 @@ const readInputDescriptor = (module) => {
   let gamepadOffset = 0;
   if (module._image_gamepad_address !== undefined || module._image_gamepad_words !== undefined) {
     if (typeof module._image_gamepad_address !== 'function' || typeof module._image_gamepad_words !== 'function') { reject(); }
-    gamepadOffset = span(module._image_gamepad_address(), 32);
-    if (!gamepadOffset || module._image_gamepad_words() !== 8) { reject(); }
+    gamepadOffset = span(module._image_gamepad_address(), GAMEPAD_INPUT.bytes);
+    if (!gamepadOffset || module._image_gamepad_words() !== GAMEPAD_INPUT.words) { reject(); }
   }
   const settingsOffset = span(module._image_settings_address?.() ?? 0, HOST_SETTINGS_SPAN);
   if (settingsOffset && module._image_settings_words?.() !== HOST_SETTINGS_WORDS) { reject(); }
@@ -252,7 +253,7 @@ const readInputDescriptor = (module) => {
   const messagesOffset = span(module._image_messages_address?.() ?? 0, HOST_MESSAGES_WORDS * 4);
   if (messagesOffset && module._image_messages_words?.() !== HOST_MESSAGES_WORDS) { reject(); }
   const spans = [[motionOffset, 20], [metricsOffset, MISSION_METRICS_WORDS * 4], [audioOffset, 32],
-    [audioSamplesOffset, AUDIO_FRAMES * AUDIO_CHANNELS * 4], [gamepadOffset, 32], [settingsOffset, HOST_SETTINGS_SPAN],
+    [audioSamplesOffset, AUDIO_FRAMES * AUDIO_CHANNELS * 4], [gamepadOffset, GAMEPAD_INPUT.bytes], [settingsOffset, HOST_SETTINGS_SPAN],
     [hookStatusOffset, 32], [keyboardOffset, KEYBOARD_INPUT.words * 4], [messagesOffset, HOST_MESSAGES_WORDS * 4]].filter(([offset]) => offset);
   for (let n = 0; n < spans.length; ++n) {
     const [offset, size] = spans[n];

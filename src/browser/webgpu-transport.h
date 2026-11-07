@@ -44,7 +44,8 @@ static_assert(sizeof(DepthUploadPacket) == 44);
 struct ClearPacket { float color[4], depth; uint32_t stencil, flags, depth_target; uint32_t rect_count = 0; };
 // pillarbox: PresentPillarbox shows a 4:3 picture in the middle, PresentLinear samples the frame bilinearly
 // PresentHdr: the canvas shows extended range, the frame's highlights stretched to headroom times SDR white
-enum : uint32_t { PresentPillarbox = 1, PresentLinear = 2, PresentSmaa = 4, PresentHdr = 8 };
+// PresentColourBlind: 1 protanopia, 2 deuteranopia or 3 tritanopia, shifted, the colours daltonized as native's
+enum : uint32_t { PresentPillarbox = 1, PresentLinear = 2, PresentSmaa = 4, PresentHdr = 8, PresentColourBlindShift = 4, PresentColourBlind = 3 << 4 };
 struct PresentPacket { uint32_t pillarbox; float headroom = 1; };
 static_assert(sizeof(PresentPacket) == 8);
 // a source rectangle drawn over a destination rectangle (the resource): colour by box filtering taps x taps source
@@ -56,8 +57,11 @@ struct BlitPacket {
   float scale = 1;  // colour times this, alpha kept: 1/8 takes 0..1 colour into an HDR scene target
 };
 static_assert(sizeof(BlitPacket) == 48);
-// native's HDR resolve over the scene (the resource) in place: exposure moved towards the scene's by blend, bloom of
-// what passes white, then tone mapping (tone 1) or bloom alone back to 0..1
+// native's HDR resolve over the scene (the resource) in place: Chaos Theory's exposure scale moved towards the scene's
+// by blend, bloom of what passes white, then both times the scale back to 0..1. tone: ResolveTone takes the level's
+// tone mapping preset (ResolveNightVision its night vision one), else every scale is 1; ResolveFresh starts the scale
+// at the preset's own before the blend
+enum : uint32_t { ResolveTone = 1, ResolveNightVision = 2, ResolveFresh = 4 };
 struct ResolvePacket { float blend; uint32_t tone; };
 static_assert(sizeof(ResolvePacket) == 8);
 // native's ambient occlusion over the scene (the resource) from its depth: kAoHlsl's proj, zp, vp (the pass's rectangle

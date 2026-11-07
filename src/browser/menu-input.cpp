@@ -172,6 +172,13 @@ bool MenuInput::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
     uint32_t event;
     std::memcpy(&event, feedback.data() + 4, 4);
     if (event) { return finish(50); }
+    // XINPUT_FEEDBACK_HEADER is dwStatus, hEvent and 58 reserved bytes, the rumble follows
+    if (rumble_) {
+      uint16_t left, right;
+      std::memcpy(&left, feedback.data() + 66, 2);
+      std::memcpy(&right, feedback.data() + 68, 2);
+      rumble_(handle->port, left, right);
+    }
     const uint32_t complete = 0;
     runtime_.Checkpoint(ctx);
     memory_->Write(ctx, frame[2], &complete, 4);

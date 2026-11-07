@@ -12,6 +12,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cwctype>
 #include <iterator>
@@ -38,6 +39,7 @@ namespace {
 std::atomic<GamepadWords*> g_gamepad{nullptr};
 }
 void BindGamepad(GamepadWords* words) { g_gamepad.store(words, std::memory_order_release); }
+GamepadWords* Gamepad() { return g_gamepad.load(std::memory_order_acquire); }
 
 bool Sample(uint32_t port, std::array<uint8_t, 18>& sample) {
   const input::Pad pad = input::Poll(int(port));
@@ -52,6 +54,8 @@ bool Sample(uint32_t port, std::array<uint8_t, 18>& sample) {
   }
   return true;
 }
+
+void Rumble(uint32_t port, uint16_t left, uint16_t right) { input::Rumble(int(port), left, right); }
 }
 
 namespace input {
@@ -61,6 +65,7 @@ namespace {
 namespace ki = browser::keyboard_input;
 
 using WORD = uint16_t;
+using SHORT = int16_t;
 constexpr int VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_MBUTTON = 0x04, VK_XBUTTON1 = 0x05, VK_XBUTTON2 = 0x06;
 constexpr int VK_BACK = 0x08, VK_TAB = 0x09, VK_RETURN = 0x0D, VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12;
 constexpr int VK_PAUSE = 0x13, VK_CAPITAL = 0x14, VK_ESCAPE = 0x1B, VK_SPACE = 0x20, VK_PRIOR = 0x21, VK_NEXT = 0x22;
@@ -87,6 +92,12 @@ struct XINPUT_GAMEPAD {
   uint8_t bLeftTrigger, bRightTrigger;
   int16_t sThumbLX, sThumbLY, sThumbRX, sThumbRY;
 };
+
+// the page's pad takes the motors from the gamepad record (gamepad-input.mjs); it is the only slot
+void SetMotors(int slot, uint16_t left, uint16_t right) {
+  auto* words = browser::input_core::g_gamepad.load(std::memory_order_acquire);
+  if (slot == 0 && words) { (*words)[browser::input_core::kRumbleWord].store(left | uint32_t(right) << 16, std::memory_order_release); }
+}
 
 std::atomic<bool> g_blocked{false};
 std::atomic<bool> g_menu{false};
@@ -174,6 +185,8 @@ constexpr float kDeadZone = 0.3f;
 constexpr float kStickMax = 32767.0f;
 std::atomic<int> g_speed{4};
 std::atomic<bool> g_targeting{false};
+std::atomic<bool> g_aiming{false};
+std::atomic<bool> g_rumbling{false};
 
 std::atomic<uint32_t> g_events{0};
 
@@ -625,6 +638,24 @@ void Keyboard(Pad& p) {
   UpdateStick(p, move, camera, menu, back);
 }
 
+// The game drops a stick axis inside its own dead zone: the axis is moved so that zone starts where the chosen
+// one does, the identity at the game's own
+SHORT MoveDeadZone(SHORT value, float zone) {
+  const float game = GameDeadZone();
+  const float v = std::min(std::abs(float(value)) / kStickMax, 1.0f);
+  if (v <= zone) { return 0; }
+  const float out = (game + (v - zone) / (1.0f - zone) * (1.0f - game)) * kStickMax;
+  return SHORT(std::lround(value < 0 ? -out : out));
+}
+
+void ApplyDeadZone(XINPUT_GAMEPAD& g, float zone) {
+  if (zone <= 0.0f || zone == GameDeadZone()) { return; }
+  g.sThumbLX = MoveDeadZone(g.sThumbLX, zone);
+  g.sThumbLY = MoveDeadZone(g.sThumbLY, zone);
+  g.sThumbRX = MoveDeadZone(g.sThumbRX, zone);
+  g.sThumbRY = MoveDeadZone(g.sThumbRY, zone);
+}
+
 // the page's gamepad record, as XInput reports one
 bool ReadPad(int slot, XINPUT_GAMEPAD& g) {
   auto* words = browser::input_core::g_gamepad.load(std::memory_order_acquire);
@@ -644,10 +675,13 @@ bool ReadPad(int slot, XINPUT_GAMEPAD& g) {
     }
     g.bLeftTrigger = uint8_t(sample[6] >> 16);
     g.bRightTrigger = uint8_t(sample[6] >> 24);
-    g.sThumbLX = axis(sample[1]);
-    g.sThumbLY = axis(sample[2]);
-    g.sThumbRX = axis(sample[3]);
-    g.sThumbRY = axis(sample[4]);
+    g.sThumbLX = axis(sample[2]);
+    g.sThumbLY = axis(sample[3]);
+    const SHORT rx = axis(sample[4]), ry = axis(sample[5]);
+    const app::Settings& s = app::Get();
+    g.sThumbRX = s.invert_pad_x ? SHORT(-1 - rx) : rx;
+    g.sThumbRY = s.invert_pad_y ? SHORT(-1 - ry) : ry;
+    ApplyDeadZone(g, s.pad_dead_zone);
     return true;
   }
   return false;
@@ -827,8 +861,8 @@ bool TakeMouse(float& dx, float& dy) {
   const app::Settings& s = app::Get();
   const float sensitivity = View(g_view.load()) == View::Eev ? s.sniper_sensitivity :
                             g_targeting ? s.weapon_sensitivity : s.free_look_sensitivity;
-  dx = float(x) / 1000.0f * sensitivity;
-  dy = float(s.invert_mouse ? -y : y) / 1000.0f * sensitivity;
+  dx = float(s.invert_mouse_x ? -x : x) / 1000.0f * sensitivity;
+  dy = float(s.invert_mouse ? -y : y) / 1000.0f * sensitivity * s.mouse_vertical_sensitivity;
   return true;
 }
 
@@ -932,6 +966,16 @@ void SetNetSession(bool net) { g_net = net; }
 void SetTrainingVideo(bool on) { g_video = on; }
 void SetInteractReloads(bool on) { g_interact_reloads = on; }
 void SetTargeting(bool on) { g_targeting = on; }
+void SetAiming(bool on) { g_aiming = on; }
+bool Aiming() { return g_aiming; }
+
+LookScale PadLookScale(bool aiming) {
+  const app::Settings& s = app::Get();
+  if (aiming) { return {s.pad_aim_horizontal_sensitivity, s.pad_aim_vertical_sensitivity}; }
+  return {s.pad_horizontal_sensitivity, s.pad_vertical_sensitivity};
+}
+
+float GameDeadZone() { return kDeadZone; }
 void SetCarrying(bool on) { g_carrying = on; }
 void SetHanging(bool on) { g_hanging = on; }
 void SetLadder(bool on, bool stepping) {
@@ -1315,6 +1359,11 @@ Pad Poll(int port) {
     Rebind(p, port, slot, g.wButtons);
     if (keyboard) { NotePadHeld(p); }
   }
+  // a motor the game left running when the keyboard took over, the game may not set it again
+  if (keyboard && g_rumbling && KeyboardLast()) {
+    SetMotors(slot, 0, 0);
+    g_rumbling = false;
+  }
   if (!keyboard) { return p; }
   g_stick_keys = 0;
   if (Active()) { Keyboard(p); }
@@ -1322,6 +1371,18 @@ Pad Poll(int port) {
   return p;
 }
 
-void Rumble(int, uint16_t, uint16_t) {}
+void Rumble(int port, uint16_t left, uint16_t right) {
+  const int slot = port >= 0 && port < 2 ? app::Get().players[port].pad : -1;
+  const bool keyboard = port == KeyboardPort();
+  if (keyboard && KeyboardLast()) {
+    left = 0;
+    right = 0;
+  }
+  if (keyboard) { g_rumbling = left || right; }
+  const uint32_t strength = app::Get().vibration_strength;
+  left = uint16_t(std::min<uint32_t>(left * strength / 100, 0xFFFF));
+  right = uint16_t(std::min<uint32_t>(right * strength / 100, 0xFFFF));
+  SetMotors(slot, left, right);
+}
 
 }  // namespace input

@@ -343,16 +343,19 @@ struct MenuBackend::Impl {
     return hdr && item.renderTarget && !item.depth && item.desc.width == width && item.desc.height == height && item.desc.levels == 1 &&
       !item.desc.cube && item.desc.depth == 1;
   }
-  // exposure, bloom and tone mapping take an entered target back to 0..1; exposure follows the scene's over about a
-  // second of wall clock
+  // exposure, bloom and tone mapping take an entered target back to 0..1; the exposure scale follows the scene's over
+  // the preset's adaptation time of wall clock, Double Agent's Tonemapping or, in night vision, Tonemapping_NV
   void resolve(Resource& item) {
     if (!item.inHdr) { return; }
+    const bool night = tone && gpu::g_night_vision.load(std::memory_order_relaxed);
+    const float adaptation = night ? 0.8f : 0.75f;
     const auto now = std::chrono::steady_clock::now();
-    const float seconds = std::clamp(std::chrono::duration<float>(now - exposureTime).count(), 0.0f, 0.25f);
+    const float seconds = std::max(std::chrono::duration<float>(now - exposureTime).count(), 0.0f);
     exposureTime = now;
-    const float blend = exposureFresh ? 1.0f : 1.0f - std::exp(-seconds * 1.5f);
+    const float blend = exposureFresh ? 0.0f : std::min(seconds / adaptation, 1.0f);
+    const uint32_t flags = (tone ? webgpu::ResolveTone : 0) | (night ? webgpu::ResolveNightVision : 0) | (exposureFresh ? webgpu::ResolveFresh : 0);
     exposureFresh = false;
-    const auto result = sendPacket(webgpu::Opcode::Resolve, item.id, webgpu::ResolvePacket{blend, uint32_t(tone)});
+    const auto result = sendPacket(webgpu::Opcode::Resolve, item.id, webgpu::ResolvePacket{blend, flags});
     item.inHdr = false; item.dirty = true; item.command = result.command; ++item.version; ++hdrResolves;
   }
   // the first depth written 3D draw of a frame into an HDR target: what it holds goes over the headroom
@@ -1896,7 +1899,7 @@ void MenuBackend::Present(const gpu::Surface& front, bool pillarbox) {
     impl_->canvasHeight = output.height;
   }
   const uint32_t flags = (pillarbox ? webgpu::PresentPillarbox : 0) | (output.linear ? webgpu::PresentLinear : 0) | (output.smaa ? webgpu::PresentSmaa : 0) |
-    (output.hdrOutput ? webgpu::PresentHdr : 0);
+    (output.hdrOutput ? webgpu::PresentHdr : 0) | (std::min(output.colourBlind, 3u) << webgpu::PresentColourBlindShift);
   const auto result = impl_->sendPacket(webgpu::Opcode::Present, item.id, webgpu::PresentPacket{flags, std::clamp(output.hdrHeadroom, 1.0f, 10.0f)});
   item.command = result.command; ++impl_->frames;
   if (impl_->metricsSink) {

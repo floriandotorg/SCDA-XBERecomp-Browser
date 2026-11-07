@@ -74,7 +74,7 @@ int contracts() {
   rejects([&] { input->Dispatch(context, memory.Base(), 40); });
   const auto state = input->SharedAddress();
   const auto gamepad = input->GamepadAddress();
-  check(input->GamepadWords() == 8 && gamepad == gamepadStorage->data(), "gamepad publication lost its owned storage");
+  check(input->GamepadWords() == browser::input_core::kGamepadWords && gamepad == gamepadStorage->data(), "gamepad publication lost its owned storage");
   runtime.Launch(context, memory.Base(), [&](X86Context& ctx, uint8_t* base) {
     const auto call = [&](X86Func* function, std::initializer_list<uint32_t> args) {
       std::vector<uint32_t> frame{0xabcdef};
@@ -214,6 +214,12 @@ int contracts() {
     std::array<uint8_t, 70> feedback{};
     memory.Write(ctx, 0x20100, feedback.data(), feedback.size());
     check(call(sub_004EDBF9, {handle, 0x20100}) == 997, "eventless keyboard feedback ABI incorrect");
+    std::array<uint32_t, 3> rumbled{~0u, 0, 0};
+    input->SetRumbleSink([&](uint32_t port, uint16_t left, uint16_t right) { rumbled = {port, left, right}; });
+    const uint16_t motors[] = {0x8000, 0x1234};
+    memory.Write(ctx, 0x20100 + 66, motors, sizeof(motors));
+    check(call(sub_004EDBF9, {handle, 0x20100}) == 997 && rumbled == std::array<uint32_t, 3>{0, 0x8000, 0x1234}, "the motors did not reach the rumble sink");
+    input->SetRumbleSink({});
     const uint32_t event = 0x1234;
     memory.Write(ctx, 0x20104, &event, 4);
     check(call(sub_004EDBF9, {handle, 0x20100}) == 50, "unsupported feedback event falsely completed");

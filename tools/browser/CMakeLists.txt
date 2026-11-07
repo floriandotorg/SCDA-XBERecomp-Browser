@@ -105,7 +105,12 @@ set(browser_applied_renames)
 if(BROWSER_MENU)
     # crt_math is not optional: the recompiled x87 acos, asin and pow return NaN at random and twist skinned bones.
     # Neither is bink: above 30 FPS movies otherwise advance a frame per presented frame and play too fast.
-    set(browser_hooks ${BROWSER_GAME_HOOKS} crt_math bink)
+    # night_vision neither: tone mapping takes the night vision preset from it. mouse_pitch turns the view by the gyro
+    # (gyro_look.cpp), which a build cache that predates gyro aiming does not list.
+    set(browser_hooks ${BROWSER_GAME_HOOKS} crt_math bink night_vision)
+    if("mouse_pitch" IN_LIST BROWSER_GAME_HOOKS)
+        list(APPEND browser_hooks gyro_look)
+    endif()
     list(REMOVE_DUPLICATES browser_hooks)
     list(SORT browser_hooks)
     foreach(rename IN LISTS browser_hook_renames)
@@ -287,7 +292,7 @@ if(BROWSER_BOOT)
             ${root}/src/browser/menu-pixel-shaders.cpp ${root}/src/browser/menu-texture.cpp ${root}/src/browser/render-snapshot.cpp ${root}/src/browser/webgpu-transport.cpp
             ${root}/src/gpu/shaders.cpp)
         target_sources(story_boot_link PRIVATE ${root}/src/browser/hook-compat.cpp ${root}/src/browser/hook-log.cpp
-            ${root}/src/browser/hook-d3d.cpp ${root}/src/browser/host-settings.cpp ${root}/src/browser/input-core.cpp
+            ${root}/src/browser/hook-d3d.cpp ${root}/src/browser/host-settings.cpp ${root}/src/browser/input-core.cpp ${root}/src/browser/gyro.cpp
             ${root}/src/browser/input-update.cpp ${root}/src/browser/settings-rows.cpp ${root}/src/browser/host-messages.cpp
             ${root}/src/browser/game-stubs.cpp ${root}/src/app/translations.cpp)
         if(BROWSER_MISSION)

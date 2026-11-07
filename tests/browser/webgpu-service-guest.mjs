@@ -12,6 +12,19 @@ const floats = (...values) => new Float32Array(values);
 const vertex = encoder.encode('struct Output { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> }; @vertex fn vs_main(@location(0) position: vec4<f32>, @location(1) uv: vec4<f32>) -> Output { var output: Output; output.position = position; output.uv = uv.xy; return output; }');
 const fragment = encoder.encode('@group(0) @binding(1) var image: texture_2d<f32>; @group(0) @binding(2) var sampling: sampler; @fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return textureSample(image, sampling, uv); }');
 const texels = [[17, 83, 149, 255], [200, 11, 57, 128], [90, 160, 30, 255], [7, 19, 231, 255]];
+// native's ColourBlindMatrix(1): identity + shift * (identity - Machado's protanopia), applied to linear colour
+const protanopiaRows = (() => {
+  const simulate = [0.152286, 1.052583, -0.204868, 0.114503, 0.786281, 0.099216, -0.003882, -0.048116, 1.051998];
+  const shift = [0, 0, 0, 0.7, 1, 0, 0.7, 0, 1];
+  return [0, 1, 2].map(r => [0, 1, 2].map(c => Number(r === c) + [0, 1, 2].reduce((sum, k) => sum + shift[r * 3 + k] * (Number(k === c) - simulate[k * 3 + c]), 0)));
+})();
+const protanopia = (pixels, index) => {
+  const pixel = index - index % 4, channel = index % 4;
+  if (channel === 3) { return pixels[index]; }
+  const linear = [0, 1, 2].map(n => (pixels[pixel + n] / 255) ** 2.2);
+  const shifted = protanopiaRows[channel].reduce((sum, weight, n) => sum + weight * linear[n], 0);
+  return Math.round(Math.min(Math.max(shifted, 0), 1) ** (1 / 2.2) * 255);
+};
 globalThis.onmessage = async event => {
   try {
     const localTransport = event.data.localTransport === true;
@@ -367,6 +380,10 @@ globalThis.onmessage = async event => {
       execute(Opcode.Present, 5, words(0));
       const identity = execute(Opcode.Readback, 0);
       if (identity.length !== pixels.length || identity.some((value, index) => value !== pixels[index])) { throw new Error('identity gamma presentation mismatch'); }
+      execute(Opcode.Present, 5, words(1 << 4, 0x3f800000));
+      const daltonized = execute(Opcode.Readback, 0);
+      if (daltonized.some((value, index) => Math.abs(value - protanopia(pixels, index)) > 2)) { throw new Error('protanopia presentation mismatch'); }
+      if (!daltonized.some((value, index) => value !== pixels[index])) { throw new Error('protanopia left the colours alone'); }
       if (n === 0) {
         const gamma = new Uint8Array(768);
         for (let n = 0; n < 256; ++n) { gamma[n] = 255 - n; gamma[n + 256] = (n + 37) % 256; gamma[n + 512] = Math.floor(n / 2); }

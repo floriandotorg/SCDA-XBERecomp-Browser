@@ -640,6 +640,34 @@ void run_smaa(WGPUCommandEncoder encoder, Texture& source) {
   for (auto view : views) { wgpuTextureViewRelease(view); }
   wgpuTextureViewRelease(color); wgpuTextureViewRelease(area); wgpuTextureViewRelease(search); wgpuBufferRelease(uniforms);
 }
+// Colour blind modes (native's ColourBlindMatrix): Machado 2009 simulation at full severity, then Fidaner's daltonize,
+// which moves the difference the eye loses into channels it still sees. Rows of protanopia, deuteranopia, tritanopia.
+constexpr float kColourBlindSimulate[3][9] = {
+  {0.152286f, 1.052583f, -0.204868f, 0.114503f, 0.786281f, 0.099216f, -0.003882f, -0.048116f, 1.051998f},
+  {0.367322f, 0.860646f, -0.227968f, 0.280085f, 0.672501f, 0.047413f, -0.011820f, 0.042940f, 0.968881f},
+  {1.255528f, -0.076749f, -0.178779f, -0.078411f, 0.930809f, 0.147602f, 0.004733f, 0.691367f, 0.303900f},
+};
+constexpr float kColourBlindShift[3][9] = {
+  {0, 0, 0, 0.7f, 1, 0, 0.7f, 0, 1},
+  {0, 0, 0, 0.7f, 1, 0, 0.7f, 0, 1},
+  {1, 0, 0.7f, 0, 1, 0.7f, 0, 0, 0},
+};
+// mode 1 to 3: identity + shift * (identity - simulate), three rows of four with the first's w 1; 0 is all zero
+std::array<float, 12> colour_blind_rows(uint32_t mode) {
+  std::array<float, 12> rows{};
+  if (!mode) { return rows; }
+  const float* simulate = kColourBlindSimulate[mode - 1];
+  const float* shift = kColourBlindShift[mode - 1];
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      float lost = 0;
+      for (int k = 0; k < 3; ++k) { lost += shift[r * 3 + k] * (float(k == c) - simulate[k * 3 + c]); }
+      rows[size_t(r * 4 + c)] = float(r == c) + lost;
+    }
+  }
+  rows[3] = 1;
+  return rows;
+}
 void release_presentation_target() {
   if (presentation_target.handle) { texture_bytes -= uint64_t(presentation_target.width) * presentation_target.height * 4; wgpuTextureDestroy(presentation_target.handle); wgpuTextureRelease(presentation_target.handle); presentation_target = {}; }
 }
@@ -651,6 +679,9 @@ void prepare_presentation() {
 struct Output { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var ramp: texture_2d<f32>;
+// a colour blind mode's matrix by rows, applied to linear colour; r0.w 0 leaves colours alone
+struct Colour { r0: vec4<f32>, r1: vec4<f32>, r2: vec4<f32> };
+@group(0) @binding(2) var<uniform> colour: Colour;
 @vertex fn vs_main(@builtin(vertex_index) vertex: u32) -> Output {
   let positions = array<vec2<f32>, 3>(vec2<f32>(-1,-1), vec2<f32>(3,-1), vec2<f32>(-1,3));
   let position = positions[vertex];
@@ -660,7 +691,10 @@ fn ramped(color: vec4<f32>) -> vec4<f32> {
   let r = textureLoad(ramp,vec2<i32>(i32(round(clamp(color.r,0,1)*255)),0),0).r;
   let g = textureLoad(ramp,vec2<i32>(i32(round(clamp(color.g,0,1)*255)),0),0).g;
   let b = textureLoad(ramp,vec2<i32>(i32(round(clamp(color.b,0,1)*255)),0),0).b;
-  return vec4<f32>(r,g,b,color.a);
+  if (colour.r0.w == 0) { return vec4<f32>(r,g,b,color.a); }
+  let linear = pow(saturate(vec3<f32>(r,g,b)), vec3<f32>(2.2));
+  let shifted = vec3<f32>(dot(colour.r0.xyz, linear), dot(colour.r1.xyz, linear), dot(colour.r2.xyz, linear));
+  return vec4<f32>(pow(saturate(shifted), vec3<f32>(1.0 / 2.2)), color.a);
 }
 @fragment fn fs_main(input: Output) -> @location(0) vec4<f32> {
   let dimensions = textureDimensions(source);
@@ -681,8 +715,10 @@ fn ramped(color: vec4<f32>) -> vec4<f32> {
     auto source = WGPU_SHADER_SOURCE_WGSL_INIT; source.code = text(code);
     auto shader_descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT; shader_descriptor.nextInChain = &source.chain;
     auto shader = wgpuDeviceCreateShaderModule(device, &shader_descriptor);
-    std::array<WGPUBindGroupLayoutEntry, 2> entries{};
-    for (uint32_t n = 0; n < entries.size(); ++n) { entries[n] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT; entries[n].binding = n; entries[n].visibility = WGPUShaderStage_Fragment; entries[n].texture.sampleType = WGPUTextureSampleType_Float; entries[n].texture.viewDimension = WGPUTextureViewDimension_2D; }
+    std::array<WGPUBindGroupLayoutEntry, 3> entries{};
+    for (uint32_t n = 0; n < entries.size(); ++n) { entries[n] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT; entries[n].binding = n; entries[n].visibility = WGPUShaderStage_Fragment; }
+    for (uint32_t n = 0; n < 2; ++n) { entries[n].texture.sampleType = WGPUTextureSampleType_Float; entries[n].texture.viewDimension = WGPUTextureViewDimension_2D; }
+    entries[2].buffer.type = WGPUBufferBindingType_Uniform;
     auto bindings = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT; bindings.entryCount = entries.size(); bindings.entries = entries.data(); presentation_bindings = wgpuDeviceCreateBindGroupLayout(device, &bindings);
     auto layout = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT; layout.bindGroupLayoutCount = 1; layout.bindGroupLayouts = &presentation_bindings; presentation_layout = wgpuDeviceCreatePipelineLayout(device, &layout);
     auto target = WGPU_COLOR_TARGET_STATE_INIT; target.format = WGPUTextureFormat_RGBA8Unorm;
@@ -1167,10 +1203,10 @@ void apply_shadows(uint32_t resource, std::span<const uint8_t> bytes) {
   if (!batch_encoder) { submit(encoder); }
   wgpuTextureViewRelease(filtered); wgpuTextureViewRelease(blank); wgpuTextureViewRelease(blankDepth); wgpuBufferRelease(uniforms);
 }
-// native's HDR resolve (src/gpu/d3d12.cpp's kPostHlsl in WGSL): exposure from the log average luminance over a grid,
-// a quarter size bloom of what passes white blurred across then down, then tone mapping back into the scene
+// native's HDR resolve (src/gpu/d3d12.cpp's kPostHlsl in WGSL): Chaos Theory's eye adaptation over a grid, a quarter
+// size bloom of what passes white blurred across then down, then scene and glow times the exposure scale
 constexpr const char* kResolveWgsl = R"(
-struct P { p0: vec4<f32>, p1: vec4<f32> }
+struct P { p0: vec4<f32>, p1: vec4<f32>, p2: vec4<f32> }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var src: texture_2d<f32>;
 @group(0) @binding(2) var bloom: texture_2d<f32>;
@@ -1184,27 +1220,32 @@ struct O { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
   o.uv = t;
   return o;
 }
-const kLum = vec3<f32>(0.2126, 0.7152, 0.0722);
+const kLum = vec3<f32>(0.3, 0.59, 0.11);
 fn exposure_now() -> f32 { return textureLoad(expo, vec2<i32>(0), 0).r; }
-// p0: headroom, key, lowest and highest exposure
+// Chaos Theory's eye adaptation, the scale the scene goes to. p0: headroom, glow strength, glow start, brightness
+// max; p1: brightness min, dark end, normal start, normal end; p2: bright start, dark, normal and bright scale
 @fragment fn exposure(i: O) -> @location(0) vec4<f32> {
   var s = 0.0;
   for (var y = 0; y < 18; y++) {
     for (var x = 0; x < 32; x++) {
       let at = (vec2<f32>(f32(x), f32(y)) + vec2<f32>(0.5)) / vec2<f32>(32.0, 18.0);
-      s += log(max(dot(textureSampleLevel(src, ls, at, 0.0).rgb * p.p0.x, kLum), 1e-3));
+      let c = textureSampleLevel(src, ls, at, 0.0).rgb * p.p0.x;
+      let lit = dot(min(c, vec3<f32>(1.0)) + max(c - vec3<f32>(1.0 + p.p0.z), vec3<f32>(0.0)) * p.p0.y, kLum);
+      s += log2(clamp(p.p0.w - lit, p.p1.x, p.p0.w));
     }
   }
-  return vec4<f32>(clamp(p.p0.y / exp(s / 576.0), p.p0.z, p.p0.w), 0.0, 0.0, 1.0);
+  let l = p.p0.w - exp2(s / 576.0);
+  if (l >= p.p1.w) { return vec4<f32>(mix(p.p2.z, p.p2.w, saturate((l - p.p1.w) / (p.p2.x - p.p1.w))), 0.0, 0.0, 1.0); }
+  return vec4<f32>(mix(p.p2.y, p.p2.z, saturate((l - p.p1.y) / (p.p1.z - p.p1.y))), 0.0, 0.0, 1.0);
 }
-// p1: source texel
+// p1: source texel; a quarter size copy of what passes 1
 @fragment fn bright(i: O) -> @location(0) vec4<f32> {
   var c = vec3<f32>(0.0);
   for (var k = 0; k < 4; k++) {
     let side = vec2<f32>(select(-1.0, 1.0, (k & 1) != 0), select(-1.0, 1.0, (k & 2) != 0));
     c += textureSampleLevel(src, ls, i.uv + p.p1.xy * side, 0.0).rgb;
   }
-  return vec4<f32>(max(c * 0.25 * p.p0.x * exposure_now() - vec3<f32>(1.0), vec3<f32>(0.0)), 1.0);
+  return vec4<f32>(max(c * 0.25 * p.p0.x - vec3<f32>(1.0), vec3<f32>(0.0)), 1.0);
 }
 // p1: step; 9 gaussian taps in 5 bilinear reads
 @fragment fn blur(i: O) -> @location(0) vec4<f32> {
@@ -1213,22 +1254,23 @@ fn exposure_now() -> f32 { return textureLoad(expo, vec2<i32>(0), 0).r; }
   c += (textureSampleLevel(src, ls, i.uv + p.p1.xy * 3.230769, 0.0).rgb + textureSampleLevel(src, ls, i.uv - p.p1.xy * 3.230769, 0.0).rgb) * 0.070270;
   return vec4<f32>(c, 1.0);
 }
-// p0: headroom, tone mapping, bloom strength; linear up to the knee, highlights roll off towards white
+// p0: headroom, bloom strength; scene and glow times the exposure scale, clipped as Chaos Theory's
 @fragment fn tone(i: O) -> @location(0) vec4<f32> {
   let s = textureLoad(src, vec2<i32>(i.pos.xy), 0);
-  var c = s.rgb * p.p0.x;
-  let b = textureSampleLevel(bloom, ls, i.uv, 0.0).rgb * p.p0.z;
-  if (p.p0.y > 0.0) {
-    let a = 0.75;
-    c = c * exposure_now() + b;
-    c = min(c, vec3<f32>(a)) + (1.0 - a) * (vec3<f32>(1.0) - exp(min(vec3<f32>(a) - c, vec3<f32>(0.0)) / (1.0 - a)));
-  } else {
-    c += b;
-  }
-  return vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), s.a);
+  let c = s.rgb * p.p0.x + textureSampleLevel(bloom, ls, i.uv, 0.0).rgb * p.p0.y;
+  return vec4<f32>(saturate(c * exposure_now()), s.a);
 }
 )";
-constexpr float kHeadroom = 8, kExposureKey = 0.4f, kLowestExposure = 0.7f, kHighestExposure = 1, kBloomStrength = 0.6f;
+constexpr float kHeadroom = 8, kBloomStrength = 0.6f;
+// a level's Tonemapping settings (native's ToneMapPreset), glow start out of 255
+struct ToneMapPreset {
+  float glow_strength, glow_start, dark_scale, normal_scale, bright_scale, dark_end, normal_start, normal_end, bright_start, brightness_max,
+    brightness_min, initial_scale;
+};
+// Double Agent's levels: Tonemapping and Tonemapping_NV; tone mapping off is every scale 1
+constexpr ToneMapPreset kToneMap = {256, 16, 1.5f, 1.0f, 0.5f, 0.05f, 0.2f, 0.6f, 1.2f, 16, 0.01f, 1.5f};
+constexpr ToneMapPreset kToneMapNv = {256, 16, 1.0f, 0.6f, 0.4f, 0.0f, 0.05f, 0.2f, 0.35f, 16, 0.01f, 2.4f};
+constexpr ToneMapPreset kNoToneMap = {256, 16, 1, 1, 1, 0.05f, 0.2f, 0.6f, 1.2f, 16, 0.01f, 1};
 constexpr uint32_t kBloomShrink = 4;
 struct ResolveState {
   WGPUBindGroupLayout bindings = nullptr;
@@ -1291,7 +1333,7 @@ WGPUTexture resolve_texture(uint32_t width, uint32_t height, WGPUTextureFormat f
   auto descriptor = WGPU_TEXTURE_DESCRIPTOR_INIT; descriptor.size = {width, height, 1}; descriptor.format = format; descriptor.usage = usage;
   return wgpuDeviceCreateTexture(device, &descriptor);
 }
-void resolve_pass(WGPUCommandEncoder encoder, uint32_t pass, WGPUTextureFormat format, WGPUTextureView output, std::array<float, 8> parameters,
+void resolve_pass(WGPUCommandEncoder encoder, uint32_t pass, WGPUTextureFormat format, WGPUTextureView output, std::array<float, 12> parameters,
                   WGPUTextureView source, WGPUTextureView bloom, WGPUTextureView exposure, float blend = 1) {
   auto& state = resolve_state;
   auto uniforms = buffer({reinterpret_cast<const uint8_t*>(parameters.data()), sizeof(parameters)}, WGPUBufferUsage_Uniform);
@@ -1315,20 +1357,28 @@ void resolve_pass(WGPUCommandEncoder encoder, uint32_t pass, WGPUTextureFormat f
 void resolve_hdr(uint32_t resource, std::span<const uint8_t> bytes) {
   const auto spec = packet<ResolvePacket>(bytes); exact(bytes, 0);
   auto& scene = texture(resource);
-  if (!scene.hdr || !std::isfinite(spec.blend) || spec.blend < 0 || spec.blend > 1 || spec.tone > 1) { throw std::runtime_error("invalid HDR resolve"); }
+  if (!scene.hdr || !std::isfinite(spec.blend) || spec.blend < 0 || spec.blend > 1 || spec.tone > (ResolveTone | ResolveNightVision | ResolveFresh)) {
+    throw std::runtime_error("invalid HDR resolve");
+  }
+  const ToneMapPreset& tm = !(spec.tone & ResolveTone) ? kNoToneMap : spec.tone & ResolveNightVision ? kToneMapNv : kToneMap;
   auto& state = resolve_state;
   end_batch_pass();
   readable(scene);
   const uint32_t bw = std::max(1u, scene.width / kBloomShrink), bh = std::max(1u, scene.height / kBloomShrink);
   auto encoder = batch_encoder ? batch_encoder : wgpuDeviceCreateCommandEncoder(device, nullptr);
-  if (!state.sampler) {
+  const bool created = !state.sampler;
+  if (created) {
     auto descriptor = WGPU_SAMPLER_DESCRIPTOR_INIT; descriptor.magFilter = descriptor.minFilter = WGPUFilterMode_Linear;
     state.sampler = wgpuDeviceCreateSampler(device, &descriptor);
     state.dummy = resolve_texture(1, 1, WGPUTextureFormat_RGBA16Float, WGPUTextureUsage_TextureBinding);
     state.exposure = resolve_texture(1, 1, WGPUTextureFormat_R16Float, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding);
-    // new memory can hold NaN, which the blend would keep forever
+  }
+  // the scale starts at the preset's own; new memory can also hold NaN, which the blend would keep forever
+  if (created || (spec.tone & ResolveFresh)) {
+    const double initial = created && !(spec.tone & ResolveFresh) ? 1.0 : tm.initial_scale;
     auto view = wgpuTextureCreateView(state.exposure, nullptr);
-    auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; attachment.view = view; attachment.loadOp = WGPULoadOp_Clear; attachment.storeOp = WGPUStoreOp_Store; attachment.clearValue = {1, 1, 1, 1};
+    auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; attachment.view = view; attachment.loadOp = WGPULoadOp_Clear; attachment.storeOp = WGPUStoreOp_Store;
+    attachment.clearValue = {initial, initial, initial, initial};
     auto descriptor_pass = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor_pass.colorAttachmentCount = 1; descriptor_pass.colorAttachments = &attachment;
     auto render = begin_pass(encoder, &descriptor_pass); wgpuRenderPassEncoderEnd(render); wgpuRenderPassEncoderRelease(render);
     wgpuTextureViewRelease(view);
@@ -1347,12 +1397,12 @@ void resolve_hdr(uint32_t resource, std::span<const uint8_t> bytes) {
   wgpuCommandEncoderCopyTextureToTexture(encoder, &from, &to, &extent);
   auto copy = wgpuTextureCreateView(state.copy, nullptr), blank = wgpuTextureCreateView(state.dummy, nullptr), exposure = wgpuTextureCreateView(state.exposure, nullptr);
   std::array<WGPUTextureView, 2> bloom{wgpuTextureCreateView(state.bloom[0], nullptr), wgpuTextureCreateView(state.bloom[1], nullptr)};
-  const float lowest = spec.tone ? kLowestExposure : kHighestExposure;
-  resolve_pass(encoder, 0, WGPUTextureFormat_R16Float, exposure, {kHeadroom, kExposureKey, lowest, kHighestExposure}, copy, blank, blank, spec.blend);
+  resolve_pass(encoder, 0, WGPUTextureFormat_R16Float, exposure, {kHeadroom, tm.glow_strength, tm.glow_start / 255, tm.brightness_max,
+    tm.brightness_min, tm.dark_end, tm.normal_start, tm.normal_end, tm.bright_start, tm.dark_scale, tm.normal_scale, tm.bright_scale}, copy, blank, blank, spec.blend);
   resolve_pass(encoder, 1, WGPUTextureFormat_RGBA16Float, bloom[0], {kHeadroom, 0, 0, 0, 1.0f / scene.width, 1.0f / scene.height}, copy, blank, exposure);
   resolve_pass(encoder, 2, WGPUTextureFormat_RGBA16Float, bloom[1], {0, 0, 0, 0, 1.0f / bw, 0}, bloom[0], blank, blank);
   resolve_pass(encoder, 2, WGPUTextureFormat_RGBA16Float, bloom[0], {0, 0, 0, 0, 0, 1.0f / bh}, bloom[1], blank, blank);
-  resolve_pass(encoder, 3, hdr_format, attachment_view(scene), {kHeadroom, float(spec.tone), kBloomStrength, 0}, copy, bloom[0], exposure);
+  resolve_pass(encoder, 3, hdr_format, attachment_view(scene), {kHeadroom, kBloomStrength}, copy, bloom[0], exposure);
   if (scene.ms) { scene.seed = true; }
   if (!batch_encoder) { submit(encoder); }
   for (auto view : {copy, blank, exposure, bloom[0], bloom[1]}) { wgpuTextureViewRelease(view); }
@@ -2254,7 +2304,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
     case Opcode::Present: {
       auto present = packet<PresentPacket>(bytes); exact(bytes, 0);
       auto& source = texture(resource);
-      if (source.depth || source.cube || source.volumeDepth > 1 || present.pillarbox > (PresentPillarbox | PresentLinear | PresentSmaa | PresentHdr) ||
+      if (source.depth || source.cube || source.volumeDepth > 1 || present.pillarbox > (PresentPillarbox | PresentLinear | PresentSmaa | PresentHdr | PresentColourBlind) ||
           !std::isfinite(present.headroom)) { throw std::runtime_error("unsupported presentation source or flags"); }
       prepare_presentation();
       if (const bool hdr = (present.pillarbox & PresentHdr) && !hdr_refused; hdr != surface_hdr) { configure_surface(hdr); }
@@ -2263,9 +2313,12 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
       if (present.pillarbox & PresentSmaa) { run_smaa(encoder, source); }
       auto source_view = wgpuTextureCreateView(present.pillarbox & PresentSmaa ? smaa_state.targets[2] : source.handle, nullptr); auto ramp_view = wgpuTextureCreateView(gamma_texture, nullptr); auto target_view = wgpuTextureCreateView(presentation_target.handle, nullptr);
-      std::array<WGPUBindGroupEntry, 2> entries{};
+      const auto colour_matrix = colour_blind_rows((present.pillarbox & PresentColourBlind) >> PresentColourBlindShift);
+      auto colour_uniforms = buffer({reinterpret_cast<const uint8_t*>(colour_matrix.data()), sizeof(colour_matrix)}, WGPUBufferUsage_Uniform);
+      std::array<WGPUBindGroupEntry, 3> entries{};
       entries[0] = WGPU_BIND_GROUP_ENTRY_INIT; entries[0].binding = 0; entries[0].textureView = source_view;
       entries[1] = WGPU_BIND_GROUP_ENTRY_INIT; entries[1].binding = 1; entries[1].textureView = ramp_view;
+      entries[2] = WGPU_BIND_GROUP_ENTRY_INIT; entries[2].binding = 2; entries[2].buffer = colour_uniforms; entries[2].size = sizeof(colour_matrix);
       auto group_descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT; group_descriptor.layout = presentation_bindings; group_descriptor.entryCount = entries.size(); group_descriptor.entries = entries.data(); auto group = wgpuDeviceCreateBindGroup(device, &group_descriptor);
       auto color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; color.view = target_view; color.loadOp = WGPULoadOp_Clear; color.storeOp = WGPUStoreOp_Store; color.clearValue = {0, 0, 0, 1};
       auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &color;
@@ -2277,7 +2330,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       if (surface_hdr) { expand_frame(encoder, current.texture, present.headroom); }
       else { auto from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; from.texture = presentation_target.handle; auto to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT; to.texture = current.texture; WGPUExtent3D extent{canvas_width, canvas_height, 1}; wgpuCommandEncoderCopyTextureToTexture(encoder, &from, &to, &extent); }
       submit(encoder);
-      wgpuBindGroupRelease(group); wgpuTextureViewRelease(source_view); wgpuTextureViewRelease(ramp_view); wgpuTextureViewRelease(target_view); wgpuTextureRelease(current.texture);
+      wgpuBindGroupRelease(group); wgpuBufferRelease(colour_uniforms); wgpuTextureViewRelease(source_view); wgpuTextureViewRelease(ramp_view); wgpuTextureViewRelease(target_view); wgpuTextureRelease(current.texture);
       auto info = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT; info.mode = WGPUCallbackMode_AllowSpontaneous;
       info.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView message, void*, void*) {
         if (status != WGPUQueueWorkDoneStatus_Success) { failure = string(message); }

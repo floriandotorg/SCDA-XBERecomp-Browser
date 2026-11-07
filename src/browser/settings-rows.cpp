@@ -4,7 +4,9 @@
 #include "app/app.h"
 #include "browser/host-messages.h"
 #include "browser/host-settings.h"
+#include "browser/input-core.h"
 #include "browser/keyboard-input.h"
+#include "core/gyro.h"
 #include "core/input.h"
 
 #include <algorithm>
@@ -55,7 +57,7 @@ const std::vector<Setting>& Settings() {
     {14, "resolutionScale", "100", {}, false, 50, 200, 5, "%.0f%%"},
     {15, "brightness", "50", {}, false, 0, 100, 1, "%.0f"},
     {16, "contrast", "50", {}, false, 0, 100, 1, "%.0f"},
-    {17, "frameCap", "60", {{"0", "DISPLAY RATE"}, {"30", "30"}, {"60", "60"}}},
+    {17, "frameCap", "0", {{"0", "DISPLAY RATE"}, {"30", "30"}, {"60", "60"}}},
     {18, "anisotropy", "0", {{"0", "OFF"}, {"2", "2X"}, {"4", "4X"}, {"8", "8X"}, {"16", "16X"}}},
     {19, "language", "auto", {{"auto", "AUTOMATIC"}, {"int", "ENGLISH"}, {"fra", "FRANCAIS"}, {"deu", "DEUTSCH"}, {"ita", "ITALIANO"}, {"esp", "ESPANOL"}}},
     {20, "audioOutput", "stereo", {{"stereo", "2.0 STEREO"}, {"mono", "MONO"}}},
@@ -69,6 +71,21 @@ const std::vector<Setting>& Settings() {
     {28, "toneMapping", "false", {}, true},
     {29, "hdrOutput", "true", {}, true},
     {30, "ambientOcclusion", "off", {{"off", "OFF"}, {"ssao", "SSAO"}, {"gtao", "GTAO"}}},
+    {31, "colourBlind", "off", {{"off", "OFF"}, {"protanopia", "PROTANOPIA"}, {"deuteranopia", "DEUTERANOPIA"}, {"tritanopia", "TRITANOPIA"}}},
+    {32, "verticalSensitivity", "1", {}, false, 0.1, 5, 0.1, "%.1f"},
+    {33, "invertX", "false", {}, true},
+    {34, "padSensitivity", "1", {}, false, 0.1, 4, 0.1, "%.1f"},
+    {35, "padVerticalSensitivity", "1", {}, false, 0.1, 4, 0.1, "%.1f"},
+    {36, "padAimSensitivity", "1", {}, false, 0.1, 4, 0.1, "%.1f"},
+    {37, "padAimVerticalSensitivity", "1", {}, false, 0.1, 4, 0.1, "%.1f"},
+    {38, "padInvertX", "false", {}, true},
+    {39, "padInvertY", "false", {}, true},
+    {40, "padDeadZone", "0", {{"0", "0.3 (DEFAULT)"}, {"0.1", "0.1"}, {"0.2", "0.2"}, {"0.3", "0.3"}, {"0.4", "0.4"}, {"0.5", "0.5"},
+                              {"0.6", "0.6"}, {"0.7", "0.7"}, {"0.8", "0.8"}, {"0.9", "0.9"}, {"1", "1.0"}}},
+    {41, "vibration", "100", {}, false, 0, 200, 10, "%.0f%%"},
+    {42, "gyroAiming", "false", {}, true},
+    {43, "gyroSensitivity", "2", {}, false, 0.1, 5, 0.1, "%.1f"},
+    {44, "gyroAxis", "yaw", {{"yaw", "YAW"}, {"roll", "ROLL"}, {"world", "WORLD"}}},
   };
   return list;
 }
@@ -78,6 +95,15 @@ const Setting* Find(int id) {
     if (setting.id == id) { return &setting; }
   }
   return nullptr;
+}
+
+// CALIBRATE GYRO: a step starts it, no setting
+constexpr int kGyroCalibrate = 45;
+// the gyro rows, shown where the page reads a motion sensor (gamepad-input.mjs)
+bool GyroRow(int id) { return id >= 42 && id <= kGyroCalibrate; }
+bool MotionSensor() {
+  const auto* words = browser::input_core::Gamepad();
+  return words && (*words)[browser::input_core::kMotionFlags].load() & browser::input_core::kMotionSensor;
 }
 
 constexpr Row kSettingsRows[] = {
@@ -92,6 +118,7 @@ constexpr Row kSettingsRows[] = {
   {Kind::Value, 15, "BRIGHTNESS"},
   {Kind::Value, 16, "CONTRAST"},
   {Kind::Value, 17, "MAX FRAME RATE"},
+  {Kind::Value, 31, "COLOUR BLIND MODE"},
   {Kind::Heading, -1, "GRAPHICS"},
   {Kind::Value, 2, "FPS COUNTER"},
   {Kind::Value, 18, "ANISOTROPIC FILTERING"},
@@ -120,7 +147,8 @@ const std::vector<Row>& InputRows() {
   static const std::vector<Row> list = [] {
     std::vector<Row> out = {{Kind::Heading, -1, "MOUSE"}, {Kind::Value, 6, "FREE LOOK SENSITIVITY"},
                             {Kind::Value, 7, "WEAPON SENSITIVITY"}, {Kind::Value, 8, "SNIPER SENSITIVITY"},
-                            {Kind::Value, 9, "INVERT MOUSE"}, {Kind::Heading, -1, "KEYBOARD"}};
+                            {Kind::Value, 32, "VERTICAL SENSITIVITY"}, {Kind::Value, 33, "INVERT X AXIS"},
+                            {Kind::Value, 9, "INVERT Y AXIS"}, {Kind::Heading, -1, "KEYBOARD"}};
     size_t count = 0;
     const input::Action* actions = input::Actions(&count);
     for (size_t i = 0; i < count; i++) {
@@ -131,9 +159,24 @@ const std::vector<Row>& InputRows() {
   return list;
 }
 
+// native's controller page: its sections are GENERAL, GYRO and BUTTONS (options_menu.cpp)
 const std::vector<Row>& PadRows() {
   static const std::vector<Row> list = [] {
-    std::vector<Row> out;
+    std::vector<Row> out = {{Kind::Heading, -1, "GENERAL"},
+                            {Kind::Value, 34, "HORIZONTAL SENSITIVITY"},
+                            {Kind::Value, 35, "VERTICAL SENSITIVITY"},
+                            {Kind::Value, 36, "AIM HORIZONTAL SENSITIVITY"},
+                            {Kind::Value, 37, "AIM VERTICAL SENSITIVITY"},
+                            {Kind::Value, 38, "INVERT X AXIS"},
+                            {Kind::Value, 39, "INVERT Y AXIS"},
+                            {Kind::Value, 40, "DEADZONE"},
+                            {Kind::Value, 41, "VIBRATION STRENGTH"},
+                            {Kind::Heading, -1, "GYRO"},
+                            {Kind::Value, 42, "GYRO AIMING"},
+                            {Kind::Value, 43, "GYRO SENSITIVITY"},
+                            {Kind::Value, 44, "GYRO AXIS"},
+                            {Kind::Value, kGyroCalibrate, "CALIBRATE GYRO"},
+                            {Kind::Heading, -1, "BUTTONS"}};
     size_t count = 0;
     const input::Action* actions = input::PadActions(&count);
     for (size_t i = 0; i < count; i++) {
@@ -240,12 +283,17 @@ std::string Value(const Row& row) {
     for (char& c : keys) { c = c == ',' ? '/' : char(std::toupper(uint8_t(c))); }
     return keys;
   }
+  if (row.kind == Kind::Value && row.id == kGyroCalibrate) { return gyro::Calibrating() ? "KEEP STILL" : "START"; }
   const Setting* setting = row.kind == Kind::Value ? Find(row.id) : nullptr;
   if (setting && !Usable(row.id)) { return row.id == 29 ? "NOT SUPPORTED" : "OFF"; }
   return setting ? Text(*setting, Current(*setting)) : std::string();
 }
 
 void Step(const Row& row, int step) {
+  if (row.kind == Kind::Value && row.id == kGyroCalibrate) {
+    if (step) { gyro::StartCalibration(); }
+    return;
+  }
   if (const Setting* setting = row.kind == Kind::Value && step && Usable(row.id) ? Find(row.id) : nullptr) { StepSetting(*setting, step); }
 }
 
@@ -281,7 +329,7 @@ void Choose(const Row& row, int index) {
   else if (index < int(setting->choices.size())) { Send(*setting, setting->choices[size_t(index)].value); }
 }
 
-bool Shown(const Row&) { return true; }
+bool Shown(const Row& row) { return row.kind != Kind::Value || !GyroRow(row.id) || MotionSensor(); }
 bool Enabled(const Row& row) { return row.kind != Kind::Value || Usable(row.id); }
 
 }  // namespace rows

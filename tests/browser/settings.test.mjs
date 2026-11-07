@@ -94,7 +94,7 @@ test('per view sensitivities share the free look range', () => {
 test('the simple settings pack normalises, persists and resets', () => {
   const storage = memory();
   const settings = createSettings({ storage });
-  assert.deepEqual(['anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput'].map(name => settings.get(name)), [0, 50, 50, 60, 'auto', 'stereo']);
+  assert.deepEqual(['anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput'].map(name => settings.get(name)), [0, 50, 50, 0, 'auto', 'stereo']);
   settings.set('anisotropy', 16);
   settings.set('anisotropy', 3);
   settings.set('brightness', 140);
@@ -104,7 +104,7 @@ test('the simple settings pack normalises, persists and resets', () => {
   const reloaded = createSettings({ storage });
   assert.deepEqual(['anisotropy', 'brightness', 'frameCap', 'language', 'audioOutput'].map(name => reloaded.get(name)), [16, 100, 30, 'fra', 'mono']);
   reloaded.reset();
-  assert.equal(reloaded.get('frameCap'), 60);
+  assert.equal(reloaded.get('frameCap'), 0);
 });
 
 test('MSAA offers off and 4x only: 2 and 8 become 4, garbage stays off; SMAA is a switch', () => {
@@ -142,4 +142,34 @@ test('ambient occlusion is off, SSAO or GTAO, off by default', () => {
   settings.set('ambientOcclusion', 'gtao');
   assert.equal(settings.get('ambientOcclusion'), 'gtao');
   assert.equal(createSettings({ storage: memory(JSON.stringify({ ambientOcclusion: 'ssao' })) }).get('ambientOcclusion'), 'ssao');
+});
+
+test('numeric choices take the text the in-game pages send', () => {
+  const settings = createSettings({ storage: memory() });
+  settings.set('frameCap', '30');
+  settings.set('anisotropy', '4');
+  settings.set('padDeadZone', '0.2');
+  settings.set('shadowResolution', '999');
+  assert.equal(settings.get('frameCap'), 30);
+  assert.equal(settings.get('anisotropy'), 4);
+  assert.equal(settings.get('padDeadZone'), 0.2);
+  assert.equal(settings.get('shadowResolution'), 512);
+});
+
+test('the upstream input, colour and gyro settings default to native', () => {
+  const settings = createSettings({ storage: memory() });
+  assert.equal(settings.get('frameCap'), 0, 'the frame rate follows the display, as native defaults to the refresh rate');
+  assert.equal(settings.get('colourBlind'), 'off');
+  assert.equal(settings.get('verticalSensitivity'), 1);
+  assert.equal(settings.get('invertX'), false);
+  for (const name of ['padSensitivity', 'padVerticalSensitivity', 'padAimSensitivity', 'padAimVerticalSensitivity']) { assert.equal(settings.get(name), 1, name); }
+  assert.equal(settings.get('padInvertX'), false);
+  assert.equal(settings.get('padInvertY'), false);
+  assert.equal(settings.get('padDeadZone'), 0);
+  assert.equal(settings.get('vibration'), 100);
+  assert.equal(settings.get('gyroAiming'), false);
+  assert.equal(settings.get('gyroSensitivity'), 2);
+  assert.equal(settings.get('gyroAxis'), 'yaw');
+  settings.set('vibration', 250);
+  assert.equal(settings.get('vibration'), 200);
 });

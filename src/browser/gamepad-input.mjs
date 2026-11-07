@@ -1,7 +1,12 @@
 import { MENU_INPUT } from './menu-input.mjs';
 import { PAD_BUTTONS } from './input-actions.mjs';
 
-export const GAMEPAD_INPUT = Object.freeze({ words: 8, bytes: 32 });
+// input-core.h: the pad (words 0 to 7), the guest's rumble, then the device's motion readings for gyro aiming
+export const GAMEPAD_INPUT = Object.freeze({ words: 144, bytes: 576, rumble: 8, motionHead: 9, motionFlags: 10, motionRing: 16, motionEntries: 16,
+  motionEntryWords: 8 });
+const RUMBLE_RENEW_MS = 100, RUMBLE_EFFECT_MS = 200;
+const finite = values => values.every(Number.isFinite);
+const screenAngle = () => Number(globalThis.screen?.orientation?.angle ?? globalThis.orientation ?? 0) || 0;
 
 const owners = new WeakMap();
 const buttons = [MENU_INPUT.confirm, MENU_INPUT.back, MENU_INPUT.x, MENU_INPUT.y, MENU_INPUT.white, MENU_INPUT.black,
@@ -19,7 +24,9 @@ const mergePads = pads => pads.length === 1 ? pads[0] : {
 
 export const createGamepadInput = ({ buffer, byteOffset, target = globalThis.window, visibilityTarget = globalThis.document,
   navigator = globalThis.navigator, requestFrame = globalThis.requestAnimationFrame?.bind(globalThis),
-  cancelFrame = globalThis.cancelAnimationFrame?.bind(globalThis), virtualPads = () => [], signal } = {}) => {
+  cancelFrame = globalThis.cancelAnimationFrame?.bind(globalThis), virtualPads = () => [], motion = () => false,
+  motionSensor = typeof globalThis.DeviceMotionEvent === 'function' && navigator?.maxTouchPoints > 0, orientation = screenAngle,
+  now = () => globalThis.performance.now(), signal } = {}) => {
   if (!(buffer instanceof SharedArrayBuffer) || buffer.growable) { throw new TypeError('Gamepad input requires fixed shared memory.'); }
   if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset % 4 || byteOffset > buffer.byteLength - GAMEPAD_INPUT.bytes) {
     throw new RangeError('Gamepad input span must be aligned and in bounds.');
@@ -40,7 +47,47 @@ export const createGamepadInput = ({ buffer, byteOffset, target = globalThis.win
   spans.add(byteOffset);
   owners.set(buffer, spans);
   const words = new Int32Array(buffer, byteOffset, GAMEPAD_INPUT.words);
+  const floats = new Float32Array(buffer, byteOffset, GAMEPAD_INPUT.words);
   let disposed = false;
+  let actuator, rumble = 0, rumbleAt = 0;
+  // the motors the guest set, as the dual rumble a standard pad plays; an effect has a length, so a held one is renewed
+  const playRumble = hardware => {
+    const value = Atomics.load(words, GAMEPAD_INPUT.rumble) >>> 0;
+    const target = hardware?.vibrationActuator;
+    if (target !== actuator) { stopRumble(); actuator = target; }
+    if (!actuator || (value === rumble && (!value || now() - rumbleAt < RUMBLE_RENEW_MS))) { return; }
+    rumble = value;
+    rumbleAt = now();
+    if (!value) { void actuator.reset?.()?.catch?.(() => {}); return; }
+    void actuator.playEffect?.('dual-rumble', { startDelay: 0, duration: RUMBLE_EFFECT_MS, strongMagnitude: (value & 0xffff) / 0xffff,
+      weakMagnitude: (value >>> 16) / 0xffff })?.catch?.(() => {});
+  };
+  const stopRumble = () => {
+    if (actuator && rumble) { void actuator.reset?.()?.catch?.(() => {}); }
+    rumble = 0;
+  };
+  // a reading about the device's axes (x right, y up and z out of its screen held upright) turned by the screen's
+  // rotation into the picture's, which are the controller's: the phone in the hands is the controller
+  const readMotion = event => {
+    const rate = event.rotationRate, gravity = event.accelerationIncludingGravity;
+    if (!rate || !finite([rate.alpha, rate.beta, rate.gamma])) { return; }
+    const radians = orientation() * Math.PI / 180, cos = Math.cos(radians), sin = Math.sin(radians);
+    const turn = (x, y, z) => [x * cos - y * sin, x * sin + y * cos, z];
+    const accelerated = Boolean(gravity) && finite([gravity.x, gravity.y, gravity.z]);
+    const head = Atomics.load(words, GAMEPAD_INPUT.motionHead) >>> 0;
+    const entry = GAMEPAD_INPUT.motionRing + head % GAMEPAD_INPUT.motionEntries * GAMEPAD_INPUT.motionEntryWords;
+    Atomics.store(words, entry, Math.round(event.timeStamp * 1000) | 0);
+    floats.set([...turn(rate.beta, rate.gamma, rate.alpha), ...(accelerated ? turn(gravity.x, gravity.y, gravity.z) : [0, 0, 0])], entry + 1);
+    Atomics.store(words, entry + 7, accelerated ? 1 : 0);
+    Atomics.store(words, GAMEPAD_INPUT.motionHead, (head + 1) | 0);
+  };
+  let listening = false;
+  const listen = on => {
+    if (on === listening) { return; }
+    listening = on;
+    if (on) { target.addEventListener('devicemotion', readMotion); }
+    else { target.removeEventListener('devicemotion', readMotion); }
+  };
   let active = true;
   let focused = visibilityTarget.hasFocus?.() ?? true;
   let frame;
@@ -63,7 +110,9 @@ export const createGamepadInput = ({ buffer, byteOffset, target = globalThis.win
       if (present.length) { pad = mergePads(present); }
     }
     if (disposed) { return; }
+    listen(!disposed && Boolean(motion()));
     if (pad) {
+      playRumble(hardware);
       let mask = 0;
       for (let n = 0; n < buttons.length; ++n) {
         if (pad.buttons?.[n]?.pressed) { mask |= buttons[n]; }
@@ -77,16 +126,21 @@ export const createGamepadInput = ({ buffer, byteOffset, target = globalThis.win
       physical |= (trigger(6) << 16) | (trigger(7) << 24);
       // connected: 1 a physical pad, 2 only a touch screen's on-screen one (input-core.cpp shows the pad's prompts)
       publish([hardware ? 1 : 2, mask, axis(pad.axes?.[0]), axis(-pad.axes?.[1]), axis(pad.axes?.[2]), axis(-pad.axes?.[3]), physical]);
-    } else { neutral(); }
+    } else {
+      stopRumble();
+      neutral();
+    }
     if (!disposed) { frame = requestFrame(poll); }
   };
-  const blur = () => { focused = false; neutral(); };
+  const blur = () => { focused = false; stopRumble(); neutral(); };
   const focus = () => { focused = true; neutral(); };
   const visibility = () => { neutral(); };
   const dispose = () => {
     if (disposed) { return; }
     disposed = true;
     if (frame !== undefined) { cancelFrame(frame); }
+    listen(false);
+    stopRumble();
     neutral();
     target.removeEventListener('blur', blur);
     target.removeEventListener('focus', focus);
@@ -95,6 +149,7 @@ export const createGamepadInput = ({ buffer, byteOffset, target = globalThis.win
     spans.delete(byteOffset);
   };
   publish([0, 0, 0, 0, 0, 0, 0], true);
+  Atomics.store(words, GAMEPAD_INPUT.motionFlags, motionSensor ? 1 : 0);
   target.addEventListener('blur', blur);
   target.addEventListener('focus', focus);
   visibilityTarget.addEventListener('visibilitychange', visibility);

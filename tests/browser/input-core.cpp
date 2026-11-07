@@ -47,6 +47,22 @@ void Publish(float free, float weapon, float sniper, bool invert, const std::str
   block.words[hs::kRevisionWord] = revision + 2;
 }
 
+// upstream's mouse and controller settings over what Publish left
+void PublishInput(uint32_t flags, float vertical, float pad, float padAim, float deadZone, uint32_t vibration) {
+  auto& block = hs::Shared();
+  const uint32_t revision = block.words[hs::kRevisionWord].load();
+  block.words[hs::kRevisionWord] = revision + 1;
+  block.words[hs::kFlagsWord] = flags;
+  block.words[hs::kMouseVerticalSensitivityWord] = std::bit_cast<uint32_t>(vertical);
+  block.words[hs::kPadHorizontalSensitivityWord] = std::bit_cast<uint32_t>(pad);
+  block.words[hs::kPadVerticalSensitivityWord] = std::bit_cast<uint32_t>(pad * 2);
+  block.words[hs::kPadAimHorizontalSensitivityWord] = std::bit_cast<uint32_t>(padAim);
+  block.words[hs::kPadAimVerticalSensitivityWord] = std::bit_cast<uint32_t>(padAim * 2);
+  block.words[hs::kPadDeadZoneWord] = std::bit_cast<uint32_t>(deadZone);
+  block.words[hs::kVibrationStrengthWord] = vibration;
+  block.words[hs::kRevisionWord] = revision + 2;
+}
+
 bool Near(int16_t value, float expected) { return std::abs(float(value) - expected * 32767.0f) < 2.0f; }
 
 int main() {
@@ -153,6 +169,10 @@ int main() {
   Publish(1, 2, 3, true, "");
   ki::Shared()[ki::kMouseY] = 1000;
   check(input::TakeMouse(dx, dy) && dy == -1, "inverted look");
+  PublishInput(1u << hs::kInvertMouseXBit, 0.5f, 1, 1, 0, 100);
+  ki::Shared()[ki::kMouseX] = 1000;
+  ki::Shared()[ki::kMouseY] = 1000;
+  check(input::TakeMouse(dx, dy) && dx == -1 && dy == 0.5f, "inverted X and the vertical sensitivity");
 
   Publish(1, 2, 3, false, "keys.fire=G\npad_buttons.jump=B\n");
   check(input::Binding(9) == "G", "a rebind from the page reloads the binds");
@@ -181,7 +201,7 @@ int main() {
   check(!pad.ly, "an inactive page gives the game no keys");
   Release();
 
-  std::array<std::atomic<uint32_t>, 8> gamepad{};
+  browser::input_core::GamepadWords gamepad{};
   browser::input_core::BindGamepad(&gamepad);
   ki::Shared()[ki::kActive] = 1;
   gamepad[1] = 1;
@@ -225,6 +245,49 @@ int main() {
   input::Poll(0);
   Key(W, false);
   check(input::KeyboardActive(), "without it keys show keyboard prompts again");
+
+  namespace ic = browser::input_core;
+  gamepad[1] = 1;
+  gamepad[2] = 0x7FFF;
+  gamepad[3] = 20000;
+  gamepad[4] = uint32_t(-20000);
+  gamepad[7] = 0;
+  pad = input::Poll(0);
+  check(pad.lx == 20000 && pad.ly == -20000 && !pad.rx, "the sticks come from the words after the menu mask");
+  gamepad[2] = gamepad[3] = gamepad[4] = 0;
+  gamepad[5] = 16383;
+  gamepad[6] = uint32_t(-16383);
+  PublishInput(1u << hs::kInvertPadXBit, 1, 1, 1, 0, 100);
+  pad = input::Poll(0);
+  check(pad.rx == -16384 && pad.ry == -16383, "the right stick's X inverted, not plain negation");
+  PublishInput(1u << hs::kInvertPadYBit, 1, 1, 1, 0.2f, 100);
+  check(input::GameDeadZone() == 0.3f, "the story's own dead zone");
+  pad = input::Poll(0);
+  check(pad.rx == 18431 && pad.ry == 18430, "a dead zone of 0.2 starts the axis where the game's 0.3 does, after Y inverts");
+  gamepad[5] = 6000;
+  pad = input::Poll(0);
+  check(pad.rx == 0, "inside the chosen dead zone the axis rests");
+  PublishInput(0, 1, 1.5f, 0.5f, 0, 100);
+  check(!input::Aiming() && input::PadLookScale(false).x == 1.5f && input::PadLookScale(false).y == 3.0f, "the look sensitivities");
+  input::SetAiming(true);
+  check(input::Aiming() && input::PadLookScale(true).x == 0.5f && input::PadLookScale(true).y == 1.0f, "the aim sensitivities while aiming");
+  input::SetAiming(false);
+
+  gamepad[7] = 1u << 0;
+  input::Poll(0);
+  PublishInput(0, 1, 1, 1, 0, 50);
+  input::Rumble(0, 40000, 20000);
+  check(gamepad[ic::kRumbleWord] == (20000u | 10000u << 16), "the motors at half the game's rumble");
+  PublishInput(0, 1, 1, 1, 0, 200);
+  input::Rumble(0, 40000, 20000);
+  check(gamepad[ic::kRumbleWord] == (0xFFFFu | 40000u << 16), "twice the rumble tops out at the motor's full speed");
+  gamepad[7] = 0;
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  Key(W, true);
+  input::Poll(0);
+  Key(W, false);
+  input::Rumble(0, 40000, 20000);
+  check(gamepad[ic::kRumbleWord] == 0, "no rumble while the keyboard plays");
   browser::input_core::BindGamepad(nullptr);
   std::puts("input-core-contracts-ok");
 }

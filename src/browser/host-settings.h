@@ -47,6 +47,20 @@ inline constexpr uint32_t kHdrOutputBit = 6;
 inline constexpr uint32_t kHdrHeadroomWord = 25;
 inline constexpr uint32_t kHdrDisplayBit = 7;
 inline constexpr uint32_t kAmbientOcclusionWord = 26;
+inline constexpr uint32_t kInvertMouseXBit = 8;
+inline constexpr uint32_t kInvertPadXBit = 9;
+inline constexpr uint32_t kInvertPadYBit = 10;
+inline constexpr uint32_t kGyroEnabledBit = 11;
+inline constexpr uint32_t kMouseVerticalSensitivityWord = 27;
+inline constexpr uint32_t kPadHorizontalSensitivityWord = 28;
+inline constexpr uint32_t kPadVerticalSensitivityWord = 29;
+inline constexpr uint32_t kPadAimHorizontalSensitivityWord = 30;
+inline constexpr uint32_t kPadAimVerticalSensitivityWord = 31;
+inline constexpr uint32_t kPadDeadZoneWord = 32;
+inline constexpr uint32_t kVibrationStrengthWord = 33;
+inline constexpr uint32_t kColourBlindWord = 34;
+inline constexpr uint32_t kGyroSensitivityWord = 35;
+inline constexpr uint32_t kGyroAxisWord = 36;
 
 struct Block {
   std::array<std::atomic<uint32_t>, kWords> words{};

@@ -44,11 +44,28 @@ export const HOST_SETTINGS_FIELDS = Object.freeze([
   Object.freeze({ field: 'ambient_occlusion', key: 'ambientOcclusion', type: 'u32', word: 26, values: Object.freeze(['off', 'ssao', 'gtao']) }),
   // the page's display shows HDR and its browser takes an extended range canvas
   Object.freeze({ field: 'hdr_display', key: 'hdrDisplay', type: 'bool', bit: 7, computed: true }),
+  // upstream's mouse, controller and colour settings; gyro_<name> is app::Settings::gyro.<name> (core/gyro.h)
+  Object.freeze({ field: 'invert_mouse_x', key: 'invertX', type: 'bool', bit: 8 }),
+  Object.freeze({ field: 'invert_pad_x', key: 'padInvertX', type: 'bool', bit: 9 }),
+  Object.freeze({ field: 'invert_pad_y', key: 'padInvertY', type: 'bool', bit: 10 }),
+  Object.freeze({ field: 'gyro_enabled', key: 'gyroAiming', type: 'bool', bit: 11 }),
+  Object.freeze({ field: 'mouse_vertical_sensitivity', key: 'verticalSensitivity', type: 'f32', word: 27 }),
+  Object.freeze({ field: 'pad_horizontal_sensitivity', key: 'padSensitivity', type: 'f32', word: 28 }),
+  Object.freeze({ field: 'pad_vertical_sensitivity', key: 'padVerticalSensitivity', type: 'f32', word: 29 }),
+  Object.freeze({ field: 'pad_aim_horizontal_sensitivity', key: 'padAimSensitivity', type: 'f32', word: 30 }),
+  Object.freeze({ field: 'pad_aim_vertical_sensitivity', key: 'padAimVerticalSensitivity', type: 'f32', word: 31 }),
+  Object.freeze({ field: 'pad_dead_zone', key: 'padDeadZone', type: 'f32', word: 32 }),
+  Object.freeze({ field: 'vibration_strength', key: 'vibration', type: 'u32', word: 33 }),
+  Object.freeze({ field: 'colour_blind', key: 'colourBlind', type: 'u32', word: 34, values: Object.freeze(['off', 'protanopia', 'deuteranopia', 'tritanopia']) }),
+  Object.freeze({ field: 'gyro_sensitivity', key: 'gyroSensitivity', type: 'f32', word: 35 }),
+  Object.freeze({ field: 'gyro_axis', key: 'gyroAxis', type: 'u32', word: 36, values: Object.freeze(['yaw', 'roll', 'world']) }),
   Object.freeze({ field: 'keys', key: 'keys', type: 'map' }),
   Object.freeze({ field: 'pad_buttons', key: 'padButtons', type: 'map' }),
   // browser settings the in-game options pages show and step (settings-rows.cpp), as host.<key>=<value> lines
   ...['scaling', 'filter', 'volume', 'showFps', 'skipIntros', 'pauseOnFocusLoss', 'sensitivity', 'weaponSensitivity',
-    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale', 'anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput', 'msaa', 'smaa', 'shadowResolution', 'shadowFilter', 'shadowDistance', 'shaderModel', 'hdrRendering', 'toneMapping', 'hdrOutput', 'ambientOcclusion'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
+    'sniperSensitivity', 'invertY', 'aspect', 'fov', 'fmvScale', 'resolution', 'resolutionScale', 'anisotropy', 'brightness', 'contrast', 'frameCap', 'language', 'audioOutput', 'msaa', 'smaa', 'shadowResolution', 'shadowFilter', 'shadowDistance', 'shaderModel', 'hdrRendering', 'toneMapping', 'hdrOutput', 'ambientOcclusion', 'colourBlind',
+    'verticalSensitivity', 'invertX', 'padSensitivity', 'padVerticalSensitivity', 'padAimSensitivity', 'padAimVerticalSensitivity', 'padInvertX',
+    'padInvertY', 'padDeadZone', 'vibration', 'gyroAiming', 'gyroSensitivity', 'gyroAxis'].map(key => Object.freeze({ field: `host.${key}`, key, type: 'host' })),
 ]);
 const REVISION = 0, SCHEMA = 1, FLAGS = 2;
 const ATTEMPTS = 1 << 16;

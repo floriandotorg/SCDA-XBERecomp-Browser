@@ -12,7 +12,7 @@ export const SETTINGS = Object.freeze({
   fov: Object.freeze({ initial: 75, min: 45, max: 140, step: 1 }),
   brightness: Object.freeze({ initial: 50, min: 0, max: 100, step: 1 }),
   contrast: Object.freeze({ initial: 50, min: 0, max: 100, step: 1 }),
-  frameCap: Object.freeze({ initial: 60, options: Object.freeze([0, 30, 60]) }),
+  frameCap: Object.freeze({ initial: 0, options: Object.freeze([0, 30, 60]) }),
   anisotropy: Object.freeze({ initial: 0, options: Object.freeze([0, 2, 4, 8, 16]) }),
   msaa: Object.freeze({ initial: 0, options: Object.freeze([0, 4]), coerce: value => Number(value) > 1 ? 4 : 0 }),
   smaa: Object.freeze({ initial: false }),
@@ -30,11 +30,26 @@ export const SETTINGS = Object.freeze({
   resolution: Object.freeze({ initial: 'console', options: Object.freeze(['console', 'window', 'dynamic']) }),
   resolutionScale: Object.freeze({ initial: 100, min: 50, max: 200, step: 5 }),
   fmvScale: Object.freeze({ initial: 'fill', options: Object.freeze(['fill', '4:3']) }),
+  colourBlind: Object.freeze({ initial: 'off', options: Object.freeze(['off', 'protanopia', 'deuteranopia', 'tritanopia']) }),
   volume: Object.freeze({ initial: 100, min: 0, max: 100, step: 5 }),
   sensitivity: Object.freeze({ initial: 1, min: 0.1, max: 5, step: 0.1 }),
   weaponSensitivity: Object.freeze({ initial: 1, min: 0.1, max: 5, step: 0.1 }),
   sniperSensitivity: Object.freeze({ initial: 1, min: 0.1, max: 5, step: 0.1 }),
   invertY: Object.freeze({ initial: false }),
+  verticalSensitivity: Object.freeze({ initial: 1, min: 0.1, max: 5, step: 0.1 }),
+  invertX: Object.freeze({ initial: false }),
+  padSensitivity: Object.freeze({ initial: 1, min: 0.1, max: 4, step: 0.1 }),
+  padVerticalSensitivity: Object.freeze({ initial: 1, min: 0.1, max: 4, step: 0.1 }),
+  padAimSensitivity: Object.freeze({ initial: 1, min: 0.1, max: 4, step: 0.1 }),
+  padAimVerticalSensitivity: Object.freeze({ initial: 1, min: 0.1, max: 4, step: 0.1 }),
+  padInvertX: Object.freeze({ initial: false }),
+  padInvertY: Object.freeze({ initial: false }),
+  // 0 is the game's own dead zone
+  padDeadZone: Object.freeze({ initial: 0, options: Object.freeze([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]) }),
+  vibration: Object.freeze({ initial: 100, min: 0, max: 200, step: 10 }),
+  gyroAiming: Object.freeze({ initial: false }),
+  gyroSensitivity: Object.freeze({ initial: 2, min: 0.1, max: 5, step: 0.1 }),
+  gyroAxis: Object.freeze({ initial: 'yaw', options: Object.freeze(['yaw', 'roll', 'world']) }),
   keys: Object.freeze({ initial: Object.freeze({}), map: normalizeKeys }),
   padButtons: Object.freeze({ initial: Object.freeze({}), map: normalizePads }),
   touchControls: Object.freeze({ initial: 'auto', options: Object.freeze(['auto', 'on', 'off']) }),
@@ -55,7 +70,8 @@ const normalize = (name, value) => {
   const setting = SETTINGS[name];
   if (setting.map) { return value && typeof value === 'object' && !Array.isArray(value) ? Object.freeze(setting.map(value)) : undefined; }
   if (setting.coerce && value !== undefined && value !== null && Number.isFinite(Number(value))) { return setting.coerce(value); }
-  if (setting.options) { return setting.options.includes(value) ? value : undefined; }
+  // the in-game pages send a numeric choice as text
+  if (setting.options) { return setting.options.find(option => option === value || (typeof option === 'number' && String(option) === value)); }
   if (typeof setting.initial === 'boolean') { return typeof value === 'boolean' || typeof value === 'number' ? Boolean(value) : undefined; }
   const number = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
   if (typeof number !== 'number' || !Number.isFinite(number)) { return undefined; }

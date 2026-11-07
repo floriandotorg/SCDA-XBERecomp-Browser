@@ -150,7 +150,10 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
           try {
             if (producer || data.words !== 2) { throw new Error('Unexpected menu input storage publication.'); }
             if (gamepad && !data.gamepadOffset) { throw new Error('Missing shared gamepad input storage.'); }
-            if (gamepad) { controller = createGamepad({ buffer: data.buffer, byteOffset: data.gamepadOffset, signal, ...(virtualPads ? { virtualPads } : {}) }); }
+            if (gamepad) {
+              controller = createGamepad({ buffer: data.buffer, byteOffset: data.gamepadOffset, signal, ...(virtualPads ? { virtualPads } : {}),
+                ...(settings ? { motion: () => settings.get('gyroAiming') } : {}) });
+            }
             producer = data.keyboardOffset ? createKeyboard({ buffer: data.buffer, byteOffset: data.keyboardOffset, signal }) :
               createInput({ buffer: data.buffer, byteOffset: data.byteOffset, signal });
             if (data.keyboardOffset) { onKeyboard(producer); }

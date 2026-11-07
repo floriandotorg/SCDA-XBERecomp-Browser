@@ -52,6 +52,7 @@ public:
     bool toneMapping = false;                 // the HDR resolve's exposure and highlight roll off
     bool hdrOutput = false;                   // the canvas shows extended range, highlights to hdrHeadroom x white
     float hdrHeadroom = 5;
+    uint32_t colourBlind = 0;                 // 1 protanopia, 2 deuteranopia, 3 tritanopia over the presented frame
   };
   void SetOutputSource(std::function<Output()> source);
   struct SnapshotData {

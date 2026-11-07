@@ -74,5 +74,22 @@ int main() {
   revision.store(revision.load() + 1);
   const float expected = float(std::tan(90 * 3.14159265358979323846 / 360) / std::tan(75 * 3.14159265358979323846 / 360));
   check(std::abs(app::FovScale() - expected) < 1e-6f && app::Get().fmv_scale == 1, "FovScale(90) and the movie scale");
+  check(app::Get().vibration_strength == 0 && app::Get().colour_blind == 0, "a written block sends the vibration strength");
+  revision.store(revision.load() + 1);
+  block.words[settings::kFlagsWord].store(1u << settings::kInvertMouseXBit | 1u << settings::kInvertPadYBit | 1u << settings::kGyroEnabledBit);
+  block.words[settings::kMouseVerticalSensitivityWord].store(std::bit_cast<uint32_t>(0.5f));
+  block.words[settings::kPadAimVerticalSensitivityWord].store(std::bit_cast<uint32_t>(2.5f));
+  block.words[settings::kPadDeadZoneWord].store(std::bit_cast<uint32_t>(1.5f));
+  block.words[settings::kVibrationStrengthWord].store(500);
+  block.words[settings::kColourBlindWord].store(2);
+  block.words[settings::kGyroSensitivityWord].store(std::bit_cast<uint32_t>(3.0f));
+  block.words[settings::kGyroAxisWord].store(7);
+  revision.store(revision.load() + 1);
+  const auto& input = app::Get();
+  check(input.invert_mouse_x && !input.invert_pad_x && input.invert_pad_y && input.gyro.enabled, "the input flags");
+  check(input.mouse_vertical_sensitivity == 0.5f && input.pad_aim_vertical_sensitivity == 2.5f && input.pad_horizontal_sensitivity == 1.0f,
+        "the sensitivities, an unsent one at its default");
+  check(input.pad_dead_zone == 1.0f && input.vibration_strength == 200, "the dead zone and vibration strength are clamped");
+  check(input.colour_blind == 2 && input.gyro.sensitivity == 3.0f && input.gyro.axis == gyro::kYaw, "colour blind mode and the gyro");
   std::puts("host-settings-contracts-ok");
 }

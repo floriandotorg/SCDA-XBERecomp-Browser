@@ -23,6 +23,9 @@ constexpr BoolField kBools[] = {
   {kHdrRenderingBit, &app::Settings::hdr_rendering},
   {kToneMappingBit, &app::Settings::tone_mapping},
   {kHdrOutputBit, &app::Settings::hdr_output},
+  {kInvertMouseXBit, &app::Settings::invert_mouse_x},
+  {kInvertPadXBit, &app::Settings::invert_pad_x},
+  {kInvertPadYBit, &app::Settings::invert_pad_y},
 };
 struct FloatField {
   uint32_t word;
@@ -33,6 +36,12 @@ constexpr FloatField kFloats[] = {
   {kFreeLookSensitivityWord, &app::Settings::free_look_sensitivity},
   {kWeaponSensitivityWord, &app::Settings::weapon_sensitivity},
   {kSniperSensitivityWord, &app::Settings::sniper_sensitivity},
+  {kMouseVerticalSensitivityWord, &app::Settings::mouse_vertical_sensitivity},
+  {kPadHorizontalSensitivityWord, &app::Settings::pad_horizontal_sensitivity},
+  {kPadVerticalSensitivityWord, &app::Settings::pad_vertical_sensitivity},
+  {kPadAimHorizontalSensitivityWord, &app::Settings::pad_aim_horizontal_sensitivity},
+  {kPadAimVerticalSensitivityWord, &app::Settings::pad_aim_vertical_sensitivity},
+  {kPadDeadZoneWord, &app::Settings::pad_dead_zone},
 };
 thread_local std::map<std::string, std::string, std::less<>> hostValues;
 
@@ -69,6 +78,12 @@ app::Settings Decode(const Snapshot& snapshot) {
   if (snapshot.words[kShadowResolutionWord]) { settings.shadow_resolution = std::clamp<uint32_t>(snapshot.words[kShadowResolutionWord], 512, 4096); }
   if (snapshot.words[kShadowFilterWord]) { settings.shadow_filter = snapshot.words[kShadowFilterWord] >= 3 ? 3 : 1; }
   if (snapshot.words[kShadowDistanceWord]) { settings.shadow_distance = std::clamp<uint32_t>(snapshot.words[kShadowDistanceWord], 1, 8); }
+  settings.pad_dead_zone = std::clamp(settings.pad_dead_zone, 0.0f, 1.0f);
+  settings.vibration_strength = std::min<uint32_t>(snapshot.words[kVibrationStrengthWord], 200);
+  settings.colour_blind = snapshot.words[kColourBlindWord] <= 3 ? snapshot.words[kColourBlindWord] : 0;
+  settings.gyro.enabled = (snapshot.words[kFlagsWord] >> kGyroEnabledBit) & 1;
+  if (const float value = std::bit_cast<float>(snapshot.words[kGyroSensitivityWord]); value > 0 && std::isfinite(value)) { settings.gyro.sensitivity = std::min(value, 5.0f); }
+  settings.gyro.axis = snapshot.words[kGyroAxisWord] <= gyro::kWorld ? snapshot.words[kGyroAxisWord] : gyro::kYaw;
   if (snapshot.words[kRenderPercentWord]) { settings.render_percent = std::clamp<uint32_t>(snapshot.words[kRenderPercentWord], 20, 200); }
   hostValues.clear();
   std::string_view text = snapshot.text;

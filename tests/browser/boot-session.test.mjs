@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createBootSession } from '../../src/browser/boot-session.mjs';
+import { GAMEPAD_INPUT } from '../../src/browser/gamepad-input.mjs';
 import { createIsoMailbox } from '../../src/browser/iso-mailbox.mjs';
 import { encodeHostSettings, HOST_SETTINGS_SPAN } from '../../src/browser/host-settings.mjs';
 
@@ -826,9 +827,10 @@ test('audio transport publishes bounded disjoint native storage before guest exe
 });
 
 test('gamepad input publication validates both exports and every shared span before execution', async () => {
-  for (const [offset, words, valid] of [[448, 8, true], [449, 8, false], [499980, 8, false], [448, 7, false],
-    [0, 8, false], [undefined, 8, false], [448, undefined, false], [4, 8, false], [112, 8, false],
-    [128, 8, false], [400, 8, false], [512, 8, false], [1024, 8, false]]) {
+  const size = GAMEPAD_INPUT.words;
+  for (const [offset, words, valid] of [[400000, size, true], [400001, size, false], [499980, size, false], [400000, 8, false],
+    [0, size, false], [undefined, size, false], [400000, undefined, false], [4, size, false], [112, size, false],
+    [128, size, false], [400, size, false], [512, size, false], [1024, size, false]]) {
     const { options, data, module, messages } = executedFixture();
     const heap = new Uint8Array(new SharedArrayBuffer(500000));
     heap.set(module.HEAPU8);

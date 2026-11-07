@@ -115,7 +115,7 @@ export const hookSource = (root, name) => {
 };
 
 const hookHeaders = ['xdk/hle.h', 'xdk/d3d8.h', 'gpu/state.h', 'app/app.h', 'core/log.h', 'game/magma.h', 'core/input.h', 'game/console.h',
-  'game/unreal.h', 'app/translations.h', 'gpu/backend.h', 'game/loading.h'];
+  'game/unreal.h', 'app/translations.h', 'gpu/backend.h', 'game/loading.h', 'core/gyro.h'];
 
 export const validateHookIncludes = ({ hooks, shadowed }) => {
   const allowed = new Set([...hookHeaders, ...shadowed]);
@@ -222,7 +222,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const compat = readdirSync(resolve(root, 'src/browser/hook-compat'), { recursive: true }).map(String).filter((name) => name.endsWith('.h')).sort();
     paths.push(...compat.map((name) => `src/browser/hook-compat/${name}`), 'src/browser/hooks.h', 'src/browser/hook-compat.cpp', 'src/browser/hook-log.cpp',
       'src/browser/hook-d3d.cpp', 'src/browser/host-settings.h', 'src/browser/host-settings.cpp',
-      'src/browser/input-core.h', 'src/browser/input-core.cpp', 'src/browser/input-update.cpp', 'src/browser/keyboard-input.h',
+      'src/browser/input-core.h', 'src/browser/input-core.cpp', 'src/browser/gyro.cpp', 'src/core/gyro.h', 'src/browser/input-update.cpp', 'src/browser/keyboard-input.h',
       'src/browser/keyboard-input.mjs', 'src/browser/input-actions.mjs', 'src/browser/settings-rows.cpp', 'src/browser/host-messages.h',
       'src/browser/host-messages.cpp', 'src/browser/host-messages.mjs', 'src/browser/game-stubs.cpp', 'src/browser/loading-screen.cpp',
       'src/browser/loading-input.cpp', 'src/browser/exit-menu.cpp', 'src/browser/render-scale.h',

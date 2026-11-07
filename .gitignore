@@ -8,10 +8,10 @@
 *.o
 
 # recompiled code, derived from the game
-/generated/
+/generated
 
 # user's own game files
-/assets/
+/assets
 /GAMEFILES.md
 
 # runtime files
