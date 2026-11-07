@@ -1,240 +1,137 @@
-# Splinter Cell: Double Agent - XBE Recomp
-An unofficial native PC port of the original Xbox version of Splinter Cell: Double Agent via static recompilation, built into a 64 bit Windows executable. The game's x86 code is translated to C++ ahead of time, the Xbox kernel, Direct3D and DirectSound calls are implemented on Windows, and everything is drawn with Direct3D 12 and played through XAudio2. Made with the [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp) tool, created for this game originally.
+# Splinter Cell: Double Agent - XBE Recomp for the Browser
+A fork of [SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp), the native PC port of the original Xbox version of Splinter Cell: Double Agent, that makes the game run in a web browser. The original project translates the game's x86 code to C++ ahead of time with the [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp) tool and implements the Xbox kernel, Direct3D and DirectSound on Windows. This fork compiles the same generated C++ to WebAssembly with Emscripten, draws with WebGPU and plays sound through Web Audio. The game reads its files straight from your own ISO; nothing is uploaded or downloaded.
 
 > [!NOTE]
-> This project does not include any game assets. You must provide the files from your own legally acquired copy of the game to install or build.
+> This project does not include any game assets or generated game code. You need your own legally acquired copy of the game, both to build and to play. There is no hosted version: you build and serve the page yourself.
 
-## Installation
-The latest version of [SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp/releases) can be found in the Releases page.
+> [!IMPORTANT]
+> The browser port is work in progress. The story campaign boots from the ISO into the original menus and missions are playable, but full campaign coverage has not been verified. Saves do not survive closing the page yet. Co-op, Versus, LAN and online play are not supported. See the [browser port roadmap](docs/browser-port/README.md) for the current state.
 
-- Place your game files in the `assets` folder. This can be an ISO, or the extracted data files.
-- Run `SCDA.exe`. The first start compiles the game's code for your PC, this only happens once.
-- Recomp Settings can be adjusted in the in-game options menu while the game is running, or through the Settings overlay, which is opened with <kbd>F10</kbd> by default.
+## Playing
+- Build the page and start the local server as described in [Building](#building).
+- Open the printed address in a supported browser.
+- Click **Start game** and select your game ISO. The first launch validates the image; Chrome remembers the file for the next visit.
+- Settings are in **Options** on the main menu, in the pause menu (<kbd>Esc</kbd>), or in the settings panel (<kbd>F10</kbd>). They are stored in the browser.
 
-<img width="1920" height="1080" alt="Recomp Settings" src="https://github.com/user-attachments/assets/d13e1fb6-ba97-4067-84e1-c2362d66d7c4"/>
+The ISO must contain the same `default.xbe` the build was generated from. Both the XISO layout and full Xbox disc images are accepted; extracted folders are not.
+
+### Phones and Tablets
+The same page runs on phones and tablets with an on-screen controller. Browsers allow WebGPU and shared memory only on secure pages, so serve it over HTTPS on your network:
+
+```sh
+node tools/browser/serve.mjs out/browser/boot-web 8443 --lan --https
+```
+
+The server prints the addresses to open and creates a self-signed certificate that the phone asks you to accept once. Touch support has only been tested in Chrome's device emulation, not on a real phone. See [Phones and tablets](docs/browser-port/mobile.md) for details.
 
 ## Features
 ### Display
-- **Monitor** - Picks the monitor the game shows on, for Fullscreen and Borderless (and where Windowed opens). Lists every connected monitor by its Windows number and desktop resolution.
-- **Display Mode** - Switch between Fullscreen, Borderless and Windowed.
-- **Resolution** - Lists every mode your monitor reports and defaults to your desktop resolution, replacing the original 640x480 resolution.
-- **Render Resolution** - Renders the game at 20% to 200% of the output resolution, allowing supersampling or downscaling independent of the window size.
-- **Field of View** - Sets the horizontal field of view during gameplay from 45 to 140 degrees, with 75 being the game's default. Cutscenes, scopes, gadget views and lock picking keep the original.
-- **Max Frame Rate** - Caps the frame rate to your monitor's refresh rate or a custom value, or removes the cap entirely, replacing the Xbox's 30 FPS limiter.
-- **V-Sync** - Reduces screen tearing.
-- **HDR Output** - Enables HDR10 output on displays with Windows HDR turned on, detected automatically. Highlights extend up to the display's peak brightness.
-- **FPS Counter** - Displays the frame rate on screen.
-- **FMV Scale** - Choose between Fill, which makes the FMVs fill widescreen displays, and 4:3, which shows them in a 4:3 frame as on the original Xbox.
-- **Colour Blind Mode** - Adjusts the colours for Protanopia, Deuteranopia or Tritanopia.
+- **Scaling** - Fit, integer or stretch scaling of the game picture to the window, with a smooth or sharp filter.
+- **Aspect Ratio** - Automatic from the window, or fixed at 4:3, 16:10, 16:9 or 21:9, with widescreen HUD and menus.
+- **Resolution** - Render at the console's 640x480, at the window's size, or with a dynamic resolution, scaled from 50% to 200%.
+- **Field of View** - Sets the horizontal field of view during gameplay from 45 to 140 degrees, with 75 being the game's default.
+- **Frame Rate Cap** - 30 or 60 FPS, or uncapped (follows the display's refresh rate).
+- **HDR Output** - HDR canvas output on displays and browsers that support it, with adjustable headroom.
+- **Brightness and Contrast**
+- **FMV Scale** - Fill widescreen displays with the FMVs, or show them in a 4:3 frame as on the original Xbox.
+- **FPS Counter**
 
 ### Graphics
-- **Multisample Antialiasing (MSAA)** - Enables 2x, 4x or 8x MSAA to smooth jagged edges while preserving a sharp image. MSAA does not smooth alpha-tested edges such as fences and foliage.
-<div align="center">
-  <table>
-    <tr>
-      <td width="50%"><img width="512" src="https://github.com/user-attachments/assets/150a11f4-c437-4014-9ee2-b7ee1857713b"></td>
-      <td width="50%"><img width="512" src="https://github.com/user-attachments/assets/d84194f6-5175-4953-8390-df206cc6cedc"></td>
-    </tr>
-    <tr>
-      <td align="center">Off</td>
-      <td align="center">MSAA 8x</td>
-    </tr>
-  </table>
-</div>
-
-- **Subpixel Morphological Antialiasing (SMAA)** - Enables SMAA to smooth jagged edges across the whole frame with a softer image. SMAA also smooths alpha-tested edges such as fences and foliage, and can be combined with MSAA.
-<div align="center">
-  <table>
-    <tr>
-      <td width="50%"><img width="512" src="https://github.com/user-attachments/assets/daff599b-8bf2-4156-a3e3-a5f1ebd87617"></td>
-      <td width="50%"><img width="512" src="https://github.com/user-attachments/assets/5dc8e76a-fcd7-4b8e-9964-f76cc1cfdde3"></td>
-    </tr>
-    <tr>
-      <td align="center">Off</td>
-      <td align="center">SMAA</td>
-    </tr>
-  </table>
-</div>
-
-
-- **Anisotropic Filtering** - Forces the selected anisotropic filtering level on all textures.
-<div align="center">
-  <table>
-    <tr>
-      <td width="50%"><img style="width:100%" src="https://github.com/user-attachments/assets/594acdec-3a98-4dc5-ba6c-62e238db3895"></td>
-      <td width="50%"><img style="width:100%" src="https://github.com/user-attachments/assets/7a55879d-4f1d-49db-98c2-c687b0213c3c"></td>
-    </tr>
-    <tr>
-      <td align="center">Off</td>
-      <td align="center">Anisotropic 16x</td>
-    </tr>
-  </table>
-</div>
-
-- **Shadow Resolution** - Raises the shadow resolution from the Xbox's 512x512 (default) up to 8192x8192.
-<div align="center">
-  <table>
-    <tr>
-      <td width="50%"><img style="width:100%" src="https://github.com/user-attachments/assets/abda5e45-ce01-4f3b-a5ca-2e71de8d0c26"></td>
-      <td width="50%"><img style="width:100%" src="https://github.com/user-attachments/assets/95d964c2-2f57-4e3e-aaf6-b652a70db091"></td>
-    </tr>
-    <tr>
-      <td align="center">512x512</td>
-      <td align="center">8192x8192</td>
-    </tr>
-  </table>
-</div>
-
-- **Shadow Distance** - Increases the distance at which lights and their shadows turn off by up to 8x.
-<div align="center">
-  <table>
-    <tr>
-      <td width="50%"><img width="512" src="https://github.com/user-attachments/assets/2afe8ca6-e7f7-4279-950f-c41f3de23113"></td>
-      <td width="50%"><img width="512" src="https://github.com/user-attachments/assets/71d0f145-272b-4244-9af9-1e290466c669"></td>
-    </tr>
-    <tr>
-      <td align="center">Shadow Distance 1x</td>
-      <td align="center">Shadow Distance 8x</td>
-    </tr>
-  </table>
-</div>
-
-- **Shadow Filter** - Choose between SM1.1, the Xbox shadow filter (default), and SM3 Soft, the Chaos Theory PC Shader Model 3 soft shadow filter.
-- **Ambient Occlusion** - Adds screen space ambient occlusion, creating soft contact shadows where surfaces meet. Choose between SSAO and GTAO.
-### Shader Model 3
-- **Shader Model** - Choose between Shader Model 1.1, the Xbox look, and Shader Model 3.0, which enables the Chaos Theory PC style features.
-<div align="center">
-  <table>
-    <tr>
-      <td width="50%"><img style="width:100%" src="https://github.com/user-attachments/assets/52b7ed68-cb87-466e-847b-8364589a6d8b"></td>
-      <td width="50%"><img style="width:100%" src="https://github.com/user-attachments/assets/d82cc615-ea9a-4621-991c-663e7d3bd242"></td>
-    </tr>
-    <tr>
-      <td align="center">Off</td>
-      <td align="center">On</td>
-    </tr>
-  </table>
-</div>
-
-- **HDR Rendering** - Enables Shader Model 3 HDR rendering.
-- **Tone Mapping** - Enables Shader Model 3 tone mapping.
-
-### Textures
-- **Texture Replacement** - Replaces the game's textures with the `.dds` or `.png` images in the `textures\replacement` folder beside the exe.
-- **Texture Dumping** - Saves every texture the game uses into the `textures\dumps` folder beside the exe as you play.
-- **Dump Format** - Choose between PNG or DDS, which keeps the original compression and mipmaps.
+- **Anti-Aliasing** - 4x MSAA and SMAA, which can be combined. WebGPU only supports 4x MSAA.
+- **Anisotropic Filtering** - 2x up to 16x.
+- **Shadow Resolution** - From the Xbox's 512x512 up to 4096x4096.
+- **Shadow Distance** - Keeps lights and their shadows on up to 8x farther.
+- **Shadow Filter** - The Xbox shadow filter or a soft filter.
+- **Ambient Occlusion** - SSAO or GTAO.
+- **Shader Model** - Shader Model 1.1, the Xbox look, or Shader Model 3.0 with the Chaos Theory PC style HDR rendering and tone mapping.
 
 ### Input
-- **Mouse and Keyboard** - Full keyboard and mouse support with raw input, adjustable horizontal and vertical sensitivity, inverted look and rebindable controls.
-- **Controller** - Controller with SDL3 support, buttons can be rebound from the Controller page. Defaults match the Xbox layout.
-
-<div align="center">
-  <table>
-    <tr>
-      <td width="50%"><img width="512" src="https://github.com/user-attachments/assets/baec07ee-feb3-4748-a121-d1a5bf44e8d3"></td>
-      <td width="50%"><img width="512" src="https://github.com/user-attachments/assets/3b344418-9592-4e8d-b165-f64bdee8c311"></td>
-    </tr>
-    <tr>
-      <td align="center">Mouse and Keyboard</td>
-      <td align="center">Controller</td>
-    </tr>
-  </table>
-</div>
+- **Mouse and Keyboard** - Mouse look with pointer lock, separate free look, weapon and sniper sensitivity, inverted look and rebindable keys.
+- **Controller** - Any controller the browser's Gamepad API sees, with rebindable buttons. Defaults match the Xbox layout.
+- **Touch** - On-screen controller on touch screens with adjustable opacity, size and look sensitivity.
 
 ### General
-- **Skip Intro** - Skips the intro logos.
-- **Pause On Focus Loss** - Pauses the game and its sound while the window is in the background or minimized.
-- **Co-op Support** - Co-op can be played online by directly connecting to a friend's IP address, over LAN, or in split-screen.
-- **Co-op Tick Rate** - Raises the co-op update rate, which is capped at 22 Hz in the original game, up to 142 Hz. Both players must use the same value.
-- **Co-op Min Input Delay** - Lowers the minimum input delay in co-op from the original 50 ms down to 0 ms. Both players must use the same value.
+- **Language** - English, French, German, Italian or Spanish, or the browser's language.
+- **Mono Audio**
+- **Skip Intros**
+- **Pause On Focus Loss** - Pauses the game when the tab is in the background.
+- **Developer Console** - The game's console, opened with <kbd>`</kbd> once enabled in Options.
 
-### Miscellaneous
-- **Boot Splash** - Place a `SplinterCell4Logo.png` (or `.bmp`) beside the exe to display a splash screen at launch.
-- **Custom Menu Cursor** - Place a `cursor.png` (or `cursor.dds`) beside the exe to replace the Windows arrow in the game's menus.
-
-## Playing Online
-Co-op and Versus can be played online by connecting directly to the host's IP address. No third-party programs are needed.
-- Press F10 by default to open the Settings overlay.
-- Enter the host's IP address in **Coop Join IP** for Co-op or **Versus Join IP** for Versus.
-- From the Co-op or Versus menu, select LAN and join the host's session from the list.
-
-### Hosting a Game Session
-As the host, you must port forward the following ports on your router so other players can connect to you:
-
-| Protocol | Port |
-|----------|------|
-| UDP      | 9100 |
-| UDP      | 1000 |
-| UDP      | 1010 |
-
-> [!TIP]
-> If you're unable to port forward, such as when your connection is behind CGNAT, or would like to keep your IP address private, you can use a virtual LAN service to play together instead.
-
-## System Requirements
-### Minimum
-- **OS**
-  - Windows 10 64-bit
-- **CPU** with 2 cores and support for SSE4.2 and POPCNT
-  - Intel Nehalem (Intel Core 1st Generation)
-  - AMD Bulldozer (AMD FX series)
-- **GPU** with support for Direct3D 12
-  - NVIDIA GeForce GT 630 (Kepler)
-  - AMD Radeon HD 7750
-  - Intel HD Graphics 510 (Skylake)
-- **Memory**
-  - 4 GB
-- **Storage**
-  - 6 GB for the game files, the compiled game code, saves and shader cache
+## Requirements
+- A browser with WebGPU, WebAssembly threads, SIMD and tail calls:
+  - Chrome or Edge 121 or newer on desktop or Android
+  - Safari on macOS 26, iOS 26 or iPadOS 26 or newer
+- The page must be served with cross-origin isolation (`tools/browser/serve.mjs` does this) from `localhost` or over HTTPS.
+- Development and testing happen in Chrome on an Apple Silicon Mac (M1 Max), where the game runs at 60 FPS. Other browsers and GPUs are less tested.
 
 ## Building
-### 1. Clone the Repository
-Clone this repository using [Git](https://git-scm.com/).
-```
-git clone https://github.com/TGP482/SCDA-XBERecomp.git
-```
+The browser build runs on macOS (and should work on Linux). It needs no Windows toolchain.
 
-### 2. Add the Required Game Files
-Place your extracted game data files in the `assets` folder. `default.xbe` and `sc4_adv.xbe` must be there, with the `Default`, `Media` and `adv` folders beside them.
+### 1. Install Dependencies
+- CMake 3.25 or newer, Ninja, Git and a C++20 compiler for the recompiler. On macOS, install the Xcode Command Line Tools.
+- [Emscripten](https://emscripten.org/) for the WebAssembly build. Development uses Emscripten 6.0.13 with the Binaryen `wasm-opt` it ships.
+- [Node.js](https://nodejs.org/) 24 or newer for the build scripts, the server and the tests.
 
-> [!NOTE]
-> Building does not support the ISO format, so the files must be extracted. ISOs only work for playing.
-
-### 3. Install Dependencies
-Install [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) and select the following **Workloads** and **Individual components**:
-- Desktop development with C++
-- C++ Clang tools for Windows
-- C++ CMake tools for Windows
-
-> [!TIP]
-> `build.bat` offers to install the Clang and CMake components for you if they're missing.
-
-### 4. Build the Project
-- Run `build.bat`. The first build recompiles the entire game and can take 30 to 90 minutes on weaker systems.
-- When it finishes, run `out\build\release\SCDA.exe`.
-
-### Build Only the Recompiler
-To build `xbe_recomp` on macOS or Linux without the Windows game runtime, enable `RECOMP_ONLY`. This needs CMake 3.25 or newer, Ninja, Git, and a C++20 compiler. On macOS, install the Xcode Command Line Tools and use `brew install cmake ninja` for the build tools.
-
-From the repository root:
+On macOS with Homebrew:
 
 ```sh
-cmake -S . -B out/build/recomp -G Ninja \
-  -DRECOMP_ONLY=ON \
-  -DCMAKE_BUILD_TYPE=Release
+brew install cmake ninja emscripten node
+```
+
+### 2. Clone the Repository
+```sh
+git clone <this repository's URL> SCDA-XBERecomp
+cd SCDA-XBERecomp
+```
+
+### 3. Add the Game Executable
+Place `default.xbe` from your game disc in the `assets` folder. The build checks the generated code against it. The rest of the game data is read from the ISO at runtime.
+
+### 4. Generate the C++ Code
+Build the recompiler and translate `default.xbe` into `generated/game/`:
+
+```sh
+cmake -S . -B out/build/recomp -G Ninja -DRECOMP_ONLY=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build out/build/recomp --target xbe_recomp --parallel
-```
-
-No game assets are needed to build the tool. To generate C++ from your extracted game executables, place them in `assets/` and run:
-
-```sh
 ./out/build/recomp/compiler/xbe_recomp config/scda_v2.toml
-./out/build/recomp/compiler/xbe_recomp config/sc4_adv.toml
 ```
 
-These write to `generated/game/` and `generated/versus/`, respectively. To override the input and output paths:
+### 5. Create the Generation Record
+The browser build only accepts generated code it can tie to your `default.xbe` and the current recompiler. It reads this from a generation record, a JSON file holding the SHA-256 of `default.xbe`, of the generator inputs and of every generated file. `tools/browser/provenance.mjs` lists the files and fields it checks; configuration fails if any of them do not match. Create the record, for example at `out/provenance-audit/generation-record.json`, after regenerating into a second folder and confirming that both outputs are identical:
 
 ```sh
-./out/build/recomp/compiler/xbe_recomp config/scda_v2.toml /path/to/default.xbe /path/to/output
+./out/build/recomp/compiler/xbe_recomp config/scda_v2.toml assets/default.xbe out/provenance-audit/regenerated
+diff -r generated/game out/provenance-audit/regenerated
 ```
 
-This builds the translation tool only, not a playable macOS, Linux, or browser version of the game. `RECOMP_ONLY` defaults to `OFF`, preserving the full Windows build.
+The record has to be refreshed whenever the recompiler, its configuration or the generated code changes.
+
+### 6. Build the Browser Version
+```sh
+emcmake cmake -S . -B out/browser -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DBROWSER_BUILD=ON -DBROWSER_BOOT=ON -DBROWSER_STORY=OFF \
+  -DBROWSER_MENU=ON -DBROWSER_MISSION=ON -DBROWSER_ACTUAL_TAIL_CALLS=ON \
+  -DBROWSER_WASM_SIMD=ON -DBROWSER_MENU_TRACE_ABORTS=ON \
+  -DBROWSER_GENERATION_RECORD="$PWD/out/provenance-audit/generation-record.json" \
+  -DBROWSER_WASM_OPT="$(brew --prefix emscripten)/libexec/binaryen/bin/wasm-opt"
+BINARYEN_CORES=4 cmake --build out/browser -j2
+```
+
+The first build compiles all 128 generated partitions and takes a while; later changes outside the generated code and its shared headers only relink. Linking needs a lot of memory, which is why the job count is kept low. If `wasm-opt` is not at the Homebrew path, point `BROWSER_WASM_OPT` at the one that comes with your Emscripten install.
+
+### 7. Serve the Page
+```sh
+node tools/browser/serve.mjs out/browser/boot-web 8080
+```
+
+Open `http://127.0.0.1:8080/`. The server sets the cross-origin isolation headers that shared WebAssembly memory needs; a plain static file server will not work.
+
+### Tests
+```sh
+node --test tests/browser/*.test.mjs
+```
+
+The full suite takes a long time. Run single files from `tests/browser/` while working on a part of the port.
+
+## Windows Version
+The native Windows build of the original project (`build.bat`, `CMakePresets.json`, `src/app`, `src/gpu/d3d12.cpp`) is still part of this repository, but this fork does not test it. For the Windows version, its features and online play, see the [original repository](https://github.com/TGP482/SCDA-XBERecomp).
