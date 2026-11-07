@@ -1142,7 +1142,7 @@ int main() {
         cacheState.tss[0][gpu::kTssBorderColor] = n;
         cacheBackend.Draw(cacheState, 5, 0, 3, nullptr);
         const auto cached = cacheBackend.Snapshot();
-        check(cached.shaderCacheEntries <= 256 && cached.shaderCacheBytes <= (16u << 20), "shader text cache exceeded its entry or byte bound");
+        check(cached.shaderCacheEntries <= browser::webgpu::MaxPipelines && cached.shaderCacheBytes <= (16u << 20), "shader text cache exceeded its entry or byte bound");
       }
       cacheBackend.Retire();
       check(!cacheBackend.Snapshot().shaderCacheEntries && !cacheBackend.Snapshot().shaderCacheBytes,

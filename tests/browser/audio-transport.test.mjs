@@ -66,3 +66,52 @@ test('transport rejects nonshared, unaligned, overlapping and truncated storage'
     assert.throws(() => new AudioQueue({ buffer: new SharedArrayBuffer(500000), byteOffset, samplesOffset }));
   }
 });
+
+test('a flush while the worklet renders wins over its stale read position', async () => {
+  const { queue, header, samples } = await fixture();
+  samples.fill(0.25);
+  header[0] = 1000;
+  header[1] = 100;
+  let flushed = false;
+  queue.samples = new Proxy(samples, { get: (target, key) => {
+    if (!flushed && typeof key === 'string' && /^\d+$/.test(key)) {
+      flushed = true;
+      Atomics.store(header, 3, 0);
+      Atomics.store(header, 1, Atomics.load(header, 0));
+      Atomics.store(header, 3, 1);
+    }
+    return Reflect.get(target, key);
+  } });
+  const left = new Float32Array(128), right = new Float32Array(128);
+  queue.render(left, right);
+  assert.equal(header[1], 1000);
+  assert.equal(header[6], 0);
+});
+
+test('after an underrun playback waits for a cushion instead of chattering on each small chunk', async () => {
+  const { queue, header, samples } = await fixture();
+  samples.fill(0.25);
+  header[0] = 64;
+  const left = new Float32Array(128), right = new Float32Array(128);
+  queue.render(left, right);
+  assert.equal(header[1], 64);
+  header[0] = 64 + 512;
+  queue.render(left, right);
+  assert.deepEqual([...new Set(left)], [0]);
+  assert.equal(header[1], 64);
+  header[0] = 64 + 4096;
+  queue.render(left, right);
+  assert.ok(left[127] > 0);
+  assert.equal(header[1], 64 + 128);
+});
+
+test('a ring that drifted towards full skips back to its target cushion', async () => {
+  const { queue, header, samples } = await fixture();
+  samples.fill(0.25);
+  header[0] = 14000;
+  const left = new Float32Array(128), right = new Float32Array(128);
+  queue.render(left, right);
+  assert.equal((header[0] - header[1]) >>> 0, 8192 - 128);
+  assert.equal(header[4], 14000 - 8192);
+  assert.equal(header[7], 0);
+});

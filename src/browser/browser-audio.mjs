@@ -30,8 +30,10 @@ export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal, 
     flush();
     if (!disposed && focused && !document.hidden && playing()) { Atomics.store(header, 3, 1); }
   };
+  // a disconnected worklet node keeps running and reading the ring until its processor stops
   const fail = () => {
     flush();
+    node?.port?.postMessage('stop');
     node?.disconnect();
     node?.removeEventListener('processorerror', fail);
     node = undefined;
@@ -68,7 +70,10 @@ export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal, 
           if (disposed || !Atomics.load(header, 3)) { return; }
           if (context.currentTime > lastClock) { lastClock = context.currentTime; lastAdvance = now(); }
           else if (now() - lastAdvance > 2000) { fail(); return; }
-          if (Atomics.load(header, 7)) { fail(); }
+          if (Atomics.load(header, 7)) {
+            Atomics.store(header, 7, 0);
+            sync();
+          }
         }, 1000);
       } catch { if (!disposed) { fail(); } }
       finally { pending = undefined; }
@@ -107,6 +112,7 @@ export const createBrowserAudio = ({ buffer, byteOffset, samplesOffset, signal, 
     window.removeEventListener('focus', focus);
     signal?.removeEventListener('abort', dispose);
     node?.removeEventListener('processorerror', fail);
+    node?.port?.postMessage('stop');
     node?.disconnect();
     gain?.disconnect();
     context?.removeEventListener('statechange', sync);

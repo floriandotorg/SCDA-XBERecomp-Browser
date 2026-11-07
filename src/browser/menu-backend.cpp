@@ -306,6 +306,7 @@ struct MenuBackend::Impl {
   uint64_t pipelineSequence = 0;
   uint64_t feedbackSequence = 0;
   std::set<uint32_t> feedbackPins;
+  static constexpr size_t kShaderCacheEntries = webgpu::MaxPipelines;
   std::unordered_map<std::vector<uint8_t>, menu::ShaderResult, BytesHash> shaderCache;
   std::unordered_map<const menu::ShaderResult*, uint64_t> shaderSerials;
   uint64_t shaderSerial = 0, nextShaderSerial = 0;
@@ -521,7 +522,7 @@ struct MenuBackend::Impl {
     };
     const size_t bytes = bytesOf(key, translated);
     require(bytes <= (16u << 20), "menu backend shader translation budget exceeded");
-    while (!shaderCache.empty() && (shaderCache.size() >= 256 || shaderCacheBytes + bytes > (16u << 20))) {
+    while (!shaderCache.empty() && (shaderCache.size() >= kShaderCacheEntries || shaderCacheBytes + bytes > (16u << 20))) {
       const auto found = shaderCache.begin();
       shaderCacheBytes -= bytesOf(found->first, found->second);
       shaderSerials.erase(&found->second);
@@ -546,14 +547,16 @@ struct MenuBackend::Impl {
       stage(opcode, resource, depth, {bytes});
       return {webgpu::Status::Ok, submitted, resource, {}};
     }
-    if (opcode != webgpu::Opcode::DrawBatch && opcode != webgpu::Opcode::RenderBatch && opcode != webgpu::Opcode::UploadBuffer && opcode != webgpu::Opcode::UploadDrawBatch && opcode != webgpu::Opcode::ReadbackCollect) { flushDraws(); }
+    // a new pipeline passes the staged draws, which cannot use it yet, so the service compiles every pipeline the batch
+    // needs at once
+    if (opcode != webgpu::Opcode::DrawBatch && opcode != webgpu::Opcode::RenderBatch && opcode != webgpu::Opcode::UploadBuffer && opcode != webgpu::Opcode::UploadDrawBatch && opcode != webgpu::Opcode::ReadbackCollect && opcode != webgpu::Opcode::CreatePipeline) { flushDraws(); }
     requireOwner();
     require(bytes.size() <= webgpu::MaxBytes, "menu backend command payload budget exceeded");
     const auto started = std::chrono::steady_clock::now();
     const bool deferred = limits.postCommands && (opcode == webgpu::Opcode::Draw || opcode == webgpu::Opcode::DrawBatch || opcode == webgpu::Opcode::ReadbackStart || opcode == webgpu::Opcode::Present ||
       opcode == webgpu::Opcode::RenderBatch || opcode == webgpu::Opcode::Clear || opcode == webgpu::Opcode::Copy || opcode == webgpu::Opcode::UploadBuffer || opcode == webgpu::Opcode::UploadDrawBatch ||
       opcode == webgpu::Opcode::Resolve || opcode == webgpu::Opcode::Occlusion || opcode == webgpu::Opcode::SoftShadows || opcode == webgpu::Opcode::ApplyShadows ||
-      opcode == webgpu::Opcode::Blit || opcode == webgpu::Opcode::Multisample || opcode == webgpu::Opcode::SetGamma);
+      opcode == webgpu::Opcode::Blit || opcode == webgpu::Opcode::Multisample || opcode == webgpu::Opcode::SetGamma || opcode == webgpu::Opcode::CreatePipeline);
     auto result = (deferred ? post : execute)(opcode, resource, bytes);
     const uint64_t elapsed = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
     commandWaitMicroseconds += elapsed;

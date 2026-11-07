@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cmath>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -114,8 +115,14 @@ uint64_t multisample_bytes(const Texture& texture) { return uint64_t(texture.wid
 std::map<uint32_t, Texture> textures;
 void readable(Texture& texture);
 void seed(WGPUCommandEncoder encoder, Texture& texture);
+// a guest pipeline compiles on the browser's workers (createRenderPipelineAsync) with a null handle until it is ready,
+// so several new pipelines compile in parallel and a command that may draw with them waits for all of them
 struct Pipeline { WGPURenderPipeline handle; uint32_t vertexStride; };
 std::map<uint32_t, Pipeline> pipelines;
+uint32_t compiling_pipelines = 0;
+struct WaitingCommand { uint32_t operation, resource; const uint8_t* data; uint32_t size, command; };
+std::optional<WaitingCommand> waiting_command;
+void pipeline_compiled(WGPUCreatePipelineAsyncStatus status, WGPURenderPipeline pipeline, WGPUStringView message, void* resourceData, void* commandData);
 std::vector<uint8_t> reply;
 std::string failure;
 struct AsyncRead { bool done = false; std::vector<uint8_t> bytes; std::string failure; };
@@ -164,7 +171,7 @@ void discard(uint32_t id) {
   auto image = textures.find(id);
   if (image != textures.end()) { texture_bytes -= textureBytes(image->second.width, image->second.height, image->second.levels, image->second.volumeDepth, texel_bytes(image->second)) * (image->second.cube ? 6 : 1) + (image->second.ms ? multisample_bytes(image->second) : 0); release_views(image->second); wgpuTextureDestroy(image->second.handle); wgpuTextureRelease(image->second.handle); textures.erase(image); }
   auto pipeline = pipelines.find(id);
-  if (pipeline != pipelines.end()) { wgpuRenderPipelineRelease(pipeline->second.handle); pipelines.erase(pipeline); }
+  if (pipeline != pipelines.end()) { if (pipeline->second.handle) { wgpuRenderPipelineRelease(pipeline->second.handle); } pipelines.erase(pipeline); }
 }
 WGPUStringView text(const char* value) { return {value, std::strlen(value)}; }
 EM_JS(void, ready, (int status, const char* message), { Module.onGPUReady(status, UTF8ToString(message)); });
@@ -743,7 +750,7 @@ void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* 
       for (const float value : spec.blend_constant) {
         if (!std::isfinite(value) || value < 0 || value > 1) { throw std::runtime_error("invalid blend constant"); }
       }
-      auto found = pipelines.find(spec.pipeline); if (found == pipelines.end()) { throw std::runtime_error("unknown pipeline resource"); }
+      auto found = pipelines.find(spec.pipeline); if (found == pipelines.end() || !found->second.handle) { throw std::runtime_error("unknown or uncompiled pipeline resource"); }
       const uint32_t stride = found->second.vertexStride;
       auto* target = resource ? &texture(resource) : nullptr;
       if ((!target && !spec.depth_target) || (target && (target->depth || target->cube || target->volumeDepth > 1)) || (!resident && (!spec.vertex_bytes || spec.vertex_bytes % stride || spec.vertex_count > spec.vertex_bytes / stride || spec.index32 > 1 || spec.index_bytes != uint64_t(spec.index_count) * (spec.index32 ? 4 : 2))) || (resident && (spec.vertex_bytes || spec.index_bytes || !spec.index_count || residentDraw.index_bytes != uint64_t(spec.index_count) * 4)) || !spec.uniform_bytes || spec.uniform_bytes > 65536 || spec.uniform_bytes % 16) { throw std::runtime_error("invalid draw payload"); }
@@ -2010,7 +2017,7 @@ void release_resources() {
   if (presentation_bindings) { wgpuBindGroupLayoutRelease(presentation_bindings); presentation_bindings = nullptr; }
   for (auto& entry : textures) { release_views(entry.second); wgpuTextureDestroy(entry.second.handle); wgpuTextureRelease(entry.second.handle); }
   textures.clear(); texture_bytes = 0;
-  for (auto& entry : pipelines) { wgpuRenderPipelineRelease(entry.second.handle); }
+  for (auto& entry : pipelines) { if (entry.second.handle) { wgpuRenderPipelineRelease(entry.second.handle); } }
   pipelines.clear();
   for (const auto& entry : resident_buffers) { wgpuBufferDestroy(entry.second.handle); wgpuBufferRelease(entry.second.handle); }
   resident_buffers.clear(); resident_buffer_bytes = 0;
@@ -2083,7 +2090,7 @@ EMSCRIPTEN_KEEPALIVE const uint32_t* webgpu_frame_stats() { return presented_sta
 EMSCRIPTEN_KEEPALIVE uint32_t webgpu_resources() { return textures.size() + pipelines.size() + resident_buffers.size() + sampler_cache.size() + cached_views + (gamma_texture ? 1 : 0) + (presentation_pipeline ? 1 : 0) + (presentation_linear_pipeline ? 1 : 0) + (presentation_target.handle ? 1 : 0) + (depth_upload_pipeline ? 1 : 0) + (depth_readback_pipeline ? 1 : 0) + std::count_if(partial_clear_pipelines.begin(), partial_clear_pipelines.end(), [](auto pipeline) { return pipeline != nullptr; }); }
 EMSCRIPTEN_KEEPALIVE void webgpu_shutdown() {
   closed = true;
-  if (active) { active = false; completed(2, nullptr, 0, "GPU service shutdown"); }
+  if (active || waiting_command) { active = false; waiting_command.reset(); completed(2, nullptr, 0, "GPU service shutdown"); }
   release_resources();
   if (surface) { wgpuSurfaceUnconfigure(surface); wgpuSurfaceRelease(surface); surface = nullptr; }
   if (sampler) { wgpuSamplerRelease(sampler); sampler = nullptr; }
@@ -2094,9 +2101,9 @@ EMSCRIPTEN_KEEPALIVE void webgpu_shutdown() {
   if (adapter) { wgpuAdapterRelease(adapter); adapter = nullptr; }
   if (instance) { wgpuInstanceRelease(instance); instance = nullptr; }
 }
-EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, const uint8_t* data, uint32_t size, uint32_t command) {
-  if (closed || !device) { completed(2, nullptr, 0, "GPU service unavailable"); return; }
-  if (active) { completed(1, nullptr, 0, "GPU service busy"); return; }
+}
+namespace {
+void process_command(uint32_t operation, uint32_t resource, const uint8_t* data, uint32_t size, uint32_t command) {
   active = true; reply.clear(); failure.clear(); created_resource = 0;
   wgpuDevicePushErrorScope(device, WGPUErrorFilter_Validation);
   try {
@@ -2157,7 +2164,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
     }
     case Opcode::CreatePipeline: {
       if (!resource || textures.contains(resource) || pipelines.contains(resource) || resident_buffers.contains(resource) || textures.size() + pipelines.size() + resident_buffers.size() >= 4096) { throw std::runtime_error("duplicate or exhausted GPU resource ID"); }
-      if (pipelines.size() >= 256) { throw std::runtime_error("GPU pipeline budget exhausted"); }
+      if (pipelines.size() >= MaxPipelines) { throw std::runtime_error("GPU pipeline budget exhausted"); }
       auto spec = packet<PipelinePacket>(bytes);
       const bool resident = spec.vertex_mask & ResidentVertexMask;
       const auto rawLayout = resident ? packet<RawLayout>(bytes) : RawLayout{};
@@ -2225,7 +2232,10 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       descriptor.fragment = &pixel; descriptor.primitive.topology = static_cast<WGPUPrimitiveTopology>(spec.topology); descriptor.primitive.cullMode = static_cast<WGPUCullMode>(spec.cull); descriptor.primitive.frontFace = static_cast<WGPUFrontFace>(spec.front_face);
       if (spec.depth) { descriptor.depthStencil = &depth; }
       descriptor.multisample.count = spec.sample_count;
-      auto pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor); pipelines.emplace(resource, Pipeline{pipeline, attributeCount * 16}); created_resource = resource;
+      pipelines.emplace(resource, Pipeline{nullptr, attributeCount * 16}); ++compiling_pipelines; created_resource = resource;
+      auto info = WGPU_CREATE_RENDER_PIPELINE_ASYNC_CALLBACK_INFO_INIT; info.mode = WGPUCallbackMode_AllowSpontaneous;
+      info.callback = pipeline_compiled; info.userdata1 = reinterpret_cast<void*>(uintptr_t(resource)); info.userdata2 = reinterpret_cast<void*>(uintptr_t(command));
+      wgpuDeviceCreateRenderPipelineAsync(device, &descriptor, info);
       if (spec.cube_mask || spec.shadow_mask || spec.volume_mask) { wgpuPipelineLayoutRelease(custom.second); wgpuBindGroupLayoutRelease(custom.first); }
       wgpuShaderModuleRelease(vertex); wgpuShaderModuleRelease(fragment);
       break;
@@ -2461,11 +2471,44 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
   } catch (const std::exception& error) { failure = error.what(); }
   const auto opcode = static_cast<Opcode>(operation);
   if (failure.empty() && pending_validations < 64 && (opcode == Opcode::Draw || opcode == Opcode::DrawBatch || opcode == Opcode::RenderBatch ||
-      opcode == Opcode::Clear || opcode == Opcode::Copy || opcode == Opcode::Destroy || opcode == Opcode::UploadBuffer || opcode == Opcode::UploadDrawBatch || opcode == Opcode::ReadbackStart)) {
+      opcode == Opcode::Clear || opcode == Opcode::Copy || opcode == Opcode::Destroy || opcode == Opcode::UploadBuffer || opcode == Opcode::UploadDrawBatch || opcode == Opcode::ReadbackStart ||
+      opcode == Opcode::CreatePipeline)) {
     created_resource = 0;
     defer_validation(command, resource);
     return;
   }
   finish();
+}
+void pipeline_compiled(WGPUCreatePipelineAsyncStatus status, WGPURenderPipeline pipeline, WGPUStringView message, void* resourceData, void* commandData) {
+  --compiling_pipelines;
+  const auto resource = uint32_t(reinterpret_cast<uintptr_t>(resourceData)), command = uint32_t(reinterpret_cast<uintptr_t>(commandData));
+  const auto found = pipelines.find(resource);
+  if (closed || status != WGPUCreatePipelineAsyncStatus_Success || found == pipelines.end() || found->second.handle) {
+    if (pipeline) { wgpuRenderPipelineRelease(pipeline); }
+    if (closed || status == WGPUCreatePipelineAsyncStatus_CallbackCancelled) { return; }
+    closed = true; active = false; validation_barrier = false; waiting_command.reset();
+    const auto detail = string(message);
+    deferred_failure(command, resource, detail.empty() ? "GPU pipeline compilation failed" : detail.c_str());
+    return;
+  }
+  found->second.handle = pipeline;
+  if (!compiling_pipelines && waiting_command) {
+    const auto next = *waiting_command;
+    waiting_command.reset();
+    process_command(next.operation, next.resource, next.data, next.size, next.command);
+  }
+}
+// only these commands never draw with a guest pipeline, so they run while pipelines compile
+bool waits_for_pipelines(Opcode opcode) { return opcode != Opcode::CreatePipeline && opcode != Opcode::CreateTexture && opcode != Opcode::UploadBuffer; }
+}
+extern "C" {
+EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, const uint8_t* data, uint32_t size, uint32_t command) {
+  if (closed || !device) { completed(2, nullptr, 0, "GPU service unavailable"); return; }
+  if (active || waiting_command) { completed(1, nullptr, 0, "GPU service busy"); return; }
+  if (compiling_pipelines && waits_for_pipelines(static_cast<Opcode>(operation))) {
+    waiting_command = WaitingCommand{operation, resource, data, size, command};
+    return;
+  }
+  process_command(operation, resource, data, size, command);
 }
 }

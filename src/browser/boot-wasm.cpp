@@ -193,6 +193,7 @@ struct Session {
 #ifdef BROWSER_MISSION
     rendererLimits.maxResources = 512;
     rendererLimits.maxResidentBytes = 128u << 20;
+    rendererLimits.maxPipelines = browser::webgpu::MaxPipelines;
     rendererLimits.batchDraws = true;
     rendererLimits.compactVertices = true;
     rendererLimits.indexedVertices = true;

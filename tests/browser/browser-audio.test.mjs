@@ -18,13 +18,19 @@ const fixture = async ({ load = Promise.resolve(), autoplay = true, volume = 1 }
     resume = async () => { events.push('resume'); if (gestured) { this.state = 'running'; } };
     close = async () => { events.push('close'); this.state = 'closed'; };
   }
-  const node = new EventTarget();
-  node.connect = () => events.push('connect');
-  node.disconnect = () => events.push('disconnect');
+  const nodes = [];
+  const createNode = () => {
+    const node = new EventTarget();
+    node.connect = () => events.push('connect');
+    node.disconnect = () => events.push('disconnect');
+    node.port = { postMessage: message => events.push(`port-${message}`) };
+    nodes.push(node);
+    return node;
+  };
   const audio = createBrowserAudio({ buffer, byteOffset: 0, samplesOffset: 32, document, window, volume,
-    AudioContext: Context, createNode: () => node, now: () => elapsed,
+    AudioContext: Context, createNode, now: () => elapsed,
     schedule: callback => { tick = callback; return 1; }, cancel: () => { tick = undefined; } });
-  return { audio, header, events, node, gain, window, document,
+  return { audio, header, events, nodes, get node() { return nodes.at(-1); }, gain, window, document,
     gesture: async type => { gestured = true; window.dispatchEvent(new Event(type)); await audio.enable(); },
     advance: value => { elapsed += value; tick?.(); } };
 };
@@ -101,4 +107,31 @@ test('mono output down-mixes to one channel on the gain node, stereo restores it
   assert.deepEqual([f.gain.channelCount, f.gain.channelCountMode, f.gain.channelInterpretation], [1, 'explicit', 'speakers']);
   f.audio.setOutput('stereo');
   assert.deepEqual([f.gain.channelCount, f.gain.channelCountMode], [2, 'max']);
+});
+
+test('a replaced worklet stops its processor so only one node reads the ring', async () => {
+  const f = await fixture();
+  await f.audio.enable();
+  const first = f.node;
+  first.dispatchEvent(new Event('processorerror'));
+  assert.ok(f.events.includes('port-stop'));
+  await f.gesture('keydown');
+  assert.equal(f.nodes.length, 2);
+  assert.notEqual(f.node, first);
+  assert.equal(f.header[3], 1);
+  await f.audio.dispose();
+});
+
+test('a corrupt ring position recovers in place without replacing the worklet', async () => {
+  const f = await fixture();
+  await f.audio.enable();
+  f.header[0] = 20000;
+  f.header[7] = 1;
+  f.advance(1000);
+  assert.equal(f.header[7], 0);
+  assert.equal(f.header[3], 1);
+  assert.equal(f.header[1], 20000);
+  assert.equal(f.nodes.length, 1);
+  assert.equal(f.events.includes('disconnect'), false);
+  await f.audio.dispose();
 });

@@ -1,6 +1,12 @@
 export const AUDIO_FRAMES = 16384;
 export const AUDIO_CHANNELS = 6;
 export const AUDIO_RATE = 48000;
+// the game feeds by its own clock and the device plays by its clock, so the fill drifts: a starved ring waits for
+// AUDIO_PRIME frames before playing again rather than playing each small chunk as it lands, and one past AUDIO_HIGH
+// skips back to AUDIO_TARGET before the producer has to drop whole chunks
+export const AUDIO_PRIME = 2048;
+export const AUDIO_TARGET = 8192;
+export const AUDIO_HIGH = 12288;
 
 export class AudioQueue {
   constructor({ buffer, byteOffset, samplesOffset }) {
@@ -12,6 +18,7 @@ export class AudioQueue {
     }
     this.header = new Uint32Array(buffer, byteOffset, 8);
     this.samples = new Float32Array(buffer, samplesOffset, AUDIO_FRAMES * AUDIO_CHANNELS);
+    this.primed = true;
   }
 
   render(left, right) {
@@ -20,16 +27,28 @@ export class AudioQueue {
     const header = this.header;
     const epoch = Atomics.load(header, 2);
     const write = Atomics.load(header, 0);
-    const read = Atomics.load(header, 1);
+    let read = Atomics.load(header, 1);
     if (!Atomics.load(header, 3)) {
       Atomics.store(header, 1, write);
       return;
     }
-    const queued = (write - read) >>> 0;
+    let queued = (write - read) >>> 0;
     if (queued > AUDIO_FRAMES || left.length !== right.length) {
       Atomics.store(header, 7, 1);
       return;
     }
+    if (queued > AUDIO_HIGH) {
+      const skipped = (write - AUDIO_TARGET) >>> 0;
+      if (Atomics.compareExchange(header, 1, read, skipped) !== read) { return; }
+      Atomics.add(header, 4, queued - AUDIO_TARGET);
+      read = skipped;
+      queued = AUDIO_TARGET;
+    }
+    if (!this.primed && queued < AUDIO_PRIME) {
+      Atomics.add(header, 5, left.length);
+      return;
+    }
+    this.primed = queued >= left.length;
     const frames = Math.min(queued, left.length);
     for (let n = 0; n < frames; ++n) {
       const offset = ((read + n) % AUDIO_FRAMES) * AUDIO_CHANNELS;
@@ -39,12 +58,12 @@ export class AudioQueue {
       left[n] = Number.isFinite(l) ? Math.max(-1, Math.min(1, l)) : 0;
       right[n] = Number.isFinite(r) ? Math.max(-1, Math.min(1, r)) : 0;
     }
-    if (Atomics.load(header, 2) !== epoch || !Atomics.load(header, 3)) {
+    // the page flushes the ring by moving the read position; a flush during this render wins and its frames are dropped
+    if (Atomics.load(header, 2) !== epoch || !Atomics.load(header, 3) || Atomics.compareExchange(header, 1, read, (read + frames) >>> 0) !== read) {
       left.fill(0);
       right.fill(0);
       return;
     }
-    Atomics.store(header, 1, (read + frames) >>> 0);
     Atomics.add(header, 5, left.length - frames);
     Atomics.add(header, 6, frames);
   }
