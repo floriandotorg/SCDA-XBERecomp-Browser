@@ -23,7 +23,7 @@ std::atomic<size_t> allocationBudget{std::numeric_limits<size_t>::max()};
 std::atomic<size_t> failAllocation{0};
 size_t completedBytes = 0;
 
-struct alignas(std::max_align_t) AllocationHeader {
+struct alignas(__STDCPP_DEFAULT_NEW_ALIGNMENT__) AllocationHeader {
   size_t size;
 };
 
@@ -31,8 +31,9 @@ void* operator new(size_t size) {
   if ((failAllocation.load() && failAllocation.fetch_sub(1) == 1) ||
       size > std::numeric_limits<size_t>::max() - sizeof(AllocationHeader) ||
       size > allocationBudget.load() - liveBytes.load()) { throw std::bad_alloc(); }
-  auto* allocation = static_cast<AllocationHeader*>(std::malloc(sizeof(AllocationHeader) + std::max<size_t>(size, 1)));
-  if (!allocation) { throw std::bad_alloc(); }
+  void* block = nullptr;
+  if (posix_memalign(&block, __STDCPP_DEFAULT_NEW_ALIGNMENT__, sizeof(AllocationHeader) + std::max<size_t>(size, 1))) { throw std::bad_alloc(); }
+  auto* allocation = static_cast<AllocationHeader*>(block);
   allocation->size = size;
   if (size >= 65536) { liveLargeBytes.fetch_add(size); }
   const auto live = liveBytes.fetch_add(size) + size;
@@ -324,9 +325,166 @@ const auto contracts = [] {
   std::puts("temporary-filesystem-contracts-ok");
 };
 
+const auto sameTree = [](const browser::TemporaryFilesystem& left, const browser::TemporaryFilesystem& right) {
+  const auto walk = [](const browser::TemporaryFilesystem& files) {
+    std::vector<std::pair<std::string, browser::TemporaryFilesystem::Metadata>> entries;
+    std::vector<std::string> pending{""};
+    while (!pending.empty()) {
+      const auto directory = pending.back();
+      pending.pop_back();
+      const auto listed = files.List(directory);
+      for (const auto& entry : *listed) {
+        const auto path = directory.empty() ? entry.name : directory + "\\" + entry.name;
+        entries.emplace_back(path, entry.metadata);
+        if (entry.metadata.directory) { pending.push_back(path); }
+      }
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    return entries;
+  };
+  const auto a = walk(left), b = walk(right);
+  if (a.size() != b.size()) { return false; }
+  for (size_t n = 0; n < a.size(); ++n) {
+    if (a[n].first != b[n].first || !sameMetadata(a[n].second, b[n].second)) { return false; }
+    std::vector<uint8_t> first(a[n].second.size), second(b[n].second.size);
+    if (left.Read(a[n].first, 0, first) != first.size() || right.Read(b[n].first, 0, second) != second.size() || first != second) { return false; }
+  }
+  return sameUsage(left.Usage(), right.Usage());
+};
+
+const auto persistence = [] {
+  using browser::TemporaryFilesystem;
+  uint64_t clock = 500;
+  TemporaryFilesystem source(16 * TemporaryFilesystem::AllocationUnit, 16, [&] { return clock; });
+  const auto initial = source.Revision();
+  std::array<uint8_t, 5> bytes{1, 2, 3, 4, 5};
+  check(source.CreateDirectory("UDATA") == 0 && source.Revision() > initial, "directory creation did not advance the revision");
+  auto revision = source.Revision();
+  check(source.CreateDirectory("UDATA") == 0xc0000035 && source.Revision() == revision, "a rejected mutation advanced the revision");
+  std::array<uint8_t, 5> read{};
+  check(source.Read("UDATA", 0, read) == 0 && source.Stat("UDATA") && source.Revision() == revision, "reads advanced the revision");
+  check(source.CreateDirectory("UDATA\\4D530064") == 0 && source.CreateFile("UDATA\\4D530064\\TITLEMETA.XBX", 0x80) == 0 &&
+    source.Write("UDATA\\4D530064\\TITLEMETA.XBX", 2, bytes) == 0 && source.WriteFile("PROFILE.BIN", bytes) == 0 &&
+    source.CreateFile("RESERVED", 0x80, 40000) == 0 && source.SetBasic("PROFILE.BIN", {11, 12, 13, 14}, 0x21) == 0,
+    "persistence fixtures failed");
+  check(source.Revision() >= revision + 6, "file mutations did not each advance the revision");
+  check(source.Writers() == 0, "a new filesystem reports writers");
+  {
+    const auto first = source.HoldWriter();
+    const auto second = source.HoldWriter();
+    check(source.Writers() == 2, "writer holds were not counted");
+  }
+  check(source.Writers() == 0, "writer holds were not released");
+  uint64_t serializedRevision = 0;
+  const auto image = source.Serialize(&serializedRevision);
+  check(serializedRevision == source.Revision() && !image.empty(), "serialization did not report its revision");
+  TemporaryFilesystem copy(16 * TemporaryFilesystem::AllocationUnit, 16, [&] { return clock; });
+  const auto before = copy.Revision();
+  check(copy.Restore(image) == 0 && copy.Revision() > before, "restore failed");
+  check(copy.Serialize() == image, "serialization is not canonical");
+  check(sameTree(source, copy), "restore did not reproduce the namespace");
+  TemporaryFilesystem empty(16 * TemporaryFilesystem::AllocationUnit, 16);
+  check(empty.Restore(TemporaryFilesystem(65536).Serialize()) == 0 && empty.Usage().entries == 1, "empty image did not restore");
+
+  const auto rejects = [&](std::vector<uint8_t> damaged, const char* reason) {
+    TemporaryFilesystem target(16 * TemporaryFilesystem::AllocationUnit, 16, [&] { return clock; });
+    check(target.WriteFile("KEEP", bytes) == 0, "rejection fixture failed");
+    const auto keep = target.Serialize();
+    const auto revision = target.Revision();
+    check(target.Restore(damaged) != 0, reason);
+    check(target.Serialize() == keep && target.Revision() == revision, "a rejected image changed the existing namespace");
+  };
+  rejects({}, "an empty buffer restored");
+  rejects(std::vector<uint8_t>(image.begin(), image.end() - 1), "a truncated image restored");
+  auto trailing = image;
+  trailing.push_back(0);
+  rejects(trailing, "trailing bytes restored");
+  auto magic = image;
+  magic[0] ^= 1;
+  rejects(magic, "a wrong magic restored");
+  auto version = image;
+  version[8] = 2;
+  rejects(version, "an unknown version restored");
+  const auto craft = [](std::initializer_list<std::tuple<std::string, bool, uint32_t, uint64_t, uint64_t>> nodes) {
+    auto image = TemporaryFilesystem(65536).Serialize();
+    image.resize(12);
+    const auto put = [&](uint64_t value, size_t width) {
+      for (size_t n = 0; n < width; ++n) { image.push_back(uint8_t(value >> (8 * n))); }
+    };
+    put(nodes.size(), 4);
+    for (const auto& [path, directory, attributes, reservation, size] : nodes) {
+      put(path.size(), 2);
+      image.insert(image.end(), path.begin(), path.end());
+      put(directory, 1);
+      put(attributes, 4);
+      for (size_t n = 0; n < 4; ++n) { put(1, 8); }
+      put(reservation, 8);
+      put(size, 8);
+      if (size) {
+        put(0, 4);
+        put(std::min<uint64_t>(size, 64), 4);
+        image.insert(image.end(), size_t(std::min<uint64_t>(size, 64)), 1);
+      }
+    }
+    return image;
+  };
+  check(empty.Restore(craft({{"DIR", true, 0x10, 0, 0}, {"DIR\\FILE", false, 0x80, 0, 100}})) != 0, "a size beyond the image restored");
+  check(empty.Restore(craft({{"DIR", true, 0x10, 0, 0}, {"DIR\\FILE", false, 0x80, 0, 64}})) == 0, "a valid crafted image failed");
+  rejects(craft({{"..\\ESCAPE", false, 0x80, 0, 1}}), "a parent path restored");
+  rejects(craft({{"a", false, 0x80, 0, 1}}), "a non-canonical path restored");
+  rejects(craft({{"C:\\FILE", false, 0x80, 0, 1}}), "a drive path restored");
+  rejects(craft({{"MISSING\\FILE", false, 0x80, 0, 1}}), "an orphaned file restored");
+  rejects(craft({{"FILE", false, 0x80, 0, 1}, {"FILE\\CHILD", false, 0x80, 0, 1}}), "a file parent restored");
+  rejects(craft({{"SAME", false, 0x80, 0, 1}, {"SAME", false, 0x80, 0, 1}}), "a duplicate path restored");
+  rejects(craft({{"B", false, 0x80, 0, 1}, {"A", false, 0x80, 0, 1}}), "an unordered image restored");
+  rejects(craft({{"DIR", true, 0x80, 0, 0}}), "a directory without its attribute restored");
+  rejects(craft({{"DIR", true, 0x10, 0, 4}}), "a directory with bytes restored");
+  rejects(craft({{"FILE", false, 0x80, 100, 1}}), "an unaligned reservation restored");
+  rejects(craft({{"FILE", false, 0x80, 1ull << 40, 1}}), "a reservation over capacity restored");
+  rejects(craft({{"FILE", false, 0x80, 0, 1ull << 40}}), "an oversized file allocated");
+  std::vector<std::tuple<std::string, bool, uint32_t, uint64_t, uint64_t>> many;
+  for (int n = 0; n < 16; ++n) { many.emplace_back("F" + std::to_string(10 + n), false, 0x80, 0, 1); }
+  auto crowded = craft({});
+  {
+    TemporaryFilesystem wide(1024 * TemporaryFilesystem::AllocationUnit, 64);
+    for (const auto& node : many) { check(wide.WriteFile(std::get<0>(node), bytes) == 0, "crowded fixture failed"); }
+    crowded = wide.Serialize();
+  }
+  rejects(crowded, "more entries than the namespace holds restored");
+  auto chunks = craft({{"FILE", false, 0x80, 0, 4}});
+  chunks.resize(chunks.size() - 4 - 8);
+  const auto chunk = [&](uint32_t zeros, uint32_t literal) {
+    auto result = chunks;
+    for (const auto value : {zeros, literal}) {
+      for (size_t n = 0; n < 4; ++n) { result.push_back(uint8_t(value >> (8 * n))); }
+    }
+    result.insert(result.end(), literal, 7);
+    return result;
+  };
+  check(empty.Restore(chunk(4, 0)) == 0, "a zero run restored as a file failed");
+  rejects(chunk(0, 0), "an empty chunk restored");
+  rejects(chunk(3, 2), "a chunk beyond the file size restored");
+  rejects(chunk(0xffffffffu, 0), "an overflowing zero run restored");
+
+  TemporaryFilesystem sparse(256 * TemporaryFilesystem::AllocationUnit, 16, [&] { return clock; });
+  std::vector<uint8_t> content(3 * 1024 * 1024);
+  for (const size_t at : {size_t(0), size_t(31), size_t(64), size_t(65), size_t(100000), content.size() - 40}) { content[at] = uint8_t(at | 1); }
+  check(sparse.WriteFile("SPARSE", content) == 0 && sparse.WriteFile("ZEROS", std::vector<uint8_t>(70000)) == 0 &&
+    sparse.WriteFile("DENSE", std::vector<uint8_t>(5000, 9)) == 0, "sparse fixtures failed");
+  const auto compact = sparse.Serialize();
+  check(compact.size() < 6 * 1024, "zero runs were not elided");
+  TemporaryFilesystem expanded(256 * TemporaryFilesystem::AllocationUnit, 16, [&] { return clock; });
+  check(expanded.Restore(compact) == 0, "a sparse image did not restore");
+  std::vector<uint8_t> roundTrip(content.size());
+  check(expanded.Read("SPARSE", 0, roundTrip) == content.size() && roundTrip == content, "sparse content changed");
+  check(expanded.Stat("ZEROS")->size == 70000 && expanded.Stat("DENSE")->size == 5000 && expanded.Serialize() == compact, "sparse sizes changed");
+  std::puts("temporary-filesystem-persistence-ok");
+};
+
 int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::strcmp(argv[1], "peak") == 0) { peakCopy(); }
+    else if (argc == 2 && std::strcmp(argv[1], "persistence") == 0) { persistence(); }
     else { reservations(); resizing(); contracts(); }
     return 0;
   } catch (const std::bad_alloc&) {

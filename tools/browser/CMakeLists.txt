@@ -258,7 +258,7 @@ endif()
 
 if(BROWSER_BOOT)
     add_executable(story_boot_link ${root}/src/browser/boot-wasm.cpp ${root}/src/browser/disc-wasm.cpp
-        ${root}/src/browser/cpu_runtime.cpp ${root}/src/browser/kernel-provider.cpp ${root}/src/browser/virtual-memory.cpp ${root}/src/browser/contiguous-memory.cpp ${root}/src/browser/string-provider.cpp ${root}/src/browser/section-provider.cpp ${root}/src/browser/file-provider.cpp ${root}/src/browser/temporary-filesystem.cpp ${root}/src/browser/raw-cache.cpp ${root}/src/browser/cache-fatx.cpp ${root}/src/browser/thread-provider.cpp ${root}/src/browser/synchronization-provider.cpp ${root}/src/browser/dispatcher.cpp ${root}/src/browser/dispatcher-handles.cpp ${root}/src/browser/dispatcher-object-abi.cpp ${root}/src/browser/guest-wait.cpp ${root}/src/kernel/crypto.cpp
+        ${root}/src/browser/cpu_runtime.cpp ${root}/src/browser/kernel-provider.cpp ${root}/src/browser/virtual-memory.cpp ${root}/src/browser/contiguous-memory.cpp ${root}/src/browser/string-provider.cpp ${root}/src/browser/section-provider.cpp ${root}/src/browser/file-provider.cpp ${root}/src/browser/temporary-filesystem.cpp ${root}/src/browser/storage-publisher.cpp ${root}/src/browser/raw-cache.cpp ${root}/src/browser/cache-fatx.cpp ${root}/src/browser/thread-provider.cpp ${root}/src/browser/synchronization-provider.cpp ${root}/src/browser/dispatcher.cpp ${root}/src/browser/dispatcher-handles.cpp ${root}/src/browser/dispatcher-object-abi.cpp ${root}/src/browser/guest-wait.cpp ${root}/src/kernel/crypto.cpp
         ${root}/src/browser/image.cpp ${root}/src/browser/platform-profile.cpp ${root}/src/browser/shutdown-provider.cpp ${root}/src/browser/dpc-provider.cpp ${root}/src/browser/timer-provider.cpp ${root}/src/browser/sdk-provider.cpp ${root}/src/browser/diagnostic-graphics.cpp ${root}/src/browser/hook-graphics.cpp ${root}/src/browser/diagnostic-shaders.cpp ${root}/src/browser/push-state.cpp ${root}/src/browser/silent-audio.cpp ${root}/src/browser/audio-core.cpp ${root}/src/browser/audio-effects.cpp ${root}/src/browser/audio-provider.cpp ${root}/src/kernel/disc_index.cpp ${compact_sources})
     target_link_libraries(story_boot_link PRIVATE browser_flags)
     target_include_directories(story_boot_link PRIVATE ${root}/generated/game)
@@ -333,7 +333,7 @@ if(BROWSER_BOOT)
     browser_publish_boot()
     if(BROWSER_MENU)
         configure_file(${root}/src/browser/menu.html ${CMAKE_BINARY_DIR}/boot-web/index.html COPYONLY)
-        foreach(module menu-shell settings host-settings menu-runtime menu-input gamepad-input mission-controls mission-metrics browser-audio audio-worklet audio-transport webgpu-service webgpu-transport input-bindings frame-shape console-model touch-controls)
+        foreach(module menu-shell settings host-settings menu-runtime menu-input gamepad-input mission-controls mission-metrics browser-audio audio-worklet audio-transport webgpu-service webgpu-transport input-bindings frame-shape console-model touch-controls save-format save-store save-store-worker save-service)
             configure_file(${root}/src/browser/${module}.mjs ${CMAKE_BINARY_DIR}/boot-web/${module}.mjs COPYONLY)
         endforeach()
         foreach(file manifest.webmanifest icon.svg icon-180.png icon-192.png icon-512.png)

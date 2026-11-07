@@ -1,6 +1,6 @@
 # M7: Campaign and persistence work
 
-Status: not started.
+Status: active. P7.1 and P7.2 are implemented and pass in Chrome; P7.3 to P7.5 have not started. See [Current implementation](#current-implementation).
 
 Previous: [M6: Playable mission](06-playable-mission.md). Next: [M8: Validation and delivery](08-validation-and-delivery.md).
 
@@ -133,3 +133,62 @@ Acceptance:
 Keep a mission and transition matrix with tested builds, input image identity, settings, pass or fail results and known deviations. Record failures as blockers rather than removing hard missions from scope silently.
 
 Do not proceed to delivery with intermittent save loss, stale runtime writes, unexplained campaign softlocks or unsupported version data silently accepted as valid.
+
+## Current implementation
+
+### Writable inventory
+
+The game writes only to `\Device\Harddisk0\Partition1` (E:). `Partition3` (Z:) is the utility cache, which the game formats at boot and uses as scratch; it is not persisted. Observed on the story image (title ID `5553005E`):
+
+| When | Files |
+| --- | --- |
+| First boot | `TDATA\5553005E\`, `UDATA\5553005E\TITLEMETA.XBX` (58 bytes), `TITLEIMAGE.XBX`, `SAVEIMAGE.XBX` |
+| New profile | `UDATA\5553005E\<profile>\PROFILE.SAV` (9,804 bytes), `SAVEMETA.XBX`, and twelve preallocated slots: `SINGLE0..5.SAV` and `MULTI0..5.SAV` (2,500,000 bytes each) with `*IMAGE.SAV` thumbnails (32,896 bytes) |
+| Quick save | `SINGLE0.SAV`, `SINGLE0IMAGE.SAV` and `PROFILE.SAV`, rewritten within 3 ms of each other |
+
+A profile allocates about 30.4 MB, almost all zeros. The 32 MiB profile volume therefore holds exactly one profile; a second one fails with the game's own "not enough free storage" message. Loading a save and starting a mission write nothing to E:.
+
+Saves are signed with the virtual hard disk key (kernel export 323), and the profile also depends on the drive serial. Both were random per page load. They now travel with the saved files, so a restored profile verifies in a later session.
+
+### Architecture
+
+* `TemporaryFilesystem` (E:) counts a revision on every successful mutation and writer holds for every open handle with write, delete or attribute access. `Serialize` writes a canonical image; file bytes are chunks of a zero run and a literal run, so a fresh profile is about 18 KB instead of 30 MB. `Restore` validates the whole image before replacing anything: canonical upper case paths inside the namespace, sorted order, existing parent directories, attributes, sizes, reservations, capacity and entry limits, chunk bounds and no trailing bytes.
+* `StoragePublisher` (`src/browser/storage-publisher.h`) is a host thread owned by `StoryState`, not by the guest runtime, so it survives mission reboots. Every 100 ms it reports a pending change once and publishes a snapshot when E: has no open writer and has not changed for 750 ms. The snapshot carries the console identity. It goes through a proxied call to the boot worker, which posts it to the page; retired runtime generations are dropped there.
+* `save-store-worker.mjs` owns the origin private file system under `scda/<namespace>/<xbeSha256>`. The namespace is `progress`; `?progress=<name>` selects an isolated one for tests. The XBE hash is the executable the selected ISO was checked against, so a renamed ISO finds the same progress, and losing the ISO selection does not touch it. A Web Lock makes one tab the writer; another tab starts without saved progress and says so.
+* `save-store.mjs` keeps two slots. A commit writes the older slot through a sync access handle, calls `flush()`, closes, reads the file back and compares every byte. Only then is the commit accepted. A torn, failed or silently dropped write leaves the newer slot intact. Loading picks the newest slot that passes the container hash and the image validation.
+* `save-service.mjs` on the page coalesces images that arrive during a write (only the newest is written) and tracks unsaved state. The next start in the same page boots from the newest accepted image, after any write in flight has finished.
+
+### Durability and recovery contract
+
+* **Saved** appears only after the page has received a published image, written it, flushed it and read it back intact. The top of the screen shows "Saving" while the guest has unpublished changes or a write is in flight, then "Progress saved".
+* While anything is unsaved, closing the page asks for confirmation (`beforeunload`). Nothing relies on work started during unload.
+* Quit to main menu waits up to 4 seconds for pending changes to be written before the runtime stops. If a runtime stops with unpublished changes, the page reports "The game stopped before its last changes were saved."
+* A failed write (quota, I/O, another tab) shows "Progress not saved: <reason>" and keeps the previous accepted progress. The next successful write clears it.
+* If every stored slot is damaged, each is copied to `damaged-<time>-<slot>` (at most eight copies, never deleted). The game starts without progress, and the notice stays in Options, Progress.
+* Progress written by a newer schema or container version is reported, never loaded and never overwritten; saving is off for that session.
+* After the first accepted write the page asks for persistent storage (`navigator.storage.persist()`). Options, Progress shows the usage and whether the browser may clear it.
+
+### Export and import
+
+Options, Progress has Export and Import. The `.scdasave` file is the same container as a slot: magic, version, JSON header (game identity, schema, sequence, time, page settings), the storage image and a SHA-256 over everything before it. It holds no ISO data, assets, guest memory or caches. Import checks the size limit before reading the file, then the hash, game identity, schema and every image bound before it asks for confirmation. The current progress is copied to `backup.scdasave` before the import commits, and Restore in the same tab undoes the import. Import and Restore are unavailable while a game runs.
+
+### Evidence
+
+Tests: `temporary-filesystem` (persistence and sparse modes), `storage-publisher` (images, polling and thread) and `file-provider` (writer holds) on native ASan/UBSan and Wasm; `save-store` and `save-service` in Node with injected torn, failed, dropped and locked writes, damaged and newer slots, foreign and malformed packages and path escapes.
+
+Chrome 2026-11-07, build of this branch, isolated namespaces and a dedicated Chrome profile:
+
+1. Fresh browser: Start, Solo, New Profile (SAMFISHER) committed. Quit through the pause menu, browser closed.
+2. New browser process, ISO selected again: the store loaded sequence 2, the game listed SAMFISHER under Profiles and opened its Solo menu.
+3. New Game, Normal, Iceland. After a short walk, quick save (F5) committed within a second. Browser closed while the mission ran.
+4. New browser process: Load Game, Progress listed "Iceland (Quick Save)" with its thumbnail. Loading it restored the exact position and view of the save.
+5. Export from that session (473 KB), import into an empty namespace, reload: the store loaded it, and the game listed the same save.
+6. Slots written by an earlier image format loaded as damaged, were copied aside, and the page showed the notice.
+
+### Not yet covered
+
+* P7.3 transition matrix, P7.4 mission packages and P7.5 beyond the run above, including checkpoints, death reload, restart and every other campaign transition.
+* A real quota failure and storage eviction in a browser (covered only by injected Node failures), the `beforeunload` prompt, and the persistence grant.
+* Safari and phones.
+* More than one profile, which needs a larger profile volume. A larger volume costs Wasm heap, because E: is held in memory.
+* Schema migration: version 1 is the only one. A future change must either read version 1 or keep reporting it as incompatible.

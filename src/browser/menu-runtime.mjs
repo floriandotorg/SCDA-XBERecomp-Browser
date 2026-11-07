@@ -28,7 +28,7 @@ const waitReady = async (ready, signal, timeoutMs) => {
 
 export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRuntime, createGPU = startGPUWorker,
   gamepad = true, virtualPads, createGamepad = createGamepadInput, createInput = createMenuInput, createKeyboard = createKeyboardInput, createMotion = createMissionControls, createAudio = createBrowserAudio, onPresented = () => {}, onAdapter = () => {}, onDiagnostic = () => {},
-  onKeyboard = () => {}, onHostMessage, onHostMessages = () => {}, hostComputed = () => ({}), onHostSettings = () => {},
+  onKeyboard = () => {}, onHostMessage, onHostMessages = () => {}, hostComputed = () => ({}), onHostSettings = () => {}, onStorage = () => {}, onStoragePending = () => {},
   readyTimeoutMs = 20000, settings, ...runtimeOptions } = {}) => {
   if (typeof acquireCanvas !== 'function') { throw new TypeError('A fresh owned canvas is required for each menu runtime.'); }
   if (!Number.isInteger(readyTimeoutMs) || readyTimeoutMs < 1 || readyTimeoutMs > 30000) { throw new RangeError('Invalid GPU initialization deadline.'); }
@@ -98,6 +98,14 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
         webgpuMailbox: mailbox, cancel, dispose,
         handle: (data) => {
           if (data.phase === 'io' && live()) { onDiagnostic({ io: data.stats }); return true; }
+          if (data.phase === 'storage') {
+            if (live() && data.image instanceof Uint8Array && Number.isSafeInteger(data.revision)) { onStorage({ image: data.image, revision: data.revision }); }
+            return true;
+          }
+          if (data.phase === 'storage-pending') {
+            if (live()) { onStoragePending(data.pending === true); }
+            return true;
+          }
           if (data.phase === 'file-operation') {
             if (live()) {
               fileOperations.push(data.fileOperation);

@@ -11,6 +11,8 @@ import { frameShape } from './frame-shape.mjs';
 import { applyHostMessage, HOST_MESSAGES } from './host-messages.mjs';
 import { createConsoleModel, routeHostMessage } from './console-model.mjs';
 import { createTouchControls } from './touch-controls.mjs';
+import { createSaveService } from './save-service.mjs';
+import { SAVE_FORMAT } from './save-format.mjs';
 
 const onOff = Object.freeze({ true: 'On', false: 'Off' });
 // the render size a scale gives in Match window: the frame's 640 x 480 times the window's device rows over 480
@@ -79,6 +81,14 @@ const TABS = Object.freeze([
     { setting: 'skipIntros', label: 'Skip intros' },
     { setting: 'pauseOnFocusLoss', label: 'Pause when unfocused' },
   ] },
+  { id: 'progress', label: 'Progress', rows: [
+    { progress: 'saved', label: 'Saved progress' },
+    { progress: 'storage', label: 'Browser storage' },
+    { progress: 'export', label: 'Export to a file', button: 'Export' },
+    { progress: 'import', label: 'Import from a file', button: 'Import' },
+    { progress: 'restore', label: 'Progress before the import', button: 'Restore', shown: shell => shell.saves.state.backup },
+    { progress: 'note' },
+  ] },
   { id: 'developer', label: 'Developer', rows: [
     { setting: 'developmentStart', label: 'Skip to first mission' },
     { setting: 'showFps', label: 'Frame rate' },
@@ -110,19 +120,21 @@ const createDiscStore = (indexedDB = globalThis.indexedDB) => {
   });
 };
 
-export const mountMenuShell = ({ root = document, window = globalThis.window, settings = createSettings(), discs = createDiscStore() } = {}) => {
+export const mountMenuShell = ({ root = document, window = globalThis.window, settings = createSettings(), discs = createDiscStore(), createSaves = createSaveService } = {}) => {
   const find = selector => {
     const element = root.querySelector(selector);
     if (!element) { throw new Error(`Menu shell element ${selector} is missing.`); }
     return element;
   };
   const body = root.body;
-  const stage = find('#stage'), input = find('#iso'), boot = find('#boot');
+  const stage = find('#stage'), input = find('#iso'), boot = find('#boot'), progressFile = find('#progress-file');
   const detail = find('#detail'), diagnostic = find('#gpu'), fps = find('#fps'), gear = find('#gear');
   const front = find('#front'), mainMenu = find('#main-menu'), loadingLayer = find('#loading'), errorLayer = find('#error');
-  const pauseLayer = find('#pause'), settingsLayer = find('#settings'), consoleLayer = find('#console');
+  const pauseLayer = find('#pause'), settingsLayer = find('#settings'), consoleLayer = find('#console'), savingLayer = find('#saving');
   const consoleLog = consoleLayer.querySelector('.log'), consoleLine = consoleLayer.querySelector('.line');
   const tabList = settingsLayer.querySelector('.tabs'), rowList = settingsLayer.querySelector('.rows');
+  // ?progress=<name> keeps a test's saved progress apart from the player's
+  const saves = createSaves({ namespace: new URLSearchParams(window.location?.search ?? '').get('progress') ?? 'progress', onChange: state => progressChanged(state) });
   const touch = createTouchControls({ root, window, container: find('#touch'), settings, onMenu: () => { setPanel('pause'); } });
   // phones and tablets: any file in the picker (it cannot always tell an ISO by type, validation checks the image) and
   // a guest thread pool of 64 workers, still twice the mission's peak of about 25, not 129 at about 8 MB each
@@ -155,7 +167,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   let started = 0, lastUpdated = 0, fpsFrames = 0, fpsSince = 0;
   const measurement = createMissionMetrics();
   const createEvidence = () => ({ developmentStart: settings.get('developmentStart'), renderedFrames: 0, firstPresentedFrameMilliseconds: null,
-    adapter: null, validationErrors: [], resources: null, get performance() { return measurement.snapshot(); } });
+    adapter: null, validationErrors: [], resources: null, get performance() { return measurement.snapshot(); }, get progress() { return progressEvidence(); } });
   let evidence = createEvidence();
 
   const showDiagnostics = () => {
@@ -167,7 +179,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const hdrQuery = window.matchMedia?.('(dynamic-range: high)');
   const hdrCanvas = typeof GPUCanvasContext !== 'undefined' && 'getConfiguration' in GPUCanvasContext.prototype;
   const hdrDisplay = () => Boolean(hdrQuery?.matches && hdrCanvas);
-  const rowShell = { settings, hdrDisplay };
+  const rowShell = { settings, hdrDisplay, saves };
   hdrQuery?.addEventListener?.('change', () => {
     hostSettings?.refresh();
     if (panel === 'settings') { renderSettings(); }
@@ -265,7 +277,13 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       element.textContent = slotText(row, Number(element.dataset.slot));
       element.toggleAttribute('data-waiting', Boolean(capture && capture.element === element));
     }
-    for (const element of rowList.querySelectorAll('[data-row]:not([data-slot]):not([data-reset])')) {
+    for (const element of rowList.querySelectorAll('[data-progress]')) {
+      const row = rowsOf().rows[Number(element.dataset.row)];
+      if (element.tagName === 'BUTTON') { element.disabled = !progressAvailable(row.progress); }
+      else { element.textContent = progressText(row.progress); }
+      element.closest('.row').hidden = row.shown ? !row.shown(rowShell) : !element.textContent && element.tagName !== 'BUTTON';
+    }
+    for (const element of rowList.querySelectorAll('[data-row]:not([data-slot]):not([data-reset]):not([data-progress])')) {
       const row = rowsOf().rows[Number(element.dataset.row)];
       if (row.format) {
         const setting = SETTINGS[row.setting], value = settings.get(row.setting);
@@ -292,13 +310,23 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     }));
     const current = rowsOf();
     rowList.replaceChildren(...current.rows.map((row, index) => {
-      const line = root.createElement(row.bind || row.padBind || row.reset ? 'div' : 'label');
-      line.className = row.heading ? 'row heading' : 'row';
+      const line = root.createElement(row.bind || row.padBind || row.reset || row.progress ? 'div' : 'label');
+      line.className = row.heading ? 'row heading' : row.progress === 'note' ? 'row note' : 'row';
       line.hidden = Boolean(row.shown && !row.shown(rowShell));
       const name = root.createElement('span');
       name.textContent = row.restart ? `${row.label} (next start)` : row.label ?? row.heading;
       if (row.heading) {
         line.append(name);
+      } else if (row.progress) {
+        const value = root.createElement(row.button ? 'button' : 'span');
+        value.dataset.row = String(index);
+        value.dataset.progress = row.progress;
+        if (row.button) {
+          Object.assign(value, { type: 'button', className: 'slot', textContent: row.button });
+          value.dataset.nav = '';
+          value.addEventListener('click', () => { void progressAction(row.progress); });
+        }
+        line.append(...(row.label ? [name] : []), value);
       } else if (row.reset) {
         const button = root.createElement('button');
         Object.assign(button, { type: 'button', className: 'slot', textContent: 'Restore' });
@@ -420,6 +448,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   };
   const selectTab = (id, focus = true) => {
     tab = id;
+    progressNote = '';
+    if (id === 'progress') { void saves.refresh().catch(() => {}); }
     renderSettings();
     if (focus) { tabList.querySelector('[data-nav]')?.focus({ preventScroll: true }); }
   };
@@ -505,8 +535,11 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     setPanel('none');
     if (motion) { stage.click(); }
   };
-  const quit = () => {
+  // the last change the guest made reaches storage before its runtime goes away
+  const quit = async () => {
+    if (quitting) { return; }
     quitting = true;
+    await saves.settled(4000);
     panel = 'none';
     void controller.stop();
   };
@@ -521,7 +554,10 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     const active = ['validating', 'booting', 'running'].includes(state.phase);
     boot.disabled = active || state.stopping || state.code === 'TEARDOWN';
     boot.setAttribute('aria-busy', String(active || state.stopping));
-    if (!active && !state.stopping) { quitting = false; }
+    if (!active && !state.stopping) {
+      quitting = false;
+      saves.stopped();
+    }
     let next;
     if (state.stopping) { next = quitting ? 'title' : screen; }
     else if (active) { next = presented ? 'game' : 'loading'; }
@@ -541,8 +577,93 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     audio = createBrowserAudio({ ...options, volume: settings.get('volume') / 100, output: settings.get('audioOutput') });
     return audio;
   };
+  let progressNote = '', savingTimer;
+  const gameActive = () => ['validating', 'booting', 'running'].includes(controller.state.phase) || controller.state.stopping;
+  const savedWhen = value => new Date(value).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  const progressText = kind => {
+    const state = saves.state;
+    if (kind === 'saved') {
+      if (state.store === 'loading') { return 'Checking'; }
+      if (!saves.enabled || state.activity === 'failed') { return 'Not saved'; }
+      if (state.activity === 'saving' || state.activity === 'pending') { return 'Saving'; }
+      return state.savedAt ? savedWhen(state.savedAt) : 'Nothing yet';
+    }
+    if (kind === 'storage') {
+      if (!Number.isFinite(state.usage)) { return 'Unknown'; }
+      return `${(state.usage / 1048576).toFixed(1)} MB, ${state.persisted ? 'kept' : 'may be cleared'}`;
+    }
+    if (kind === 'note') { return progressNote || (state.activity === 'failed' ? state.error?.message : '') || state.message || ''; }
+    return '';
+  };
+  const progressAvailable = kind => {
+    if (kind === 'export') { return Boolean(saves.accepted); }
+    return saves.enabled && !gameActive();
+  };
+  const progressEvidence = () => {
+    const { store, activity, savedAt, persisted, usage, quota, backup, error } = saves.state;
+    return { store, activity, savedAt, persisted, usage, quota, backup, error: error?.code, unsaved: saves.unsaved };
+  };
+  const flashSaving = (text, tone = '', duration = 0) => {
+    clearTimeout(savingTimer);
+    savingLayer.textContent = text;
+    savingLayer.hidden = !text;
+    savingLayer.dataset.tone = tone;
+    if (duration) { savingTimer = setTimeout(() => { savingLayer.hidden = true; }, duration); }
+  };
+  const progressChanged = state => {
+    if (state.activity === 'saving' || state.activity === 'pending') { flashSaving('Saving'); }
+    else if (state.activity === 'failed') { flashSaving(`Progress not saved: ${state.error?.message ?? 'unknown failure'}`, 'alert'); }
+    else if (state.activity === 'saved') { flashSaving('Progress saved', '', 2500); }
+    if (panel === 'settings' && tab === 'progress') { refreshRows(); }
+    if (!diagnostic.hidden) { showDiagnostics(); }
+  };
+  void saves.loaded.then(result => { if (result.message) { flashSaving(result.message, 'alert', 10000); } });
+  const importProgress = async file => {
+    if (file.size > SAVE_FORMAT.maximumPackageBytes) { throw new Error('This file is too large to be saved progress.'); }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const described = await saves.inspectPackage(bytes);
+    const question = `Replace your progress with the progress saved ${savedWhen(described.savedAt)}?` +
+      (saves.accepted ? ' Your current progress is kept and can be restored here.' : '');
+    if (!window.confirm(question)) { return; }
+    const { settings: imported } = await saves.importPackage(bytes);
+    for (const [name, value] of Object.entries(imported ?? {})) {
+      if (Object.hasOwn(SETTINGS, name)) { settings.set(name, value); }
+    }
+    progressNote = `Imported the progress saved ${savedWhen(described.savedAt)}.`;
+  };
+  const progressAction = async (kind, file) => {
+    try {
+      if (kind === 'export') {
+        const bytes = await saves.exportPackage(settings.snapshot());
+        const name = `progress-${new Date().toISOString().slice(0, 10)}.scdasave`;
+        const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+        const link = root.createElement('a');
+        Object.assign(link, { href: url, download: name });
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        progressNote = `Exported ${name}.`;
+      } else if (kind === 'import') {
+        if (!file) {
+          progressFile.click();
+          return;
+        }
+        await importProgress(file);
+      } else if (kind === 'restore') {
+        if (!window.confirm('Go back to the progress you had before the last import?')) { return; }
+        await saves.restoreBackup();
+        progressNote = 'Restored the progress from before the last import.';
+      }
+    } catch (error) {
+      progressNote = error.message;
+    } finally {
+      if (panel === 'settings' && tab === 'progress') { refreshRows(); }
+    }
+  };
   const controller = createShellController({ onChange: state => render(state), createRuntime: () => createMenuRuntime({
     developmentStart: settings.get('developmentStart'), settings, createMotion, createAudio, ...(touchDevice ? { pthreadPool: 64 } : {}),
+    ...(saves.enabled && saves.accepted ? { storage: saves.accepted } : {}),
+    onStorage: ({ image }) => { saves.commit(image); },
+    onStoragePending: pending => { saves.pending(pending); },
     onKeyboard: value => { keyboard = value; touch.setKeyboard(value); show(); },
     virtualPads: () => { const pad = touch.pad(); return pad ? [pad] : []; },
     onHostMessages: value => { hostMessages = value; },
@@ -634,9 +755,12 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     void discs.save(picked).catch(() => {});
     await select(await picked.getFile(), true);
   };
+  // a new runtime starts from the newest progress in storage, so a write still in flight finishes first
   const begin = async () => {
     dismissed = false;
     presented = false;
+    await saves.loaded;
+    await saves.settled(10000);
     void controller.start();
   };
   const start = async () => {
@@ -738,6 +862,16 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const fullscreen = () => { layout(); if (panel === 'settings') { refreshRows(); } };
   const visibility = () => { if (!root.hidden) { void keepAwake(); } };
   const startClick = () => { void start(); };
+  const unload = event => {
+    if (!saves.unsaved) { return; }
+    event.preventDefault();
+    event.returnValue = '';
+  };
+  const pickedProgress = () => {
+    const file = progressFile.files?.[0];
+    progressFile.value = '';
+    if (file) { void progressAction('import', file); }
+  };
   const picked = () => {
     const file = input.files?.[0];
     const startAfter = pickToStart;
@@ -759,6 +893,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   boot.addEventListener('click', startClick);
   gear.addEventListener('click', () => { setPanel('pause'); });
   input.addEventListener('change', picked);
+  progressFile.addEventListener('change', pickedProgress);
   root.addEventListener('click', clicks);
   root.addEventListener('pointermove', hover);
   root.addEventListener('mousemove', activity);
@@ -770,6 +905,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   window.addEventListener('mousedown', captureMouse, true);
   window.addEventListener('wheel', captureWheelEvent, { capture: true, passive: false });
   window.addEventListener('resize', resized);
+  window.addEventListener('beforeunload', unload);
   layout();
   showDiagnostics();
   renderSettings();
@@ -789,6 +925,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       if (padFrame !== undefined) { window.cancelAnimationFrame(padFrame); }
       boot.removeEventListener('click', startClick);
       input.removeEventListener('change', picked);
+      progressFile.removeEventListener('change', pickedProgress);
       root.removeEventListener('click', clicks);
       root.removeEventListener('pointermove', hover);
       root.removeEventListener('mousemove', activity);
@@ -802,14 +939,18 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       window.removeEventListener('mousedown', captureMouse, true);
       window.removeEventListener('wheel', captureWheelEvent, { capture: true, passive: false });
       window.removeEventListener('resize', resized);
+      window.removeEventListener('beforeunload', unload);
       clearTimeout(layoutTimer);
+      clearTimeout(savingTimer);
       await controller.stop();
+      saves.dispose();
     },
     beginMeasurement: () => { measurement.begin(); },
     get measurement() { return measurement.snapshot(); },
     get evidence() { return evidence; },
     get input() { return keyboard?.snapshot(); },
     touch,
+    saves,
     get audio() { return audio?.snapshot(); },
   });
 };

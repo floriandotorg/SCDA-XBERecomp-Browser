@@ -2,7 +2,8 @@ import { createWorkerBroker } from './boot-worker-broker.mjs';
 import { createIsoMailbox, finishIsoRead, isoMailboxHeader } from './iso-mailbox.mjs';
 import { validateHostSettings } from './host-settings.mjs';
 
-export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createWorkerBroker, createServices, observeIo = false, developmentStart = false, hostSettings, pthreadPool } = {}) => {
+export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createWorkerBroker, createServices, observeIo = false, developmentStart = false, hostSettings, pthreadPool, storage } = {}) => {
+  if (storage !== undefined && !(storage instanceof Uint8Array && storage.length > 0 && storage.length <= 48 * 1024 * 1024)) { throw new RangeError('Invalid saved progress image.'); }
   if (typeof developmentStart !== 'boolean') { throw new TypeError('Invalid development start option.'); }
   if (pthreadPool !== undefined && !(Number.isInteger(pthreadPool) && pthreadPool >= 32 && pthreadPool <= 129)) { throw new RangeError('Invalid guest thread pool size.'); }
   if (hostSettings !== undefined) { validateHostSettings(hostSettings); }
@@ -135,7 +136,7 @@ export const createBootRuntime = ({ WorkerClass = Worker, createBroker = createW
       }
       const guest = broker.create(new URL('./boot-worker.mjs', import.meta.url), { type: 'module', name: 'story-boot' }, publish, workerError);
       guest.postMessage({ port: channel.port2, mailbox, generation, ownership, size: source.size,
-        developmentStart, ...(hostSettings ? { hostSettings } : {}), ...(pthreadPool ? { pthreadPool } : {}),
+        developmentStart, ...(hostSettings ? { hostSettings } : {}), ...(pthreadPool ? { pthreadPool } : {}), ...(storage ? { storage } : {}),
         ...(services?.webgpuMailbox ? { webgpuMailbox: services.webgpuMailbox } : {}) }, [channel.port2]);
       if (observeIo) {
         ioTimer = setInterval(() => { sample?.(); }, 1000);

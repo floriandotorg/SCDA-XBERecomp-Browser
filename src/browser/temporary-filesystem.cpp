@@ -93,6 +93,7 @@ uint32_t TemporaryFilesystem::CreateDirectory(const std::string& path) {
   if (capacity_ - allocated_ < AllocationUnit) { return 0xc000007f; }
   nodes_.emplace(*normalized, NewNode(true, 0x10));
   allocated_ += AllocationUnit;
+  ++revision_;
   return 0;
 }
 
@@ -109,6 +110,7 @@ uint32_t TemporaryFilesystem::CreateFile(const std::string& path, uint32_t attri
   node.reservation = Allocation(allocation);
   nodes_.emplace(*normalized, std::move(node));
   allocated_ += Allocation(allocation);
+  ++revision_;
   return 0;
 }
 
@@ -127,6 +129,7 @@ uint32_t TemporaryFilesystem::OverwriteFile(const std::string& path, uint32_t at
   node->second.attributes = attributes;
   node->second.lastWriteTime = now;
   node->second.changeTime = now;
+  ++revision_;
   return 0;
 }
 
@@ -151,6 +154,7 @@ uint32_t TemporaryFilesystem::WriteFile(const std::string& path, std::span<const
     node->second.changeTime = now;
   }
   allocated_ = allocated_ - previous + allocation;
+  ++revision_;
   return 0;
 }
 
@@ -165,6 +169,7 @@ uint32_t TemporaryFilesystem::Delete(const std::string& path) {
   if (node->second.directory && next != nodes_.end() && next->first.starts_with(*normalized + "\\")) { return 0xc0000101; }
   allocated_ -= node->second.directory ? AllocationUnit : std::max(Allocation(node->second.bytes.size()), node->second.reservation);
   nodes_.erase(node);
+  ++revision_;
   return 0;
 }
 
@@ -193,6 +198,7 @@ uint32_t TemporaryFilesystem::Rename(const std::string& source, const std::strin
   moved.key().swap(replacement);
   moved.mapped().changeTime = now;
   nodes_.insert(std::move(moved));
+  ++revision_;
   return 0;
 }
 
@@ -216,6 +222,7 @@ uint32_t TemporaryFilesystem::Resize(const std::string& path, uint64_t size) {
   node->second.lastWriteTime = now;
   node->second.changeTime = now;
   allocated_ = allocated_ - previous + allocation;
+  ++revision_;
   return 0;
 }
 
@@ -237,6 +244,7 @@ uint32_t TemporaryFilesystem::Reserve(const std::string& path, uint64_t size) {
   node->second.reservation = allocation;
   node->second.changeTime = now;
   allocated_ = allocated_ - previous + allocation;
+  ++revision_;
   return 0;
 }
 
@@ -257,6 +265,7 @@ uint32_t TemporaryFilesystem::SetBasic(const std::string& path, const std::array
     if (times[n] && times[n] < UINT64_MAX - 1) { *fields[n] = times[n]; }
   }
   if (attributes) { node->second.attributes = (node->second.directory ? 0x10u : 0u) | (attributes & ~0x10u); }
+  ++revision_;
   return 0;
 }
 
@@ -280,6 +289,7 @@ uint32_t TemporaryFilesystem::Write(const std::string& path, uint64_t offset, st
   node->second.lastWriteTime = now;
   node->second.changeTime = now;
   allocated_ = allocated_ - previous + allocation;
+  ++revision_;
   return 0;
 }
 
@@ -293,6 +303,128 @@ size_t TemporaryFilesystem::Read(const std::string& path, uint64_t offset, std::
   if (size) { node->second.lastAccessTime = clock_(); }
   std::copy_n(node->second.bytes.data() + offset, size, output.data());
   return size;
+}
+
+std::shared_ptr<void> TemporaryFilesystem::HoldWriter() {
+  writers_->fetch_add(1, std::memory_order_acq_rel);
+  return std::shared_ptr<void>(nullptr, [writers = writers_](void*) { writers->fetch_sub(1, std::memory_order_acq_rel); });
+}
+
+namespace {
+
+constexpr std::array<uint8_t, 8> ImageMagic{'S', 'C', 'D', 'A', 'T', 'F', 'S', 'I'};
+constexpr uint32_t ImageVersion = 1;
+constexpr size_t NodeHeaderBytes = 1 + 4 + 4 * 8 + 8 + 8;
+constexpr size_t ElidedZeros = 32;
+
+// file bytes as chunks of a zero run and a literal run: the game preallocates its save slots as zeros
+template <typename Chunk> void SparseChunks(const std::vector<uint8_t>& bytes, Chunk chunk) {
+  const auto zero = [](uint8_t value) { return value == 0; };
+  auto at = bytes.begin();
+  while (at != bytes.end()) {
+    const auto start = std::find_if_not(at, bytes.end(), zero);
+    auto end = start;
+    while (end != bytes.end()) {
+      end = std::find(end, bytes.end(), uint8_t(0));
+      const auto run = std::find_if_not(end, end + std::min<ptrdiff_t>(ElidedZeros, bytes.end() - end), zero);
+      if (run == bytes.end() || run - end >= ptrdiff_t(ElidedZeros)) { break; }
+      end = run;
+    }
+    chunk(uint32_t(start - at), start, end);
+    at = end;
+  }
+}
+
+}
+
+std::vector<uint8_t> TemporaryFilesystem::Serialize(uint64_t* revision) const {
+  std::lock_guard lock(lock_);
+  std::vector<uint8_t> image;
+  const auto put = [&](uint64_t value, size_t width) {
+    for (size_t n = 0; n < width; ++n) { image.push_back(uint8_t(value >> (8 * n))); }
+  };
+  image.insert(image.end(), ImageMagic.begin(), ImageMagic.end());
+  put(ImageVersion, 4);
+  put(nodes_.size() - 1, 4);
+  for (const auto& [path, node] : nodes_) {
+    if (path.empty()) { continue; }
+    put(path.size(), 2);
+    image.insert(image.end(), path.begin(), path.end());
+    put(node.directory, 1);
+    put(node.attributes, 4);
+    for (const auto time : {node.creationTime, node.lastAccessTime, node.lastWriteTime, node.changeTime}) { put(time, 8); }
+    put(node.reservation, 8);
+    put(node.bytes.size(), 8);
+    SparseChunks(node.bytes, [&](uint32_t zeros, auto literal, auto end) {
+      put(zeros, 4);
+      put(end - literal, 4);
+      image.insert(image.end(), literal, end);
+    });
+  }
+  if (revision) { *revision = revision_.load(std::memory_order_relaxed); }
+  return image;
+}
+
+uint32_t TemporaryFilesystem::Restore(std::span<const uint8_t> image) {
+  constexpr uint32_t invalid = 0xc000000d;
+  size_t offset = 0;
+  const auto take = [&](uint64_t& value, size_t width) {
+    if (image.size() - offset < width) { return false; }
+    value = 0;
+    for (size_t n = 0; n < width; ++n) { value |= uint64_t(image[offset + n]) << (8 * n); }
+    offset += width;
+    return true;
+  };
+  if (image.size() < ImageMagic.size() || !std::equal(ImageMagic.begin(), ImageMagic.end(), image.begin())) { return invalid; }
+  offset = ImageMagic.size();
+  uint64_t version = 0, count = 0;
+  if (!take(version, 4) || version != ImageVersion || !take(count, 4)) { return invalid; }
+  if (count >= maximumEntries_) { return 0xc000009a; }
+  std::map<std::string, Node> nodes;
+  nodes.emplace("", NewNode(true, 0x10));
+  uint64_t allocated = AllocationUnit;
+  std::string previous;
+  for (uint64_t entry = 0; entry < count; ++entry) {
+    uint64_t length = 0;
+    if (!take(length, 2) || !length || length > 240 || image.size() - offset < length) { return invalid; }
+    std::string path(reinterpret_cast<const char*>(image.data() + offset), length);
+    offset += length;
+    if (Normalize(path) != path || path <= previous) { return invalid; }
+    const auto separator = path.rfind('\\');
+    const auto parent = nodes.find(separator == std::string::npos ? "" : path.substr(0, separator));
+    if (parent == nodes.end() || !parent->second.directory) { return invalid; }
+    uint64_t directory = 0, attributes = 0, reservation = 0, size = 0;
+    std::array<uint64_t, 4> times{};
+    if (!take(directory, 1) || directory > 1 || !take(attributes, 4)) { return invalid; }
+    for (auto& time : times) {
+      if (!take(time, 8)) { return invalid; }
+    }
+    if (!take(reservation, 8) || !take(size, 8)) { return invalid; }
+    if ((attributes & ~0xb7u) || bool(attributes & 0x10) != bool(directory)) { return invalid; }
+    if (directory && (size || reservation)) { return invalid; }
+    if (reservation % AllocationUnit || reservation > capacity_ || size > capacity_) { return 0xc000007f; }
+    const auto allocation = directory ? AllocationUnit : std::max(Allocation(size), reservation);
+    if (allocation > capacity_ - allocated) { return 0xc000007f; }
+    std::vector<uint8_t> bytes(size);
+    for (uint64_t filled = 0; filled < size;) {
+      uint64_t zeros = 0, literal = 0;
+      if (!take(zeros, 4) || !take(literal, 4) || !(zeros + literal) || zeros + literal > size - filled ||
+          image.size() - offset < literal) { return invalid; }
+      std::copy_n(image.begin() + offset, literal, bytes.begin() + filled + zeros);
+      offset += literal;
+      filled += zeros + literal;
+    }
+    Node node{bool(directory), std::move(bytes), uint32_t(attributes), times[0], times[1], times[2], times[3], reservation};
+    allocated += allocation;
+    nodes.emplace(path, std::move(node));
+    previous = std::move(path);
+  }
+  if (offset != image.size()) { return invalid; }
+  std::lock_guard lock(lock_);
+  nodes_.swap(nodes);
+  allocated_ = allocated;
+  ++revision_;
+  return 0;
 }
 
 }

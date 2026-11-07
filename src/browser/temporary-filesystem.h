@@ -2,8 +2,10 @@
 
 #include <cstdint>
 #include <array>
+#include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -50,6 +52,11 @@ public:
   uint32_t WriteFile(const std::string& path, std::span<const uint8_t> bytes);
   uint32_t Write(const std::string& path, uint64_t offset, std::span<const uint8_t> bytes);
   size_t Read(const std::string& path, uint64_t offset, std::span<uint8_t> output) const;
+  uint64_t Revision() const { return revision_.load(std::memory_order_acquire); }
+  std::shared_ptr<void> HoldWriter();
+  size_t Writers() const { return writers_->load(std::memory_order_acquire); }
+  std::vector<uint8_t> Serialize(uint64_t* revision = nullptr) const;
+  uint32_t Restore(std::span<const uint8_t> image);
 
 private:
   struct Node {
@@ -69,6 +76,8 @@ private:
   uint64_t capacity_;
   uint64_t allocated_ = AllocationUnit;
   size_t maximumEntries_;
+  std::atomic<uint64_t> revision_ = 0;
+  std::shared_ptr<std::atomic<size_t>> writers_ = std::make_shared<std::atomic<size_t>>(0);
   static std::optional<std::string> Normalize(std::string path);
   static uint64_t Allocation(uint64_t size);
   uint32_t ParentStatus(const std::string& path) const;

@@ -52,6 +52,7 @@ class FileProvider {
     bool deletes = false;
     bool deletePending = false;
     bool writeAttributes = false;
+    std::shared_ptr<void> writer;
   };
   std::map<uint32_t, File> files_;
   std::map<uint32_t, std::string> links_;
@@ -339,6 +340,7 @@ public:
       file.alertable = options & 0x10;
       file.deletes = deletes;
       file.writeAttributes = (access & 0x40000100u) != 0;
+      if (temporary && !raw && (writes || deletes || file.writeAttributes)) { file.writer = storage->HoldWriter(); }
       if (!temporary && !raw) { file.disc = std::make_shared<DiscFile>(disc_, disc_->Find(path)); }
       files_.emplace(handle, std::move(file));
       nextHandle_ += 4;

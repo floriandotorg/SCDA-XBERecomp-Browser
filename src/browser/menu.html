@@ -120,9 +120,12 @@
     .slot { all: unset; cursor: pointer; padding: .05rem .3rem; text-align: center; font: inherit; text-transform: uppercase; color: var(--item);
       border: 1px solid #3c433c; background: #101310; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .slot:focus { border-color: #e4e8e2; color: #f3f6f1; }
+    .slot:disabled { cursor: default; opacity: .45; }
     .slot[data-waiting] { color: var(--alert); }
     .row.heading { color: var(--head); font-style: italic; padding-top: .7rem; }
     .row.heading::before { visibility: hidden; }
+    .row.note { display: block; text-transform: none; color: var(--item-dim); font-size: .78rem; }
+    .row.note::before { content: none; }
     .keys { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 1.6rem; margin: .7rem 0 0; padding: .6rem .6rem 0; border-top: 1px solid var(--frame-dark); }
     .keys div { display: flex; justify-content: space-between; gap: 1rem; padding: .18rem 0; font: 700 .72rem/1.2 var(--face); text-transform: uppercase; color: var(--item-dim); }
     .keys kbd { font: inherit; color: var(--item); }
@@ -149,6 +152,8 @@
     body[data-screen="game"][data-panel="none"][data-cursor="active"] #gear { opacity: 1; pointer-events: auto; }
     #gear svg { width: 1.1rem; height: 1.1rem; }
 
+    #saving { position: fixed; top: .8rem; left: 50%; transform: translateX(-50%); z-index: 4; max-width: calc(100vw - 8rem); padding: .3rem .6rem; font: 500 .74rem/1.3 var(--mono); text-transform: uppercase; color: #b6dca6; background: rgba(0, 0, 0, .65); pointer-events: none; }
+    #saving[data-tone="alert"] { color: var(--alert); text-transform: none; }
     #fps { position: fixed; top: .8rem; left: .9rem; z-index: 4; padding: .3rem .55rem; font: 500 .78rem/1 var(--mono); color: #b6dca6; background: rgba(0, 0, 0, .65); pointer-events: none; }
     #gpu { position: fixed; top: .8rem; right: .9rem; z-index: 4; width: min(28rem, 45vw); max-height: 70vh; overflow: auto; margin: 0; padding: .7rem .8rem; font: 400 .68rem/1.35 var(--mono); color: #b6dca6; background: rgba(0, 0, 0, .8); border: 1px solid var(--frame); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
 
@@ -316,8 +321,10 @@
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7"/></svg>
   </button>
   <div id="fps" hidden></div>
+  <div id="saving" role="status" hidden></div>
   <pre id="gpu" hidden></pre>
   <input id="iso" type="file" accept=".iso,application/x-iso9660-image" hidden>
+  <input id="progress-file" type="file" accept=".scdasave" hidden>
   <noscript>JavaScript is required.</noscript>
   <script type="module">
     import { mountMenuShell } from './menu-shell.mjs';

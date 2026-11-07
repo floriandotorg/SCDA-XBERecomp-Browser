@@ -10,6 +10,7 @@ const auto check = [](bool value, const char* reason) {
   if (!value) { throw std::runtime_error(reason); }
 };
 std::function<bool(uint32_t)> closeFile;
+browser::TemporaryFilesystem* userStorage = nullptr;
 uint32_t fileHandleLimit = 64;
 const auto entry = [](X86Context& ctx, uint8_t* base) {
   constexpr uint32_t cacheHeaderSize = 4096;
@@ -413,6 +414,7 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   const std::string titleFile = "\\Device\\Harddisk0\\partition1\\UDATA\\1234ABCD\\TitleMeta.xbx";
   check(createFile(titleFile) == 0 && get(0x1010c) == 2, "observed title metadata file OPEN_IF refused");
   const auto metadataFile = get(0x10100);
+  check(userStorage->Writers() == 1, "an open guest writer did not hold the user namespace");
   const auto queryFile = [&](uint32_t handle, uint32_t length = 56, uint32_t information = 34, uint32_t output = 0x10800, uint32_t status = 0x10840) {
     std::array<uint32_t, 14> sentinel;
     sentinel.fill(0xabcdef);
@@ -465,6 +467,8 @@ const auto entry = [](X86Context& ctx, uint8_t* base) {
   check(createFile(titleFile) == 0xc0000043, "new writer ignored existing share-read handle");
   check(open(titleFile, 0, 0x100001, 0x20, 0x10100, 0x10108, 1) == 0xc0000043, "reader did not share existing writer");
   check(close(metadataFile) && !close(metadataFile), "metadata file handle lifetime broken");
+  check(userStorage->Writers() == 0, "a closed guest writer still held the user namespace");
+  check(open(titleFile) == 0 && userStorage->Writers() == 0 && close(get(0x10100)), "a reader held the user namespace");
   check(queryFile(metadataFile) == 0xc0000008, "closed metadata handle remained valid");
   check(createFile(titleFile) == 0 && get(0x1010c) == 1 && close(get(0x10100)), "existing metadata file was not opened");
   check(createFile(titleFile, 2) == 0xc0000035, "file CREATE ignored collision");
@@ -2045,6 +2049,7 @@ int main() {
     image.image.kernel_thunk = 0x10000;
     auto temporary = std::make_shared<browser::TemporaryFilesystem>();
     check(temporary->CreateDirectory("CACHE") == 0, "fixture directory failed");
+    userStorage = temporary.get();
     check(temporary->WriteFile("CACHE\\SAVE.BIN", std::array<uint8_t, 3>{1, 2, 3}) == 0, "fixture file failed");
     check(temporary->CreateFile("CACHE\\READONLY.BIN", 1) == 0, "readonly fixture file failed");
     std::vector<browser::KernelDataExport> exports;

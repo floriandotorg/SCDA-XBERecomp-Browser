@@ -333,7 +333,7 @@ export const readMissionDiagnostic = (module) => {
 
 export const createBootSession = ({ create, manifest, postMessage, prepare = prepareDiscImage, onProgress = () => {} }) => {
   let started = false;
-  return async ({ data: { port, mailbox, generation, ownership, size, webgpuMailbox, developmentStart = false, hostSettings, pthreadPool } }) => {
+  return async ({ data: { port, mailbox, generation, ownership, size, webgpuMailbox, developmentStart = false, hostSettings, pthreadPool, storage } }) => {
     if (started) {
       port?.close();
       postMessage({ ok: false, generation, code: 'SESSION', message: 'A boot worker owns one session only.' });
@@ -371,6 +371,14 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
         onFileOperation: operation => {
           if (!diagnosticsActive || signal.aborted || wasmAborted) { return; }
           onProgress({ generation, phase: 'file-operation', fileOperation: operation });
+        },
+        onStorageImage: (image, revision) => {
+          if (signal.aborted || wasmAborted) { return; }
+          onProgress({ generation, phase: 'storage', image, revision });
+        },
+        onStoragePending: pending => {
+          if (signal.aborted || wasmAborted) { return; }
+          onProgress({ generation, phase: 'storage-pending', pending });
         },
         onAbort: (reason) => {
           if (!diagnosticsActive || signal.aborted || wasmAborted) { return; }
@@ -414,6 +422,14 @@ export const createBootSession = ({ create, manifest, postMessage, prepare = pre
       signal.throwIfAborted();
       if (developmentStart && module._image_development_boot?.() !== 1) {
         throw Object.assign(new Error('This build cannot start a development mission directly.'), { code: 'DEVELOPMENT_START' });
+      }
+      if (storage !== undefined) {
+        const address = storage instanceof Uint8Array && storage.length ? module._image_storage_allocate?.(storage.length) : 0;
+        if (!address) { throw Object.assign(new Error('This build cannot load saved progress.'), { code: 'STORAGE_RESTORE' }); }
+        module.HEAPU8.set(storage, address);
+        if (module._image_storage_restore() !== 1) {
+          throw Object.assign(new Error('Saved progress was rejected by the game runtime. It was not changed.'), { code: 'STORAGE_RESTORE' });
+        }
       }
       onProgress({ generation, phase: 'booting' });
       signal.throwIfAborted();

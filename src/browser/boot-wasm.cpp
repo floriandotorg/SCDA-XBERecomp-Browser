@@ -12,6 +12,7 @@
 #include "browser/section-provider.h"
 #include "browser/file-provider.h"
 #include "browser/raw-cache.h"
+#include "browser/storage-publisher.h"
 #include <algorithm>
 #include "browser/sdk-provider.h"
 #include "browser/diagnostic-graphics.h"
@@ -97,6 +98,7 @@ struct StoryState {
   bool initialized = false;
   uint32_t restarts = 0;
   bool developmentStart = false;
+  std::unique_ptr<browser::StoragePublisher> publisher;
 };
 struct Session {
 #ifdef BROWSER_MISSION
@@ -425,6 +427,30 @@ std::shared_ptr<browser::AudioOutput> publishedAudioStorage;
 std::shared_ptr<browser::MenuInput> publishedInputStorage;
 #endif
 uint32_t faultOrdinal = 0;
+std::vector<uint8_t> storageInput;
+
+browser::ConsoleIdentity StoryIdentity(const StoryState& story) {
+  browser::ConsoleIdentity identity;
+  identity.driveKey = story.driveKey;
+  std::copy_n(story.serial.begin(), identity.serial.size(), identity.serial.begin());
+  return identity;
+}
+
+// the page commits each published image to durable storage; images and the pending state go to the boot worker, which
+// keeps servicing proxied calls while it joins the guest
+void StartStoragePublisher(StoryState& story) {
+  if (story.publisher) { return; }
+  story.publisher = std::make_unique<browser::StoragePublisher>(story.profile,
+    [&story](uint64_t* revision) { return browser::EncodeStorageImage(StoryIdentity(story), *story.profile, revision); },
+    browser::StoragePublisher::Sink{
+      [](uint64_t revision, std::vector<uint8_t> image) {
+        MAIN_THREAD_EM_ASM({ Module.onStorageImage?.(HEAPU8.slice($0, $0 + $1), $2 + $3 * 4294967296); },
+          image.data(), image.size(), uint32_t(revision), uint32_t(revision >> 32));
+      },
+      [](bool pending) { MAIN_THREAD_EM_ASM({ Module.onStoragePending?.($0 !== 0); }, pending); },
+    },
+    browser::StoragePublisher::Options{std::chrono::milliseconds(750), std::chrono::milliseconds(100)});
+}
 }
 
 extern "C" {
@@ -994,6 +1020,7 @@ EMSCRIPTEN_KEEPALIVE int image_bind() {
   try {
     session->coverage = browser::InspectImageImports(*session->image, session->runtime, session->dataExports);
     browser::BindImageImports(*session->image, session->runtime, session->dataExports);
+    if (session->story) { StartStoragePublisher(*session->story); }
     return 1;
   } catch (const browser::Fault& fault) {
     faultOrdinal = fault.address;
@@ -1001,6 +1028,31 @@ EMSCRIPTEN_KEEPALIVE int image_bind() {
   } catch (const std::runtime_error&) {
     return 0;
   }
+}
+
+EMSCRIPTEN_KEEPALIVE uint8_t* image_storage_allocate(uint32_t size) {
+  if (!session || !session->story || !size || size > (48u << 20)) { return nullptr; }
+  storageInput.assign(size, 0);
+  return storageInput.data();
+}
+
+// the saved user namespace and console identity, before the guest binds: a rejected image leaves both untouched
+EMSCRIPTEN_KEEPALIVE int image_storage_restore() {
+  const auto image = std::move(storageInput);
+  storageInput = {};
+  if (!session || !session->story || session->story->publisher || session->image->importsBound ||
+      session->runtime.ActiveWorkers() || image.empty()) { return 0; }
+  auto& story = *session->story;
+  browser::ConsoleIdentity identity;
+  try {
+    if (browser::DecodeStorageImage(image, identity, *story.profile)) { return 0; }
+  } catch (const std::bad_alloc&) { return 0; }
+  story.driveKey = identity.driveKey;
+  std::copy(identity.serial.begin(), identity.serial.end(), story.serial.begin());
+  story.serial.back() = 0;
+  session->image->memory->Write({}, 0xc0003000, story.driveKey.data(), story.driveKey.size());
+  session->image->memory->Write({}, 0xc000003c, story.serial.data(), story.serial.size());
+  return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t image_coverage_count() { return session ? session->coverage.size() : 0; }

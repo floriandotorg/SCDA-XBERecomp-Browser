@@ -18,7 +18,7 @@ for (const platform of ['native', 'wasm']) {
       'tests/browser/temporary-filesystem.cpp', 'src/browser/temporary-filesystem.cpp', ...flags, '-o', output],
     { encoding: 'utf8', timeout: 120000 });
     assert.equal(build.status, 0, build.stderr);
-    for (const mode of ['contracts', 'peak']) {
+    for (const mode of ['contracts', 'peak', 'persistence']) {
       const run = spawnSync(wasm ? process.execPath : output, wasm ? [`${directory}/run.mjs`, mode] : [mode],
         { encoding: 'utf8', timeout: 120000 });
       writeFileSync(`${directory}/${platform}-${mode}-results.txt`, `${run.stdout}${run.stderr}`);
