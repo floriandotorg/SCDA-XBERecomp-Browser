@@ -6,6 +6,8 @@ export const createGPUService = async ({ canvas, moduleURL, mailbox, diagnostic 
   let pending;
   let terminal;
   const readiness = new Promise(resolve => { resolveReady = resolve; });
+  // webgpu-service.cpp FrameStat: passes, resolving passes, seeds, depth resolves, submits, texture MiB, upload KiB
+  const frameStats = () => [...new Uint32Array(module.HEAPU8.buffer, module._webgpu_frame_stats(), 7)];
   const module = await createModule({
     canvas,
     readbackMailbox: mailbox,
@@ -16,7 +18,7 @@ export const createGPUService = async ({ canvas, moduleURL, mailbox, diagnostic 
         const { resolve, command, resource, opcode } = pending;
         pending = undefined;
         if (status !== Status.Ok) { diagnostic({ command, resource, status, message }); }
-        if (status === Status.Ok && opcode === Opcode.Present) { onPresented({ command, resource, resources: module._webgpu_resources(), serviceHeapBytes: module.HEAPU8.byteLength }); }
+        if (status === Status.Ok && opcode === Opcode.Present) { onPresented({ command, resource, resources: module._webgpu_resources(), serviceHeapBytes: module.HEAPU8.byteLength, frameStats: frameStats() }); }
         resolve({ status, bytes: message ? new TextEncoder().encode(message) : bytes });
       }
     },

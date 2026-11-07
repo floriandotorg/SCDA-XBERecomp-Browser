@@ -6,6 +6,7 @@
 #include "browser/menu-shaders.h"
 #include "browser/menu-texture.h"
 #include "browser/render-snapshot.h"
+#include <initializer_list>
 #include <list>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,20 +29,22 @@ std::atomic<uint32_t> resourceSequence{0};
 const auto require = [](bool valid, const char* reason) {
   if (!valid) { throw std::runtime_error(reason); }
 };
+// a reason built only on failure, for checks on the per draw path
+const auto requireBuilt = [](bool valid, const auto& reason) {
+  if (!valid) { throw std::runtime_error(reason()); }
+};
 uint32_t address(uint32_t value) {
   if (value >= 0xf0000000 && value < 0xf4000000) { return (value & 0x03ffffff) | 0x80000000; }
   return value && value < 0x04000000 ? value | 0x80000000 : value;
 }
+template<class T> std::span<const uint8_t> bytesOf(const T& value) { return {reinterpret_cast<const uint8_t*>(&value), sizeof(value)}; }
 template<class T> void append(std::vector<uint8_t>& bytes, const T& value) {
-  const size_t offset = bytes.size();
-  bytes.resize(offset + sizeof(value));
-  std::memcpy(bytes.data() + offset, &value, sizeof(value));
+  const auto view = bytesOf(value);
+  bytes.insert(bytes.end(), view.begin(), view.end());
 }
-void appendBytes(std::vector<uint8_t>& bytes, std::span<const uint8_t> value) {
-  const size_t offset = bytes.size();
-  bytes.resize(offset + value.size());
-  if (!value.empty()) { std::memcpy(bytes.data() + offset, value.data(), value.size()); }
-}
+void appendBytes(std::vector<uint8_t>& bytes, std::span<const uint8_t> value) { bytes.insert(bytes.end(), value.begin(), value.end()); }
+// a packet in parts, staged without first joining them
+using PacketParts = std::initializer_list<std::span<const uint8_t>>;
 std::vector<uint8_t> shaderKey(const gpu::State& state, uint16_t regs, bool pretransformed,
     const gpu::TexInfo (&textures)[4], bool colorTarget, bool depthBias) {
   std::vector<uint8_t> key;
@@ -528,14 +531,7 @@ struct MenuBackend::Impl {
     return inserted;
   }
   webgpu::Result send(webgpu::Opcode opcode, uint32_t resource, std::span<const uint8_t> bytes = {}) {
-    if (opcode == webgpu::Opcode::UploadBuffer && limits.batchDraws) {
-      const size_t reserve = sizeof(webgpu::UploadDrawPacket);
-      require(bytes.size() + reserve + 12 <= webgpu::MaxBytes, "menu backend staged upload exceeds packet budget");
-      if (stagedDrawCount + stagedUploadCount == 256 || std::max<size_t>(stagedDraws.size(), 4) + std::max(stagedUploads.size(), reserve) + bytes.size() + 8 > webgpu::MaxBytes) { flushDraws(); }
-      if (!stagedUploadCount) { stagedUploads.reserve(webgpu::MaxBytes); stagedUploads.resize(reserve); }
-      append(stagedUploads, resource); append(stagedUploads, uint32_t(bytes.size())); appendBytes(stagedUploads, bytes); ++stagedUploadCount; stagedUploadPools.insert(resource);
-      return {webgpu::Status::Ok, submitted, resource, {}};
-    }
+    if (opcode == webgpu::Opcode::UploadBuffer && limits.batchDraws) { return stageUpload(resource, bytes, {}); }
     if (limits.batchCommands && (opcode == webgpu::Opcode::Clear || opcode == webgpu::Opcode::Copy)) {
       uint32_t depth = 0;
       if (opcode == webgpu::Opcode::Clear) {
@@ -544,7 +540,7 @@ struct MenuBackend::Impl {
         std::memcpy(&packet, bytes.data(), sizeof(packet));
         depth = packet.depth_target;
       }
-      stage(opcode, resource, depth, bytes);
+      stage(opcode, resource, depth, {bytes});
       return {webgpu::Status::Ok, submitted, resource, {}};
     }
     if (opcode != webgpu::Opcode::DrawBatch && opcode != webgpu::Opcode::RenderBatch && opcode != webgpu::Opcode::UploadBuffer && opcode != webgpu::Opcode::UploadDrawBatch && opcode != webgpu::Opcode::ReadbackCollect) { flushDraws(); }
@@ -553,7 +549,8 @@ struct MenuBackend::Impl {
     const auto started = std::chrono::steady_clock::now();
     const bool deferred = limits.postCommands && (opcode == webgpu::Opcode::Draw || opcode == webgpu::Opcode::DrawBatch || opcode == webgpu::Opcode::ReadbackStart || opcode == webgpu::Opcode::Present ||
       opcode == webgpu::Opcode::RenderBatch || opcode == webgpu::Opcode::Clear || opcode == webgpu::Opcode::Copy || opcode == webgpu::Opcode::UploadBuffer || opcode == webgpu::Opcode::UploadDrawBatch ||
-      opcode == webgpu::Opcode::Resolve || opcode == webgpu::Opcode::Occlusion);
+      opcode == webgpu::Opcode::Resolve || opcode == webgpu::Opcode::Occlusion || opcode == webgpu::Opcode::SoftShadows || opcode == webgpu::Opcode::ApplyShadows ||
+      opcode == webgpu::Opcode::Blit || opcode == webgpu::Opcode::Multisample || opcode == webgpu::Opcode::SetGamma);
     auto result = (deferred ? post : execute)(opcode, resource, bytes);
     const uint64_t elapsed = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
     commandWaitMicroseconds += elapsed;
@@ -582,6 +579,16 @@ struct MenuBackend::Impl {
     }
     return result;
   }
+  // an UploadBuffer staged with the draws, its packet in two parts so a resident upload is copied once
+  webgpu::Result stageUpload(uint32_t resource, std::span<const uint8_t> head, std::span<const uint8_t> tail) {
+    const size_t reserve = sizeof(webgpu::UploadDrawPacket), size = head.size() + tail.size();
+    require(size + reserve + 12 <= webgpu::MaxBytes, "menu backend staged upload exceeds packet budget");
+    if (stagedDrawCount + stagedUploadCount == 256 || std::max<size_t>(stagedDraws.size(), 4) + std::max(stagedUploads.size(), reserve) + size + 8 > webgpu::MaxBytes) { flushDraws(); }
+    if (!stagedUploadCount) { stagedUploads.reserve(webgpu::MaxBytes); stagedUploads.resize(reserve); }
+    append(stagedUploads, resource); append(stagedUploads, uint32_t(size)); appendBytes(stagedUploads, head); appendBytes(stagedUploads, tail);
+    ++stagedUploadCount; stagedUploadPools.insert(resource);
+    return {webgpu::Status::Ok, submitted, resource, {}};
+  }
   void flushDraws() {
     if (!stagedDrawCount && !stagedUploadCount) { return; }
     if (stagedDraws.empty()) { stagedDraws.resize(4); }
@@ -598,20 +605,27 @@ struct MenuBackend::Impl {
     }
     stagedDraws.clear(); stagedUploads.clear(); stagedUploadPools.clear(); stagedTargets.clear(); stagedDrawCount = 0; stagedUploadCount = 0; stagedBufferViews.clear();
   }
-  std::optional<uint32_t> draw(uint32_t resource, const webgpu::DrawPacket& packet, std::span<const uint8_t> bytes) {
-    if (!limits.batchDraws) { return send(webgpu::Opcode::Draw, resource, bytes).command; }
-    stage(webgpu::Opcode::Draw, resource, packet.depth_target, bytes);
+  std::optional<uint32_t> draw(uint32_t resource, const webgpu::DrawPacket& packet, PacketParts parts) {
+    if (!limits.batchDraws) {
+      std::vector<uint8_t> bytes;
+      for (const auto part : parts) { appendBytes(bytes, part); }
+      return send(webgpu::Opcode::Draw, resource, bytes).command;
+    }
+    stage(webgpu::Opcode::Draw, resource, packet.depth_target, parts);
     return std::nullopt;
   }
-  void stage(webgpu::Opcode opcode, uint32_t resource, uint32_t depth, std::span<const uint8_t> bytes) {
+  void stage(webgpu::Opcode opcode, uint32_t resource, uint32_t depth, PacketParts parts) {
     requireOwner();
+    size_t size = 0;
+    for (const auto part : parts) { size += part.size(); }
     const uint32_t headerBytes = limits.batchCommands ? 12 : 8;
     const size_t reserve = limits.residentVertices ? sizeof(webgpu::UploadDrawPacket) : 0;
-    require(bytes.size() + headerBytes + 4 + reserve <= webgpu::MaxBytes, "menu backend staged draw exceeds packet budget");
-    if (stagedDrawCount + stagedUploadCount == 256 || std::max<size_t>(stagedDraws.size(), 4) + bytes.size() + headerBytes + std::max(stagedUploads.size(), reserve) > webgpu::MaxBytes) { flushDraws(); }
+    require(size + headerBytes + 4 + reserve <= webgpu::MaxBytes, "menu backend staged draw exceeds packet budget");
+    if (stagedDrawCount + stagedUploadCount == 256 || std::max<size_t>(stagedDraws.size(), 4) + size + headerBytes + std::max(stagedUploads.size(), reserve) > webgpu::MaxBytes) { flushDraws(); }
     if (!stagedDrawCount) { stagedDraws.reserve(webgpu::MaxBytes); stagedDraws.resize(4); }
     if (limits.batchCommands) { append(stagedDraws, uint32_t(opcode)); }
-    append(stagedDraws, resource); append(stagedDraws, uint32_t(bytes.size())); appendBytes(stagedDraws, bytes);
+    append(stagedDraws, resource); append(stagedDraws, uint32_t(size));
+    for (const auto part : parts) { appendBytes(stagedDraws, part); }
     if (resource) { stagedTargets.insert(resource); }
     if (depth) { stagedTargets.insert(depth); }
     ++stagedDrawCount;
@@ -657,8 +671,10 @@ struct MenuBackend::Impl {
     }
     require(bytes.size() <= webgpu::MaxBytes - sizeof(webgpu::BufferUpload) - sizeof(webgpu::UploadDrawPacket) - 12, "resident buffer upload budget exceeded");
     const auto upload = [&](uint32_t id, uint32_t offset, uint32_t capacity) {
+      const webgpu::BufferUpload head{offset, capacity};
+      if (limits.batchDraws) { stageUpload(id, {reinterpret_cast<const uint8_t*>(&head), sizeof(head)}, bytes); return; }
       std::vector<uint8_t> packet;
-      append(packet, webgpu::BufferUpload{offset, capacity}); appendBytes(packet, bytes);
+      append(packet, head); appendBytes(packet, bytes);
       send(webgpu::Opcode::UploadBuffer, id, packet);
     };
     if (found != residentBuffers.end()) {
@@ -824,7 +840,7 @@ struct MenuBackend::Impl {
     auto header = read(headerAddress, 20);
     auto desc = describe(header, surface);
     if (surface && !depth) {
-      require(desc.format == 0x06 || desc.format == 0x07 || desc.format == 0x12 || desc.format == 0x1e, ("menu backend unsupported color surface format=" + std::to_string(desc.format)).c_str());
+      requireBuilt(desc.format == 0x06 || desc.format == 0x07 || desc.format == 0x12 || desc.format == 0x1e, [&] { return "menu backend unsupported color surface format=" + std::to_string(desc.format); });
     }
     const uint64_t bytes = resourceBytes(desc, depth);
     require(bytes <= limits.maxResourceBytes, "menu backend resource byte budget exceeded");
@@ -894,7 +910,7 @@ struct MenuBackend::Impl {
     trimFeedback(found == resources.end() ? 1 : 0, residentBytes > oldBytes ? residentBytes - oldBytes : 0,
       found == resources.end() ? nullptr : &found->second);
     require(resourceCount() < limits.maxResources || found != resources.end(), "menu backend resource count budget exceeded");
-    require(residentBytes <= limits.maxResidentBytes && resident - std::min(resident, oldBytes) <= limits.maxResidentBytes - residentBytes, ("menu backend resident byte budget exceeded: resident=" + std::to_string(resident) + " replacement=" + std::to_string(oldBytes) + " request=" + std::to_string(residentBytes) + " limit=" + std::to_string(limits.maxResidentBytes)).c_str());
+    requireBuilt(residentBytes <= limits.maxResidentBytes && resident - std::min(resident, oldBytes) <= limits.maxResidentBytes - residentBytes, [&] { return "menu backend resident byte budget exceeded: resident=" + std::to_string(resident) + " replacement=" + std::to_string(oldBytes) + " request=" + std::to_string(residentBytes) + " limit=" + std::to_string(limits.maxResidentBytes); });
     const uint32_t id = newId();
     webgpu::TexturePacket packet{desc.width, desc.height, depth ? 1u : desc.cube ? 2u : desc.depth > 1 ? 3u : 0u, desc.levels};
     std::vector<uint8_t> payload;
@@ -1031,9 +1047,9 @@ struct MenuBackend::Impl {
       const size_t bytes = feedbackBytes(item);
       require(bytes <= limits.maxResourceBytes && bytes <= limits.maxResidentBytes, "menu backend feedback resident byte budget exceeded");
       trimFeedback(1, bytes, &item);
-      require(resourceCount() < limits.maxResources, ("menu backend feedback resource count budget exceeded: originals=" + std::to_string(resources.size()) +
+      requireBuilt(resourceCount() < limits.maxResources, [&] { return "menu backend feedback resource count budget exceeded: originals=" + std::to_string(resources.size()) +
         " feedback=" + std::to_string(resourceCount() - resources.size() - size_t(white != 0)) + " pinned=" + std::to_string(feedbackPins.size()) +
-        " limit=" + std::to_string(limits.maxResources)).c_str());
+        " limit=" + std::to_string(limits.maxResources); });
       require(bytes <= limits.maxResourceBytes && bytes <= limits.maxResidentBytes && resident <= limits.maxResidentBytes - bytes, "menu backend feedback resident byte budget exceeded");
       std::vector<uint8_t> payload;
       append(payload, webgpu::TexturePacket{item.hostWidth, item.hostHeight, item.hdrTarget ? webgpu::HdrTexture : 0u});
@@ -1316,7 +1332,7 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     if (!(regs & (1u << n))) { continue; }
     const auto& element = layout.inputs[n];
     const auto& stream = input.streams[size_t(element.stream)];
-    const auto format = menu::GuestVertex(element.type);
+    const auto& format = menu::GuestVertexLayout(element.type);
     const uint32_t stride = stream.stride ? stream.stride : layout.stream_stride[size_t(element.stream)];
     const uint32_t alignment = std::min(format.extraFormat ? format.extraOffset : format.bytes, 4u);
     if (element.stream >= 8 || stride > 2048 || !format.format || stride % 4 || !alignment || element.offset % alignment || element.offset + format.bytes > stride || streamBytes[size_t(element.stream)] > webgpu::MaxBytes - sizeof(webgpu::BufferUpload) - sizeof(webgpu::UploadDrawPacket) - 12) { raw = false; break; }
@@ -1384,15 +1400,18 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   const bool depthOnly = !input.rt.data && !input.simple[gpu::kMColorWriteEnable / 4] && input.zs.header &&
     (input.rs[gpu::kRsZEnable] || input.rs[gpu::kRsStencilEnable]);
   // targets first: one sampled before it was drawn to is promoted to its render scale before any texture of this draw
-  // (its feedback copy included) is bound
-  if (!depthOnly) { impl_->surface(input.rt); }
-  if (input.zs.header && (input.rs[gpu::kRsZEnable] || input.rs[gpu::kRsStencilEnable])) { impl_->surface(input.zs, true); }
+  // (its feedback copy included) is bound. Each is resolved once a draw; a texture that is the colour target itself
+  // takes the item's header, so then the target is resolved again after the textures
+  auto* colorTarget = depthOnly ? nullptr : &impl_->surface(input.rt);
+  const bool depthEnabled = input.zs.header && (input.rs[gpu::kRsZEnable] || input.rs[gpu::kRsStencilEnable]);
+  Impl::Resource* depthTarget = depthEnabled ? &impl_->surface(input.zs, true) : nullptr;
   // native's EnterHdrForScene: screen quads never start it, so loading fades draw over the last tone mapped picture
   if (!depthOnly && input.zs.header && input.rs[gpu::kRsZEnable] && input.simple[gpu::kMZWriteEnable / 4] &&
       !(!(input.vs_handle & 1) && (input.vs_handle & 14) == 4)) {
-    auto& scene = impl_->surface(input.rt);
+    auto& scene = *colorTarget;
     if (scene.hdrTarget && !scene.inHdr && scene.hdrFrame != impl_->frames) { impl_->enterHdr(scene); }
   }
+  bool sampledTarget = false;
   gpu::TexInfo texinfo[4]{};
   std::array<uint32_t, 4> textureFormats{};
   std::array<std::array<float, 4>, 4> texsize{};
@@ -1413,7 +1432,9 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
       if (item.inHdr) { texinfo[n].flags |= gpu::kTexHdr; }
       if (item.normCube && impl_->hdr) { texinfo[n].flags |= gpu::kTexNormCube; }
       texsize[n] = {float(item.desc.width), float(item.desc.height), item.renderTarget ? -0.5f / item.desc.width : 0, item.renderTarget ? -0.5f / item.desc.height : 0};
-      packet.texture[n] = input.rt.data && item.desc.data == address(input.rt.data) ? impl_->feedbackTexture(item) : item.id;
+      const bool feedback = input.rt.data && item.desc.data == address(input.rt.data);
+      sampledTarget = sampledTarget || feedback;
+      packet.texture[n] = feedback ? impl_->feedbackTexture(item) : item.id;
       addRequest(RenderResourceKind::Texture, input.textures[n], item.desc.data, uint32_t(item.uploaded.size()), item.version, item.id);
       const auto& sampling = input.tss[n];
       packet.sampler[n][0] = samplerAddress(sampling[gpu::kTssAddressU]);
@@ -1437,11 +1458,9 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     }
   }
 
-  auto* colorTarget = depthOnly ? nullptr : &impl_->surface(input.rt);
+  if (colorTarget && sampledTarget) { colorTarget = &impl_->surface(input.rt); }
   if (colorTarget) { addRequest(RenderResourceKind::Surface, input.rt.header, colorTarget->desc.data, uint32_t(colorTarget->uploaded.size()), colorTarget->version, colorTarget->id); }
-  Impl::Resource* depthTarget = nullptr;
-  if (input.zs.header && (input.rs[gpu::kRsZEnable] || input.rs[gpu::kRsStencilEnable])) {
-    depthTarget = &impl_->surface(input.zs, true);
+  if (depthTarget) {
     require(!colorTarget || (depthTarget->desc.width == colorTarget->desc.width && depthTarget->desc.height == colorTarget->desc.height &&
       depthTarget->hostWidth == colorTarget->hostWidth && depthTarget->hostHeight == colorTarget->hostHeight), "menu backend incompatible depth target dimensions");
     impl_->initializeDepth(*depthTarget);
@@ -1628,9 +1647,7 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     draw.indices = indexView.id; draw.index_offset = indexView.offset;
     draw.index_bytes = uint32_t(expandedCount * 4);
     packet.vertex_count = maximum - minimum + 1; packet.index_count = uint32_t(expandedCount); packet.index32 = 2;
-    std::vector<uint8_t> bytes;
-    append(bytes, packet); append(bytes, draw); append(bytes, constants);
-    const auto command = impl_->draw(colorTarget ? colorTarget->id : 0, packet, bytes);
+    const auto command = impl_->draw(colorTarget ? colorTarget->id : 0, packet, {bytesOf(packet), bytesOf(draw), bytesOf(constants)});
     if (raw && budget.batchDraws) { impl_->stagedBufferViews.insert(impl_->viewPins.begin(), impl_->viewPins.end()); }
     if (colorTarget) { colorTarget->dirty = true; if (command) { colorTarget->command = *command; } ++colorTarget->version; }
     if (packet.depth_target) {
@@ -1662,7 +1679,6 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
   const uint32_t batchVertices = std::min(8192u, uint32_t((webgpu::MaxBytes - sizeof(packet) - sizeof(constants)) / (vertexStride + (budget.indexedVertices ? 2 : 0)))) / primitiveVertices * primitiveVertices;
   require(batchVertices, "menu backend uniforms leave no geometry staging capacity");
   std::vector<float> vertices;
-  std::vector<uint8_t> bytes;
   std::vector<uint32_t> batchNumbers;
   std::vector<uint16_t> batchIndices;
   std::vector<int32_t> remap(budget.indexedVertices ? size_t(maximum - minimum) + 1 : 0, -1);
@@ -1691,13 +1707,9 @@ void MenuBackend::Draw(const gpu::State& input, uint32_t prim, uint32_t start, u
     }
     packet.vertex_count = uint32_t(batchNumbers.size()); packet.vertex_bytes = uint32_t(vertices.size() * 4);
     packet.index_count = uint32_t(batchIndices.size()); packet.index_bytes = uint32_t(batchIndices.size() * 2);
-    bytes.clear();
-    bytes.reserve(sizeof(packet) + packet.vertex_bytes + packet.index_bytes + sizeof(constants));
-    append(bytes, packet);
-    appendBytes(bytes, {reinterpret_cast<const uint8_t*>(vertices.data()), vertices.size() * sizeof(float)});
-    appendBytes(bytes, {reinterpret_cast<const uint8_t*>(batchIndices.data()), packet.index_bytes});
-    append(bytes, constants);
-    const auto command = impl_->draw(colorTarget ? colorTarget->id : 0, packet, bytes);
+    const auto command = impl_->draw(colorTarget ? colorTarget->id : 0, packet, {bytesOf(packet),
+      {reinterpret_cast<const uint8_t*>(vertices.data()), vertices.size() * sizeof(float)},
+      {reinterpret_cast<const uint8_t*>(batchIndices.data()), packet.index_bytes}, bytesOf(constants)});
     if (colorTarget) { colorTarget->dirty = true; if (command) { colorTarget->command = *command; } ++colorTarget->version; }
     if (packet.depth_target) {
       auto& depth = impl_->resources.at(uint64_t(address(state.zs.data)) * 2 + 1);

@@ -256,4 +256,5 @@ What C08 built.
 ### Not done
 
 - `wgpuDeviceCreateRenderPipelineAsync` for the SMAA pipelines (the first enabled frame compiles them in line).
-- Resolve and multisampled pass counters in Diagnostics; the perf harness runs; the 60 second soak.
+- Measured with every other enhanced feature at 1080p in C07 (display rate; per frame pass counters in the presented
+  frame's `frameStats`).

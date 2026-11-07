@@ -606,7 +606,7 @@ bool DiagnosticGraphics::TypedState(X86Context& ctx, uint8_t* base, uint32_t id)
   } else if (id == 30 || id == 31 || id == 54 || id == 55) {
     const uint32_t requested = id == 31 ? frame[1] / 4 : id == 55 ? 4 : 1;
     const uint32_t count = ctx.ecx < state_.vsc.size() ? std::min(requested, uint32_t(state_.vsc.size()) - ctx.ecx) : 0;
-    std::array<std::array<float, 4>, 192> values{};
+    std::array<std::array<float, 4>, 192> values;
     if (count) {
       memory_->Read(ctx, ctx.edx, values.data(), count * 16);
       std::copy_n(values.begin(), count, state_.vsc.begin() + ctx.ecx);

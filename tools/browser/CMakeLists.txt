@@ -304,7 +304,7 @@ if(BROWSER_BOOT)
         target_compile_options(menu_gpu PRIVATE --use-port=emdawnwebgpu -fexceptions)
         target_link_options(menu_gpu PRIVATE --use-port=emdawnwebgpu -fexceptions -sMODULARIZE=1 -sEXPORT_ES6=1
             -sENVIRONMENT=worker,web -sALLOW_MEMORY_GROWTH=1 -sNO_EXIT_RUNTIME=1
-            "-sEXPORTED_FUNCTIONS=['_webgpu_start','_webgpu_submit','_webgpu_resources','_webgpu_shutdown','_malloc','_free']"
+            "-sEXPORTED_FUNCTIONS=['_webgpu_start','_webgpu_submit','_webgpu_resources','_webgpu_frame_stats','_webgpu_shutdown','_malloc','_free']"
             "-sEXPORTED_RUNTIME_METHODS=['HEAPU8']")
         set_target_properties(menu_gpu PROPERTIES OUTPUT_NAME "menu_gpu" SUFFIX ".mjs"
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/boot-web)

@@ -11,6 +11,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace browser::webgpu;
@@ -129,7 +130,11 @@ uint32_t pending_validations = 0;
 bool validation_barrier = false;
 uint32_t created_resource = 0;
 uint64_t texture_bytes = 0;
-constexpr uint64_t TextureBudget = 256ull * 1024 * 1024;
+// screen sized targets at 1080p with 4x MSAA and HDR are about 66 MB a colour companion, so the console era 256 MiB is too small
+constexpr uint64_t TextureBudget = 1024ull * 1024 * 1024;
+std::runtime_error budget_exhausted(const char* what, uint64_t needed) {
+  return std::runtime_error(std::string("GPU ") + what + " texture budget exhausted: " + std::to_string(texture_bytes >> 20) + " MiB used, " + std::to_string(needed >> 20) + " MiB more");
+}
 uint32_t canvas_width = 0, canvas_height = 0;
 WGPUTexture gamma_texture;
 WGPURenderPipeline presentation_pipeline;
@@ -243,13 +248,25 @@ template<class T> T packet(std::span<const uint8_t>& bytes) {
 void exact(std::span<const uint8_t> bytes, uint64_t size) {
   if (bytes.size() != size) { throw std::runtime_error("GPU payload length mismatch"); }
 }
+// per frame GPU work, kept for the presented frame's diagnostics: render passes, those resolving a 4x companion,
+// companion seeds, depth sample 0 resolves, queue submits, texture MiB, resident buffer KiB uploaded
+enum FrameStat : uint32_t { StatPasses, StatResolvingPasses, StatSeeds, StatDepthResolves, StatSubmits, StatTextureMiB, StatUploadKiB, StatCount };
+uint64_t frame_upload_bytes = 0;
+std::array<uint32_t, StatCount> frame_stats{}, presented_stats{};
+WGPURenderPassEncoder begin_pass(WGPUCommandEncoder encoder, const WGPURenderPassDescriptor* descriptor) {
+  ++frame_stats[StatPasses];
+  if (descriptor->colorAttachmentCount && descriptor->colorAttachments[0].resolveTarget) { ++frame_stats[StatResolvingPasses]; }
+  return wgpuCommandEncoderBeginRenderPass(encoder, descriptor);
+}
 void submit(WGPUCommandEncoder encoder) {
   auto command = wgpuCommandEncoderFinish(encoder, nullptr);
   wgpuQueueSubmit(queue, 1, &command);
+  ++frame_stats[StatSubmits];
   wgpuCommandBufferRelease(command);
   wgpuCommandEncoderRelease(encoder);
 }
 void write_buffer(WGPUBuffer buffer, std::span<const uint8_t> bytes, uint64_t offset = 0) {
+  if (bytes.size() % 4 == 0) { wgpuQueueWriteBuffer(queue, buffer, offset, bytes.data(), bytes.size()); return; }
   std::vector<uint8_t> padded((bytes.size() + 3) & ~size_t(3));
   std::memcpy(padded.data(), bytes.data(), bytes.size());
   wgpuQueueWriteBuffer(queue, buffer, offset, padded.data(), padded.size());
@@ -265,6 +282,7 @@ WGPUBuffer buffer(std::span<const uint8_t> bytes, WGPUBufferUsage usage) {
 void upload_buffer(uint32_t resource, std::span<const uint8_t> bytes) {
   const auto upload = packet<BufferUpload>(bytes);
   const uint64_t length = (bytes.size() + 3) & ~uint64_t(3);
+  frame_upload_bytes += bytes.size();
   if (!resource || bytes.empty() || upload.offset % 4 || !upload.capacity || upload.capacity % 4 || upload.capacity > MaxBytes || uint64_t(upload.offset) + length > upload.capacity) { throw std::runtime_error("invalid resident buffer upload"); }
   if (const auto found = resident_buffers.find(resource); found != resident_buffers.end()) {
     if (upload.capacity != found->second.bytes) { throw std::runtime_error("resident buffer update size mismatch"); }
@@ -381,7 +399,7 @@ void force_opaque_alpha(WGPUCommandEncoder encoder, Texture& target, const CopyP
   auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
   attachment.view = wgpuTextureCreateView(target.handle, nullptr); attachment.loadOp = WGPULoadOp_Load; attachment.storeOp = WGPUStoreOp_Store;
   auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &attachment;
-  auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+  auto pass = begin_pass(encoder, &descriptor);
   wgpuRenderPassEncoderSetPipeline(pass, pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
   wgpuRenderPassEncoderSetScissorRect(pass, copy.destination_x, copy.destination_y, copy.width, copy.height);
   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
@@ -434,7 +452,7 @@ WGPUTexture pack_depth(WGPUCommandEncoder encoder, const Texture& target) {
   auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
   attachment.view = wgpuTextureCreateView(packed, nullptr); attachment.loadOp = WGPULoadOp_Clear; attachment.storeOp = WGPUStoreOp_Store;
   auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &attachment;
-  auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+  auto pass = begin_pass(encoder, &descriptor);
   wgpuRenderPassEncoderSetPipeline(pass, depth_readback_pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
   wgpuTextureViewRelease(attachment.view); wgpuBindGroupRelease(group); wgpuTextureViewRelease(input);
@@ -584,7 +602,7 @@ void prepare_smaa(uint32_t width, uint32_t height) {
   if (state.width == width && state.height == height) { return; }
   release_smaa_targets();
   const uint64_t bytes = uint64_t(width) * height * 10;
-  if (texture_bytes + bytes > TextureBudget) { throw std::runtime_error("GPU SMAA texture budget exhausted"); }
+  if (texture_bytes + bytes > TextureBudget) { throw budget_exhausted("SMAA", bytes); }
   const auto usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
   state.targets[0] = smaa_texture(width, height, WGPUTextureFormat_RG8Unorm, usage);
   state.targets[1] = smaa_texture(width, height, WGPUTextureFormat_RGBA8Unorm, usage);
@@ -611,7 +629,7 @@ void run_smaa(WGPUCommandEncoder encoder, Texture& source) {
     auto group = wgpuDeviceCreateBindGroup(device, &group_descriptor);
     auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; attachment.view = output; attachment.loadOp = WGPULoadOp_Clear; attachment.storeOp = WGPUStoreOp_Store; attachment.clearValue = {0, 0, 0, 0};
     auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &attachment;
-    auto render = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+    auto render = begin_pass(encoder, &descriptor);
     wgpuRenderPassEncoderSetPipeline(render, pipeline); wgpuRenderPassEncoderSetBindGroup(render, 0, group, 0, nullptr);
     wgpuRenderPassEncoderDraw(render, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(render); wgpuRenderPassEncoderRelease(render);
     wgpuBindGroupRelease(group);
@@ -675,7 +693,7 @@ fn ramped(color: vec4<f32>) -> vec4<f32> {
   }
   if (presentation_target.width != canvas_width || presentation_target.height != canvas_height) {
     const uint64_t old_size = uint64_t(presentation_target.width) * presentation_target.height * 4;
-    if (texture_bytes - old_size + uint64_t(canvas_width) * canvas_height * 4 > TextureBudget) { throw std::runtime_error("GPU presentation texture budget exhausted"); }
+    if (texture_bytes - old_size + uint64_t(canvas_width) * canvas_height * 4 > TextureBudget) { throw budget_exhausted("presentation", uint64_t(canvas_width) * canvas_height * 4); }
     release_presentation_target();
     auto descriptor = WGPU_TEXTURE_DESCRIPTOR_INIT; descriptor.size = {canvas_width, canvas_height, 1}; descriptor.format = WGPUTextureFormat_RGBA8Unorm; descriptor.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc | WGPUTextureUsage_TextureBinding;
     presentation_target = {wgpuDeviceCreateTexture(device, &descriptor), canvas_width, canvas_height, false}; texture_bytes += uint64_t(canvas_width) * canvas_height * 4;
@@ -755,7 +773,7 @@ void draw(uint32_t resource, std::span<const uint8_t> bytes, const DrawUploads* 
         if (depth_texture) { seed(encoder, *depth_texture); }
       }
       if (depth_texture && depth_texture->ms) { depth_texture->stale = true; }
-      auto pass = reuse ? batch_pass : wgpuCommandEncoderBeginRenderPass(encoder, &pass_descriptor);
+      auto pass = reuse ? batch_pass : begin_pass(encoder, &pass_descriptor);
       if (batch_encoder) { batch_pass = pass; batch_color = resource; batch_depth = spec.depth_target; }
       wgpuRenderPassEncoderSetPipeline(pass, found->second.handle); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr); if (resident) {
         for (uint32_t n = 0; n < 16; ++n) {
@@ -842,7 +860,7 @@ void msaa_pass(WGPUCommandEncoder encoder, uint32_t kind, WGPUTextureView input,
     color.view = output; color.loadOp = WGPULoadOp_Load; color.storeOp = WGPUStoreOp_Store;
     descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &color;
   }
-  auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+  auto pass = begin_pass(encoder, &descriptor);
   wgpuRenderPassEncoderSetPipeline(pass, pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
   wgpuBindGroupRelease(group);
@@ -855,6 +873,7 @@ WGPUTextureView depth_only(WGPUTexture handle) {
 void seed(WGPUCommandEncoder encoder, Texture& texture) {
   if (!texture.ms || !texture.seed) { return; }
   texture.seed = false;
+  ++frame_stats[StatSeeds];
   auto input = texture.depth ? depth_only(texture.handle) : wgpuTextureCreateView(texture.handle, nullptr);
   msaa_pass(encoder, texture.depth ? 1 : texture.hdr ? 3 : 0, input, texture.msView, texture.depth);
   wgpuTextureViewRelease(input);
@@ -863,6 +882,7 @@ void seed(WGPUCommandEncoder encoder, Texture& texture) {
 void readable(Texture& texture) {
   if (!texture.ms || !texture.stale) { return; }
   texture.stale = false;
+  ++frame_stats[StatDepthResolves];
   end_batch_pass();
   auto encoder = batch_encoder ? batch_encoder : wgpuDeviceCreateCommandEncoder(device, nullptr);
   auto input = depth_only(texture.ms);
@@ -884,7 +904,7 @@ void multisample(uint32_t resource, std::span<const uint8_t> bytes) {
     return;
   }
   const uint64_t bytesNeeded = multisample_bytes(target);
-  if (texture_bytes + bytesNeeded > TextureBudget) { throw std::runtime_error("GPU multisample texture budget exhausted"); }
+  if (texture_bytes + bytesNeeded > TextureBudget) { throw budget_exhausted("multisample", bytesNeeded); }
   auto descriptor = WGPU_TEXTURE_DESCRIPTOR_INIT;
   descriptor.size = {target.width, target.height, 1}; descriptor.sampleCount = 4;
   descriptor.format = target.depth ? WGPUTextureFormat_Depth24PlusStencil8 : color_format(target);
@@ -1065,7 +1085,7 @@ void soft_pass(WGPUCommandEncoder encoder, uint32_t pass, bool multisampled, WGP
   auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; attachment.view = output; attachment.resolveTarget = resolve;
   attachment.loadOp = load ? WGPULoadOp_Load : WGPULoadOp_Clear; attachment.storeOp = WGPUStoreOp_Store; attachment.clearValue = {0, 0, 0, 0};
   auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &attachment;
-  auto render = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+  auto render = begin_pass(encoder, &descriptor);
   wgpuRenderPassEncoderSetPipeline(render, pipeline); wgpuRenderPassEncoderSetBindGroup(render, 0, group, 0, nullptr);
   if (rect) { wgpuRenderPassEncoderSetScissorRect(render, uint32_t(rect[0]), uint32_t(rect[1]), uint32_t(rect[2]), uint32_t(rect[3])); }
   wgpuRenderPassEncoderDraw(render, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(render); wgpuRenderPassEncoderRelease(render);
@@ -1284,7 +1304,7 @@ void resolve_pass(WGPUCommandEncoder encoder, uint32_t pass, WGPUTextureFormat f
   auto group = wgpuDeviceCreateBindGroup(device, &group_descriptor);
   auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; attachment.view = output; attachment.loadOp = WGPULoadOp_Load; attachment.storeOp = WGPUStoreOp_Store;
   auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &attachment;
-  auto render = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+  auto render = begin_pass(encoder, &descriptor);
   const WGPUColor constant{blend, blend, blend, blend};
   wgpuRenderPassEncoderSetBlendConstant(render, &constant);
   wgpuRenderPassEncoderSetPipeline(render, pipeline); wgpuRenderPassEncoderSetBindGroup(render, 0, group, 0, nullptr);
@@ -1310,7 +1330,7 @@ void resolve_hdr(uint32_t resource, std::span<const uint8_t> bytes) {
     auto view = wgpuTextureCreateView(state.exposure, nullptr);
     auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; attachment.view = view; attachment.loadOp = WGPULoadOp_Clear; attachment.storeOp = WGPUStoreOp_Store; attachment.clearValue = {1, 1, 1, 1};
     auto descriptor_pass = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor_pass.colorAttachmentCount = 1; descriptor_pass.colorAttachments = &attachment;
-    auto render = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor_pass); wgpuRenderPassEncoderEnd(render); wgpuRenderPassEncoderRelease(render);
+    auto render = begin_pass(encoder, &descriptor_pass); wgpuRenderPassEncoderEnd(render); wgpuRenderPassEncoderRelease(render);
     wgpuTextureViewRelease(view);
   }
   if (state.width != scene.width || state.height != scene.height) {
@@ -1395,7 +1415,7 @@ void expand_frame(WGPUCommandEncoder encoder, WGPUTexture canvas, float headroom
   wgpuBindGroupLayoutRelease(group_descriptor.layout);
   auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; attachment.view = output; attachment.loadOp = WGPULoadOp_Clear; attachment.storeOp = WGPUStoreOp_Store; attachment.clearValue = {0, 0, 0, 1};
   auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &attachment;
-  auto render = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+  auto render = begin_pass(encoder, &descriptor);
   wgpuRenderPassEncoderSetPipeline(render, expand_pipeline); wgpuRenderPassEncoderSetBindGroup(render, 0, group, 0, nullptr);
   wgpuRenderPassEncoderDraw(render, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(render); wgpuRenderPassEncoderRelease(render);
   wgpuBindGroupRelease(group); wgpuBufferRelease(uniforms); wgpuTextureViewRelease(frame); wgpuTextureViewRelease(output);
@@ -1641,7 +1661,7 @@ void ambient_occlusion(uint32_t resource, std::span<const uint8_t> bytes) {
     auto attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; attachment.view = output; attachment.resolveTarget = resolve;
     attachment.loadOp = WGPULoadOp_Load; attachment.storeOp = WGPUStoreOp_Store;
     auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &attachment;
-    auto render = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+    auto render = begin_pass(encoder, &descriptor);
     wgpuRenderPassEncoderSetPipeline(render, pipeline); wgpuRenderPassEncoderSetBindGroup(render, 0, group, 0, nullptr);
     wgpuRenderPassEncoderSetScissorRect(render, uint32_t(vp[0]), uint32_t(vp[1]), uint32_t(vp[2]), uint32_t(vp[3]));
     wgpuRenderPassEncoderDraw(render, 3, 1, 0, 0); wgpuRenderPassEncoderEnd(render); wgpuRenderPassEncoderRelease(render);
@@ -1695,7 +1715,7 @@ void clear(uint32_t resource, std::span<const uint8_t> bytes) {
         if (!item) { continue; }
         if (spec.rect_count) { seed(encoder, *item); } else { item->seed = false; }
       }
-      auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+      auto pass = begin_pass(encoder, &descriptor);
       if (spec.rect_count) {
         wgpuRenderPassEncoderSetPipeline(pass, pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
         wgpuRenderPassEncoderSetStencilReference(pass, spec.stencil);
@@ -1849,7 +1869,7 @@ void blit(uint32_t resource, std::span<const uint8_t> bytes) {
     descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &color;
   }
   auto encoder = batch_encoder ? batch_encoder : wgpuDeviceCreateCommandEncoder(device, nullptr);
-  auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+  auto pass = begin_pass(encoder, &descriptor);
   const auto* rect = spec.destination_rect;
   const uint32_t x = uint32_t(rect[0]), y = uint32_t(rect[1]);
   const uint32_t width = std::min(uint32_t(std::ceil(rect[0] + rect[2])), target.width) - x, height = std::min(uint32_t(std::ceil(rect[1] + rect[3])), target.height) - y;
@@ -2009,6 +2029,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_start() {
 #ifdef WEBGPU_SERVICE_TESTING
 EMSCRIPTEN_KEEPALIVE void webgpu_test_loss() { wgpuDeviceDestroy(device); }
 #endif
+EMSCRIPTEN_KEEPALIVE const uint32_t* webgpu_frame_stats() { return presented_stats.data(); }
 EMSCRIPTEN_KEEPALIVE uint32_t webgpu_resources() { return textures.size() + pipelines.size() + resident_buffers.size() + sampler_cache.size() + cached_views + (gamma_texture ? 1 : 0) + (presentation_pipeline ? 1 : 0) + (presentation_linear_pipeline ? 1 : 0) + (presentation_target.handle ? 1 : 0) + (depth_upload_pipeline ? 1 : 0) + (depth_readback_pipeline ? 1 : 0) + std::count_if(partial_clear_pipelines.begin(), partial_clear_pipelines.end(), [](auto pipeline) { return pipeline != nullptr; }); }
 EMSCRIPTEN_KEEPALIVE void webgpu_shutdown() {
   closed = true;
@@ -2058,7 +2079,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       // no pixels: a render target the backend fills itself (a scaled surface), left zero
       const bool empty = spec.depth == 0 && spec.levels == 1 && bytes.empty();
       exact(bytes, spec.depth == 1 || empty ? 0 : storageBytes);
-      if (texture_bytes + storageBytes > TextureBudget) { throw std::runtime_error("GPU texture budget exhausted"); }
+      if (texture_bytes + storageBytes > TextureBudget) { throw budget_exhausted("resource", storageBytes); }
       auto descriptor = WGPU_TEXTURE_DESCRIPTOR_INIT;
       descriptor.dimension = spec.depth == 3 ? WGPUTextureDimension_3D : WGPUTextureDimension_2D;
       descriptor.size = {spec.width, spec.height, spec.depth == 3 ? volumeDepth : faces}; descriptor.mipLevelCount = spec.levels;
@@ -2207,7 +2228,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       depth.depthStoreOp = depth.stencilStoreOp = WGPUStoreOp_Store;
       depth.depthClearValue = 0; depth.stencilClearValue = 0;
       auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.depthStencilAttachment = &depth;
-      auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr); auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+      auto encoder = wgpuDeviceCreateCommandEncoder(device, nullptr); auto pass = begin_pass(encoder, &descriptor);
       wgpuRenderPassEncoderSetPipeline(pass, depth_upload_pipeline); wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
       for (uint32_t n = 0; n < 256; ++n) {
         if (mask[n / 32] & (1u << (n & 31))) {
@@ -2248,7 +2269,7 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
       auto group_descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT; group_descriptor.layout = presentation_bindings; group_descriptor.entryCount = entries.size(); group_descriptor.entries = entries.data(); auto group = wgpuDeviceCreateBindGroup(device, &group_descriptor);
       auto color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT; color.view = target_view; color.loadOp = WGPULoadOp_Clear; color.storeOp = WGPUStoreOp_Store; color.clearValue = {0, 0, 0, 1};
       auto descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT; descriptor.colorAttachmentCount = 1; descriptor.colorAttachments = &color;
-      auto pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+      auto pass = begin_pass(encoder, &descriptor);
       float width = canvas_width, height = canvas_height;
       if (present.pillarbox & PresentPillarbox) { if (width * 3 > height * 4) { width = height * 4 / 3; } else { height = width * 3 / 4; } }
       wgpuRenderPassEncoderSetViewport(pass, (canvas_width - width) / 2, (canvas_height - height) / 2, width, height, 0, 1);
@@ -2264,6 +2285,9 @@ EMSCRIPTEN_KEEPALIVE void webgpu_submit(uint32_t operation, uint32_t resource, c
         if (present_waiting && presents_in_flight <= 1) { present_waiting = false; if (active && device) { finish(); } }
       };
       wgpuQueueOnSubmittedWorkDone(queue, info);
+      frame_stats[StatTextureMiB] = uint32_t(texture_bytes >> 20);
+      frame_stats[StatUploadKiB] = uint32_t(std::exchange(frame_upload_bytes, 0) >> 10);
+      presented_stats = frame_stats; frame_stats = {};
       if (++presents_in_flight > 1) { present_waiting = true; return; }
       break;
     }

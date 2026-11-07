@@ -232,4 +232,5 @@ What C09 built.
 ### Not done
 
 The light_distance and shadows contract tests, the synthetic service test of the penumbra mask, a save at 4x loaded
-at 1x, visual comparison in a scene with visible character shadows, and the perf runs.
+at 1x and visual comparison in a scene with visible character shadows. Perf is measured in C07: 4096, soft and 8x
+at 1080p with every other enhanced feature run at display rate once SoftShadows and ApplyShadows are posted.

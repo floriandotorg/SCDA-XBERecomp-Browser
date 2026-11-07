@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -44,5 +45,15 @@ inline GuestVertexFormat GuestVertex(uint32_t type) {
     return {count == 1 ? 1u : count == 2 ? 2u : 3u, count, vector("u32"), expand(normalize("guest_unorm", 8))};
   }
   return {};
+}
+// the per draw path only needs the formats and sizes: decoded once per D3DVSDT type instead of building WGSL each call
+inline const GuestVertexFormat& GuestVertexLayout(uint32_t type) {
+  static const auto table = [] {
+    std::array<GuestVertexFormat, 256> formats;
+    for (uint32_t n = 0; n < formats.size(); ++n) { formats[n] = GuestVertex(n); }
+    return formats;
+  }();
+  static const GuestVertexFormat unsupported;
+  return type < table.size() ? table[type] : unsupported;
 }
 }

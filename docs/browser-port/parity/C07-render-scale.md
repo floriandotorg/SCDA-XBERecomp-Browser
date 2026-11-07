@@ -248,6 +248,25 @@ What C07 built (phase 1 of the scale rule).
 - Switching to 50% mid-mission resampled to 480 x 360 without a validation error, a fault or a lost picture.
 - Console mode unchanged (853 x 480 canvas, no errors).
 
+### Measured with every enhanced feature (1920x1080, M1 Max)
+
+Match window at 100% (1920 x 1080 targets), MSAA 4x, SMAA, 16x anisotropy, shadows 4096 soft at 8x distance, shader
+model 3.0 with HDR rendering and tone mapping, GTAO; out/perf-60/bench-max.mjs (development start, the harness's
+opening and control windows and a 60 s walk).
+
+- Before: the mission failed after about 77 s with "GPU multisample texture budget exhausted". The scene's 4x HDR
+  companions alone are about 66 MB each; a mission at these settings holds 388 MiB of GPU textures, so the service
+  `TextureBudget` is now 1 GiB and its budget errors name the MiB used and requested.
+- With the budget raised: 17.5 / 22.0 ms mean (opening / control), the 60 s walk 18.8 ms, p95 23, max 39.8 ms. The
+  game thread waited about 3 ms a frame on the GPU worker: `SoftShadows` and `ApplyShadows` were synchronous
+  exchanges, so each frame's shadow filter waited out the frames still in flight.
+- SoftShadows, ApplyShadows, Blit, Multisample and SetGamma are now posted like Occlusion and Resolve, and the per
+  draw host work lost repeated surface lookups, per draw WGSL string building for vertex formats, eagerly built
+  error strings and the draw packet's intermediate copies: 16.1 / 16.4 ms, the walk 16.2 ms, p95 19, p99 23, max
+  27.5 ms (3695 frames in 60 s), the GPU wait 0.15 ms. Default settings at console resolution measure the same.
+- A frame has about 55 to 62 render passes, 14 to 16 of them resolving a 4x companion, and about 14 submits (the
+  presented frame's `frameStats`: passes, resolving passes, seeds, depth resolves, submits, texture MiB, upload KiB).
+
 ### Not done
 
 - `kTexWide` wide sampling (task 10) and `UnitTexcoords`: glow and blur chains sampling an upscaled target take
@@ -255,4 +274,5 @@ What C07 built (phase 1 of the scale rule).
   on small HUD quads.
 - Rendering straight into the surface texture (task 14) and frame capture above 4 MiB (task 15): `capture()` refuses
   canvases larger than 1024 x 1024 pixels' worth of bytes in Match window.
-- The perf harness runs, the 200% and dynamic soak, and the quick save thumbnail check were not run.
+- The 200% and dynamic soak and the quick save thumbnail check were not run; frame capture still refuses a 1080p
+  canvas, so the harness checks pictures with page screenshots.
