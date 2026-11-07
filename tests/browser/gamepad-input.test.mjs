@@ -163,3 +163,29 @@ test('retirement inside the browser poll cannot publish into the retired owner',
   assert.deepEqual([...value.words.slice(1)], [0, 0, 0, 0, 0, 0, 0]);
   assert.equal(value.frames.size, 0);
 });
+
+test('an on-screen pad publishes alone and merges with a physical pad', () => {
+  const value = fixture();
+  let virtual = [];
+  const producer = createGamepadInput({ ...value.options, virtualPads: () => virtual });
+  virtual = [value.pad([0.5, -1, 0, 0], [0])];
+  value.tick();
+  assert.equal(value.words[1], 2, 'a touch screen\'s pad alone is connected as 2: the guest names its buttons');
+  assert.equal(value.words[2], MENU_INPUT.confirm);
+  assert.deepEqual([...value.words.slice(3, 5)], [16384, 32767]);
+  value.setPads([value.pad([-0.25, 0, 0, 0.75], [1, 7])]);
+  value.tick();
+  assert.equal(value.words[1], 1);
+  assert.equal(value.words[2], MENU_INPUT.confirm | MENU_INPUT.back | MENU_INPUT.rightTrigger);
+  assert.deepEqual([...value.words.slice(3, 7)], [16384, 32767, 0, -24575], 'the larger deflection of each axis wins');
+  assert.equal(value.words[7], 1 | 2 | (1 << 7) | (255 << 24));
+  virtual = [];
+  value.setPads([]);
+  value.tick();
+  assert.deepEqual([...value.words.slice(1)], [0, 0, 0, 0, 0, 0, 0]);
+  producer.setActive(false);
+  virtual = [value.pad([1, 0, 0, 0], [0])];
+  value.tick();
+  assert.deepEqual([...value.words.slice(1)], [0, 0, 0, 0, 0, 0, 0], 'an inactive producer ignores the on-screen pad too');
+  producer.dispose();
+});

@@ -8,10 +8,18 @@ const buttons = [MENU_INPUT.confirm, MENU_INPUT.back, MENU_INPUT.x, MENU_INPUT.y
   MENU_INPUT.leftTrigger, MENU_INPUT.rightTrigger, MENU_INPUT.select, MENU_INPUT.start, MENU_INPUT.leftThumb, MENU_INPUT.rightThumb,
   MENU_INPUT.up, MENU_INPUT.down, MENU_INPUT.left, MENU_INPUT.right];
 const axis = value => Number.isFinite(value) ? Math.round(Math.max(-1, Math.min(1, value)) * 32767) : 0;
+const strongest = values => values.reduce((best, value) => Math.abs(value) > Math.abs(best) ? value : best, 0);
+// a physical pad and the on-screen one (touch-controls.mjs) as one standard pad: any press, the deepest trigger, the
+// larger deflection of each axis
+const mergePads = pads => pads.length === 1 ? pads[0] : {
+  buttons: Array.from({ length: 17 }, (_, n) => ({ pressed: pads.some(pad => pad.buttons?.[n]?.pressed),
+    value: Math.max(...pads.map(pad => Number(pad.buttons?.[n]?.value) || 0)) })),
+  axes: [0, 1, 2, 3].map(n => strongest(pads.map(pad => Number.isFinite(pad.axes?.[n]) ? pad.axes[n] : 0))),
+};
 
 export const createGamepadInput = ({ buffer, byteOffset, target = globalThis.window, visibilityTarget = globalThis.document,
   navigator = globalThis.navigator, requestFrame = globalThis.requestAnimationFrame?.bind(globalThis),
-  cancelFrame = globalThis.cancelAnimationFrame?.bind(globalThis), signal } = {}) => {
+  cancelFrame = globalThis.cancelAnimationFrame?.bind(globalThis), virtualPads = () => [], signal } = {}) => {
   if (!(buffer instanceof SharedArrayBuffer) || buffer.growable) { throw new TypeError('Gamepad input requires fixed shared memory.'); }
   if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset % 4 || byteOffset > buffer.byteLength - GAMEPAD_INPUT.bytes) {
     throw new RangeError('Gamepad input span must be aligned and in bounds.');
@@ -47,10 +55,12 @@ export const createGamepadInput = ({ buffer, byteOffset, target = globalThis.win
   const poll = () => {
     if (disposed) { return; }
     frame = undefined;
-    let pad;
+    let pad, hardware;
     if (active && focused && !visibilityTarget.hidden) {
-      try { pad = Array.from(navigator?.getGamepads?.() ?? []).find(value => value?.connected && value.mapping === 'standard'); }
+      try { hardware = Array.from(navigator?.getGamepads?.() ?? []).find(value => value?.connected && value.mapping === 'standard'); }
       catch {}
+      const present = [hardware, ...virtualPads()].filter(Boolean);
+      if (present.length) { pad = mergePads(present); }
     }
     if (disposed) { return; }
     if (pad) {
@@ -65,7 +75,8 @@ export const createGamepadInput = ({ buffer, byteOffset, target = globalThis.win
       }
       const trigger = n => Math.round(Math.max(0, Math.min(1, Number(pad.buttons?.[n]?.value) || (pad.buttons?.[n]?.pressed ? 1 : 0))) * 255);
       physical |= (trigger(6) << 16) | (trigger(7) << 24);
-      publish([1, mask, axis(pad.axes?.[0]), axis(-pad.axes?.[1]), axis(pad.axes?.[2]), axis(-pad.axes?.[3]), physical]);
+      // connected: 1 a physical pad, 2 only a touch screen's on-screen one (input-core.cpp shows the pad's prompts)
+      publish([hardware ? 1 : 2, mask, axis(pad.axes?.[0]), axis(-pad.axes?.[1]), axis(pad.axes?.[2]), axis(-pad.axes?.[3]), physical]);
     } else { neutral(); }
     if (!disposed) { frame = requestFrame(poll); }
   };

@@ -197,3 +197,17 @@ test('worker failure becomes an explicit generation tagged boot failure', async 
   harness.guestMessages[0].port.close();
   harness.ioWorkers[0].messages[1].port.close();
 });
+
+test('a smaller guest thread pool travels in the worker start message, bounded', async () => {
+  const harness = fixture(true, { pthreadPool: 64 });
+  await harness.runtime.start(harness.context);
+  assert.equal(harness.guestMessages[0].pthreadPool, 64);
+  await harness.runtime.terminateAll();
+  const plain = fixture(true);
+  await plain.runtime.start(plain.context);
+  assert.equal(Object.hasOwn(plain.guestMessages[0], 'pthreadPool'), false);
+  await plain.runtime.terminateAll();
+  for (const pthreadPool of [0, 31, 130, 64.5, '64']) {
+    assert.throws(() => createBootRuntime({ WorkerClass: EventTarget, pthreadPool }), /thread pool/);
+  }
+});

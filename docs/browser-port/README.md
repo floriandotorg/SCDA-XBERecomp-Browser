@@ -27,7 +27,7 @@ Excluded:
 * Co op, split screen, Versus, LAN, online sessions, voice and Xbox Live.
 * Browser compilation of C++ on the player's device.
 * Streaming the Windows executable from another machine.
-* Mobile, touch controls, every browser and every GPU at the first release.
+* Every browser and every GPU at the first release. Phones and tablets run the same page with touch controls; see [Phones and tablets](mobile.md).
 * HDR output, enhanced shader model effects, ambient occlusion, SMAA and desktop display management unless later justified.
 * Distribution of game assets or generated game code without a separate rights review.
 

@@ -165,20 +165,20 @@ int main() {
       image.memory->Write(ctx, list + 0x9c, &selection, 2);
       expected = ctx;
     };
-    for (int16_t selection : {0, 2, 3, 4, -1}) {
+    for (int16_t selection : {0, 3, 4, -1}) {
       prepare(selection);
       sub_0018697A(ctx, base);
       check(ctx.eax == 0x76543210 && ctx.esp == stack + 8, "original dispatch ABI");
     }
-    check(originalCalls == 5, "Solo/Versus/Credits/other did not delegate");
-    for (int16_t selection : {1, 1, 1}) {
+    check(originalCalls == 4, "Solo/Credits/other did not delegate");
+    for (int16_t selection : {1, 2, 1}) {
       prepare(selection);
       sub_0018697A(ctx, base);
       auto handled = expected;
       handled.eax = 1;
       handled.esp += 8;
       check(std::memcmp(&ctx, &handled, sizeof(ctx)) == 0, "rejection did not preserve context and ret4 handled ABI");
-      check(originalCalls == 5, "unsupported route reached original");
+      check(originalCalls == 4, "unsupported route reached original");
       check(uint32_t(X86_MEM32(ctx.esp - 8)) == 0x12345 && uint32_t(X86_MEM32(ctx.esp - 4)) == element, "rejection changed caller frame");
       const auto snapshot = route->Snapshot();
       check(snapshot.lastSelection == uint32_t(selection), "diagnostic selection lost");
@@ -188,23 +188,23 @@ int main() {
     const auto previousElements = elementCalls;
     prepare(2);
     sub_0018697A(ctx, base);
-    check(elementCalls == previousElements && originalCalls == 6, "other page was classified");
+    check(elementCalls == previousElements && originalCalls == 5, "other page was classified");
     activePage = 1;
     activeElement = 0;
     const auto previousLists = listCalls;
     prepare(2);
     sub_0018697A(ctx, base);
-    check(listCalls == previousLists && originalCalls == 7, "other element was classified");
+    check(listCalls == previousLists && originalCalls == 6, "other element was classified");
     activeElement = 1;
     foundList = 0;
     prepare(2);
     sub_0018697A(ctx, base);
-    check(originalCalls == 8, "missing list did not delegate");
+    check(originalCalls == 7, "missing list did not delegate");
     foundList = list;
     const auto expectFault = [&] {
       bool caught = false;
       try { sub_0018697A(ctx, base); } catch (const browser::Fault&) { caught = true; }
-      check(caught && originalCalls == 8, "malformed route delegated");
+      check(caught && originalCalls == 7, "malformed route delegated");
     };
     prepare(2); ctx.esp = 0xfffffffc; expectFault();
     prepare(2); ctx.esp = 4; expectFault();
@@ -413,10 +413,10 @@ int main() {
     cancelHelper = true;
     bool cancelled = false;
     try { sub_0018697A(ctx, base); } catch (const browser::Cancelled&) { cancelled = true; }
-    check(cancelled && originalCalls == 8 && route->Snapshot().rejectedAttempts == 3, "cancelled route dispatched or recorded rejection");
+    check(cancelled && originalCalls == 7 && route->Snapshot().rejectedAttempts == 3, "cancelled route dispatched or recorded rejection");
     check(std::memcmp(&ctx, &expected, sizeof(ctx)) == 0, "cancelled helper leaked context changes");
   });
   if (const auto failure = runtime.Join()) { std::rethrow_exception(failure); }
-  check(pageCalls == 14, "unexpected helper dispatch count");
+  check(pageCalls == 13, "unexpected helper dispatch count");
   std::puts("menu-route-contracts-ok");
 }

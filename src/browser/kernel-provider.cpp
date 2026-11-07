@@ -3,9 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <vector>
-#include <cstdio>
-#include <string>
 
 namespace browser {
 namespace {
@@ -562,92 +559,12 @@ void InvokeCriticalSection(Runtime& runtime, Memory& memory, X86Context& ctx, ui
 
 }
 
-// Exceptions dispatch like NT on x86, as native's xboxkrnl.cpp: each handler of the fs:[0] chain is called (record,
-// frame, context, dispatcher context) until one returns ExceptionContinueExecution. A C++ catch never returns: the CRT
-// jumps to its continuation, which unwinds the host stack (X86Resume). An exception no handler takes stops the session
-// with what was thrown (an Unreal appThrowf throws its TCHAR text).
-constexpr uint32_t kContextBytes = 0x400, kUnwinding = 2, kExitUnwind = 4, kContinueExecution = 0;
-
-uint32_t CallHandler(Runtime& runtime, Memory& memory, X86Context& ctx, uint8_t* base, uint32_t record, uint32_t frame, uint32_t scratch) {
-  uint32_t handler = 0;
-  memory.Read(ctx, frame + 4, &handler, 4);
-  return runtime.Call(ctx, base, handler, {record, frame, scratch, scratch + kContextBytes - 8});
-}
-uint32_t Word(Memory& memory, const X86Context& ctx, uint32_t address) {
-  uint32_t value = 0;
-  memory.Read(ctx, address, &value, 4);
-  return value;
-}
-void ClearScratch(Memory& memory, const X86Context& ctx, uint32_t address, uint32_t bytes) {
-  const std::vector<uint8_t> zero(bytes);
-  memory.Write(ctx, address, zero.data(), zero.size());
-}
-
-void InvokeRaiseException(Runtime& runtime, Memory& memory, X86Context& ctx, uint8_t* base) {
-  const uint32_t ret = Word(memory, ctx, ctx.esp), record = Word(memory, ctx, ctx.esp + 4);
-  const uint32_t esp = ctx.esp;
-  ctx.esp = (ctx.esp - kContextBytes) & ~15u;
-  const uint32_t scratch = ctx.esp;
-  ClearScratch(memory, ctx, scratch, kContextBytes);
-  for (uint32_t frame = Word(memory, ctx, ctx.fs_base); frame && frame != 0xffffffff; frame = Word(memory, ctx, frame)) {
-    if (CallHandler(runtime, memory, ctx, base, record, frame, scratch) == kContinueExecution) {
-      ctx.esp = esp + 8;
-      ctx.eax = 0;
-      return;
-    }
-  }
-  ctx.esp = esp;
-  std::array<uint32_t, 8> words{};
-  memory.Read(ctx, record, words.data(), sizeof(words));
-  std::string text;
-  try {
-    if (words[0] == 0xe06d7363 && words[4] >= 2 && words[6]) {
-      for (uint32_t pointer = Word(memory, ctx, words[6]), n = 0; pointer && n < 160; ++n, pointer += 2) {
-        uint16_t value = 0;
-        memory.Read(ctx, pointer, &value, 2);
-        if (!value) { break; }
-        text.push_back(value < 0x80 ? char(value) : '?');
-      }
-    }
-  } catch (const Fault&) {}
-  char code[64];
-  std::snprintf(code, sizeof(code), "guest raised exception %08X at %08X", words[0], words[3]);
-  throw Fault(ctx, ret, 0, text.empty() ? code : (std::string(code) + ": " + text).c_str());
-}
-
-// RtlUnwind(target frame, target ip, record, return value): the handlers of the frames above the target run with the
-// unwinding flag (destructors), each frame leaving the chain after its handler
-void InvokeUnwind(Runtime& runtime, Memory& memory, X86Context& ctx, uint8_t* base) {
-  std::array<uint32_t, 5> frame{};
-  memory.Read(ctx, ctx.esp, frame.data(), sizeof(frame));
-  const uint32_t target = frame[1];
-  uint32_t record = frame[3];
-  const uint32_t esp = ctx.esp;
-  ctx.esp = (ctx.esp - kContextBytes - 0x60) & ~15u;
-  const uint32_t scratch = ctx.esp;
-  ClearScratch(memory, ctx, scratch, kContextBytes + 0x60);
-  if (!record) {
-    record = scratch + kContextBytes;
-    const uint32_t status = 0xc0000027;
-    memory.Write(ctx, record, &status, 4);
-  }
-  const uint32_t flags = Word(memory, ctx, record + 4) | kUnwinding | (target ? 0 : kExitUnwind);
-  memory.Write(ctx, record + 4, &flags, 4);
-  for (uint32_t current = Word(memory, ctx, ctx.fs_base); current && current != 0xffffffff && current != target; current = Word(memory, ctx, ctx.fs_base)) {
-    CallHandler(runtime, memory, ctx, base, record, current, scratch);
-    const uint32_t next = Word(memory, ctx, current);
-    memory.Write(ctx, ctx.fs_base, &next, 4);
-  }
-  ctx.esp = esp + 20;
-  ctx.eax = frame[4];
-}
-
 void InstallKernelProvider(Runtime& runtime, Memory& memory, std::function<uint32_t()> language) {
   if (runtime.ActiveWorkers()) { throw Fault({}, 0, 0, "kernel provider installation requires a stopped runtime"); }
   runtime.Checkpoint({});
   auto pool = std::make_shared<GuestPool>(memory);
   const std::array<uint32_t, 3> settings = {1, KernelVideoFlags, 0};
-  for (const uint32_t ordinal : {2u, 15u, 17u, 23u, 24u, 37u, 126u, 128u, 129u, 160u, 161u, 252u, 253u, 277u, 291u, 294u, 301u, 302u, 312u, 335u, 336u, 337u, 338u, 339u, 340u, 346u}) {
+  for (const uint32_t ordinal : {2u, 15u, 17u, 23u, 24u, 37u, 126u, 128u, 129u, 160u, 161u, 252u, 253u, 277u, 291u, 294u, 301u, 335u, 336u, 337u, 338u, 339u, 340u, 346u}) {
     runtime.RegisterKernel(ordinal, [&runtime, &memory, ordinal, pool, settings, language](X86Context& ctx, uint8_t* base) {
       if (&Runtime::From(ctx) != &runtime || base != memory.Base()) { throw Fault(ctx, ordinal, 0, "kernel provider session mismatch"); }
       if (ordinal == 2) { InvokeDiagnosticVirtualDisplayQuery(runtime, memory, ctx); }
@@ -664,8 +581,6 @@ void InstallKernelProvider(Runtime& runtime, Memory& memory, std::function<uint3
       else if (ordinal == 252) { InvokeOfflineLinkState(runtime, memory, ctx); }
       else if (ordinal == 253) { InvokeOfflinePhyInitialization(runtime, memory, ctx); }
       else if (ordinal == 301) { InvokeStatusTranslation(runtime, memory, ctx); }
-      else if (ordinal == 302) { InvokeRaiseException(runtime, memory, ctx, base); }
-      else if (ordinal == 312) { InvokeUnwind(runtime, memory, ctx, base); }
       else if (ordinal == 335 || ordinal == 336 || ordinal == 337) { InvokeSha(runtime, memory, ctx, ordinal); }
       else if (ordinal == 338) { InvokeRc4Key(runtime, memory, ctx); }
       else if (ordinal == 339) { InvokeRc4Crypt(runtime, memory, ctx); }

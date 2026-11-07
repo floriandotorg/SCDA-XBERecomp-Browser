@@ -1,8 +1,5 @@
 #include "browser/push-state.h"
-#include <array>
-#include <atomic>
 #include <bit>
-#include <cstdio>
 #include <memory>
 #include <vector>
 
@@ -27,9 +24,7 @@ const auto rawStateMethod = [](uint32_t method) {
     method == 0x17f8 || method == 0x194c || method == 0x1950 || method == 0x195c || method == 0x1960 ||
     method == 0x1d78 || method == 0x1d7c || method == 0x1d8c || method == 0x1d90 ||
     method == 0x1d98 || method == 0x1d9c || inRange(method, 0x1e20, 0x1e24) ||
-    inRange(method, 0x1e40, 0x1e60) || method == 0x1e6c || inRange(method, 0x1e70, 0x1e78) ||
-    // versus's fixed function state: texture matrix enables, point size, the matrices and texgen, and the lights
-    inRange(method, 0x3a8, 0x3bc) || inRange(method, 0x420, 0x9fc) || inRange(method, 0x1000, 0x13fc);
+    inRange(method, 0x1e40, 0x1e60) || method == 0x1e6c || inRange(method, 0x1e70, 0x1e78);
 };
 
 struct Journal {
@@ -82,12 +77,7 @@ PushStateStatus applyMethod(gpu::State& state, Journal& journal, uint32_t method
     const uint32_t stage = (method - 0x1b00) / 64;
     const uint32_t offset = (method - 0x1b00) % 64;
     if (offset == 0x0c) {
-#ifndef BROWSER_VERSUS
       if (value != 0) { return PushStateStatus::UnsupportedMethod; }
-#endif
-    } else if (offset == 0x08 || offset == 0x10 || offset == 0x14 || offset == 0x1c) {
-      // versus pushes a stage's addressing, control, filter and rectangle itself; the D3D state the backend reads
-      // keeps the stage's own values
     } else if (offset == 0x24) {
       journal.Set(state.tss[stage][gpu::kTssBorderColor], value);
     } else if (inRange(offset, 0x28, 0x3c)) {
@@ -105,15 +95,6 @@ PushStateStatus applyMethod(gpu::State& state, Journal& journal, uint32_t method
     journal.Set(state.simple[method / 4], value);
     return PushStateStatus::StateOnly;
   }
-#ifdef BROWSER_VERSUS
-  // versus pushes more of its state itself; a state method the story never used is kept and named once
-  {
-    static std::array<std::atomic<bool>, 0x800> named{};
-    if (!named[method / 4].exchange(true)) { std::fprintf(stderr, "[game] versus push state method %04X = %08X\n", method, value); }
-    journal.Set(state.simple[method / 4], value);
-    return PushStateStatus::StateOnly;
-  }
-#endif
   return PushStateStatus::UnsupportedMethod;
 }
 

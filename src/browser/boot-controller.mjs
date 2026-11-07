@@ -63,7 +63,7 @@ export const createBootController = ({
       }
       const final = poisoned ?? result;
       active = undefined;
-      publish({ phase: final.phase, stopping: false, code: final.code, message: final.message, diagnostic: final.diagnostic, next: final.next });
+      publish({ phase: final.phase, stopping: false, code: final.code, message: final.message, diagnostic: final.diagnostic });
       session.finish(final);
     });
     return cleanup;
@@ -81,8 +81,7 @@ export const createBootController = ({
     publish({ phase: selected ? 'selected' : 'selection', stopping: false, code: undefined, message: undefined, diagnostic: undefined });
     return state;
   };
-  // options reach createRuntime: the image to boot and the hand over from the one before (an image switch)
-  const start = async (options = {}) => {
+  const start = async () => {
     const request = ++intent;
     await retire(cancelled());
     if (request !== intent) { return cancelled(); }
@@ -110,7 +109,7 @@ export const createBootController = ({
       lastProgress: undefined, execution: 0, ioBytes: 0 };
     Atomics.store(ownership, 0, session.generation);
     active = session;
-    publish({ phase: 'validating', stopping: false, code: undefined, message: undefined, diagnostic: undefined, next: undefined, generation: session.generation });
+    publish({ phase: 'validating', stopping: false, code: undefined, message: undefined, diagnostic: undefined, generation: session.generation });
     session.timer = setTimer(() => {
       if (active === session && !session.retired) {
         void retire(outcome('WATCHDOG', 'Independent boot watchdog expired.'));
@@ -136,11 +135,8 @@ export const createBootController = ({
     session.observer = setTimer(observe, 250);
     const report = (message) => {
       if (active !== session || session.retired || message?.generation !== session.generation) { return; }
-      if (message.ok === false && message.code === 'IMAGE_SWITCH' && ['story', 'versus'].includes(message.image) && message.carry instanceof Uint8Array) {
-        void retire({ ...outcome('IMAGE_SWITCH', message.message, 'switching'), next: { image: message.image, carry: message.carry } });
-      } else if (message.ok === false) {
-        void retire(outcome(message.code ?? 'BOOT', message.message ?? 'Guest boot failed.', ['CANCELLED', 'GRAPHICS_CHECKPOINT', 'SINGLE_PLAYER_LAUNCH_REQUEST'].includes(message.code) ? 'stopped' : 'error',
-          guestDiagnostic(message) ?? (message.code === 'WASM_ABORT' && message.wasmDiagnostics ? Object.freeze({ wasmDiagnostics: message.wasmDiagnostics }) : undefined)));
+      if (message.ok === false) {
+        void retire(outcome(message.code ?? 'BOOT', message.message ?? 'Guest boot failed.', ['CANCELLED', 'GRAPHICS_CHECKPOINT', 'SINGLE_PLAYER_LAUNCH_REQUEST'].includes(message.code) ? 'stopped' : 'error', guestDiagnostic(message)));
       } else if (message.phase === 'booting' && state.phase === 'validating') {
         publish({ phase: 'booting' });
       } else if (message.phase === 'running' && state.phase === 'booting') {
@@ -158,7 +154,7 @@ export const createBootController = ({
         if (typeof createRuntime !== 'function') {
           throw Object.assign(new Error('Complete Emscripten worker tree teardown adapter is unavailable.'), { code: 'LIFECYCLE_UNAVAILABLE' });
         }
-        session.runtime = createRuntime(options);
+        session.runtime = createRuntime();
         if (!session.runtime || ['start', 'cancelIo', 'terminateAll', 'sampleProgress'].some((method) => typeof session.runtime[method] !== 'function')) {
           poisoned = outcome('TEARDOWN', 'Runtime adapter does not provide complete worker and I/O teardown. Reload before booting again.');
           throw Object.assign(new Error(poisoned.message), { code: poisoned.code });

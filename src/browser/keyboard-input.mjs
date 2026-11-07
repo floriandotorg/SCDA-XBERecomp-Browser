@@ -153,6 +153,25 @@ export const createKeyboardInput = ({ buffer, byteOffset, target = globalThis.wi
     if (notches < 0) { Atomics.add(words, K.wheelDown, -notches); }
     if (notches) { bump(); }
   };
+  // touch-controls.mjs: a finger on the picture is a menu click at the finger, a drag moves a dragged map. The guest
+  // reads the cursor and clicks directly; no button or change count, so it keeps the pad's prompts.
+  let touchAt;
+  const touch = (phase, clientX, clientY) => {
+    if (phase !== 'down' && !touchAt) { return; }
+    if (phase === 'down' && !available()) { return; }
+    cursor({ clientX, clientY });
+    if (phase === 'move' && (flags() & K.mapDragFlag)) {
+      accumulate(K.mouseX, clientX - touchAt.x);
+      accumulate(K.mouseY, clientY - touchAt.y);
+    }
+    touchAt = { x: clientX, y: clientY };
+    if (phase === 'down') {
+      Atomics.store(words, K.pressing, pointing() ? 1 : 0);
+    } else if (phase === 'up' || phase === 'cancel') {
+      touchAt = undefined;
+      if (Atomics.exchange(words, K.pressing, 0) && phase === 'up' && available() && pointing()) { Atomics.add(words, K.clicks, 1); }
+    }
+  };
   const suppress = event => { if (event.target === canvas()) { event.preventDefault(); } };
   const lockChange = () => {
     if (locked()) { released = false; return; }
@@ -217,6 +236,15 @@ export const createKeyboardInput = ({ buffer, byteOffset, target = globalThis.wi
       if (panel !== undefined) { Atomics.store(words, K.hostPanel, panel ? 1 : 0); }
       if (open !== undefined) { Atomics.store(words, K.hostConsole, open ? 1 : 0); }
     },
+    // a touch drag's look: mouse movement that leaves the change count alone, so the guest keeps the pad's prompts
+    look: (dx, dy) => {
+      if (!available()) { return; }
+      accumulate(K.mouseX, dx);
+      accumulate(K.mouseY, dy);
+    },
+    touch,
+    type: text => { if (available() && (flags() & K.textFlag)) { typed(String(text)); } },
+    flags,
     pointerFree: () => pointing() && !(flags() & K.mapDragFlag),
     snapshot: () => ({ active: Atomics.load(words, K.active), flags: flags(), changes: Atomics.load(words, K.change),
       clicks: Atomics.load(words, K.clicks), focused, enabled }),

@@ -23,7 +23,6 @@ BROWSER_AUDIO_ABSENT_PLACEHOLDERS
     } \
   }
 BROWSER_AUDIO_ENTRIES(BROWSER_AUDIO_WRAPPER)
-BROWSER_AUDIO_EXTRA_ENTRIES(BROWSER_AUDIO_WRAPPER)
 
 namespace browser {
 namespace {
@@ -56,15 +55,14 @@ struct EntryInfo {
   uint32_t address;
   uint32_t arguments;
   const char* name;
-  bool present;  // the image links it; an absent one sits at a placeholder address
 };
 
-#define BROWSER_AUDIO_INFO(name, id, args) { BROWSER_AUDIO_ADDRESS(name), args, #name, HAS_##name == 1 },
-constexpr EntryInfo kEntries[] = { BROWSER_AUDIO_ENTRIES(BROWSER_AUDIO_INFO) BROWSER_AUDIO_EXTRA_ENTRIES(BROWSER_AUDIO_INFO) };
-static_assert(std::size(kEntries) == BROWSER_AUDIO_ENTRY_COUNT + BROWSER_AUDIO_EXTRA_LAST_ID - BROWSER_AUDIO_EXTRA_FIRST_ID + 1);
+#define BROWSER_AUDIO_INFO(name, id, args) { BROWSER_AUDIO_ADDRESS(name), args, #name },
+constexpr EntryInfo kEntries[] = { BROWSER_AUDIO_ENTRIES(BROWSER_AUDIO_INFO) };
+static_assert(std::size(kEntries) == BROWSER_AUDIO_ENTRY_COUNT);
 
 const EntryInfo& InfoFor(uint32_t id) {
-  return id >= BROWSER_AUDIO_EXTRA_FIRST_ID ? kEntries[BROWSER_AUDIO_ENTRY_COUNT + id - BROWSER_AUDIO_EXTRA_FIRST_ID] : kEntries[id - BROWSER_AUDIO_FIRST_ID];
+  return kEntries[id - BROWSER_AUDIO_FIRST_ID];
 }
 
 }
@@ -79,17 +77,16 @@ AudioProvider::AudioProvider(Runtime& runtime, PreparedImage& image, std::shared
     throw Fault({}, 0, 0, "audio provider requires its cold owned generated image and sink");
   }
   for (const EntryInfo& entry : kEntries) {
-    if (entry.present && runtime_.Find(entry.address) == nullptr) {
+    if (runtime_.Find(entry.address) == nullptr) {
       throw Fault({}, entry.address, 0, "audio provider requires its mapped generated entry");
     }
   }
 #define BROWSER_AUDIO_CHECK_STRONG(name, id, args) \
-  if (HAS_##name == 1 && (runtime_.Find(BROWSER_AUDIO_ADDRESS(name)) != BROWSER_AUDIO_GUEST(name) || \
-      BROWSER_AUDIO_GUEST(name) == BROWSER_AUDIO_ORIGINAL(name))) { \
+  if (runtime_.Find(BROWSER_AUDIO_ADDRESS(name)) != BROWSER_AUDIO_GUEST(name) || \
+      BROWSER_AUDIO_GUEST(name) == BROWSER_AUDIO_ORIGINAL(name)) { \
     throw Fault({}, BROWSER_AUDIO_ADDRESS(name), 0, "audio provider requires its actual strong entry binding"); \
   }
   BROWSER_AUDIO_ENTRIES(BROWSER_AUDIO_CHECK_STRONG)
-  BROWSER_AUDIO_EXTRA_ENTRIES(BROWSER_AUDIO_CHECK_STRONG)
   ValidateVtable(BROWSER_AUDIO_ADDRESS(DSound_StreamVtable));
   ValidateVtable(BROWSER_AUDIO_ADDRESS(DSound_StreamVtable2));
   if (memory_->CommittedPages(kArenaBase, kArenaCapacity) || memory_->QueryPages(kArenaBase).mapped ||
@@ -947,17 +944,6 @@ uint32_t AudioProvider::Handle(const X86Context& ctx, uint32_t id, uint64_t now,
     flushVoice(args[0], *voice, completions);
     return 0;
   }
-  // versus's CDirectSoundStream_SetFormat: native flushes and takes the new format; the browser voice keeps the
-  // format it was created with, so the stream is flushed only
-  case 137: {
-    auto [state, voice] = voiceArgs(true);
-    if (!state) { return audio::kGuestErrorFail; }
-    std::vector<audio::Completion> completions;
-    voice->Flush(completions);
-    flushVoice(args[0], *voice, completions);
-    return 0;
-  }
-  case 138: return 0;
   case 84: {
     auto [state, voice] = voiceArgs(true);
     if (!state) { return audio::kGuestErrorFail; }
@@ -1039,7 +1025,7 @@ uint32_t AudioProvider::Handle(const X86Context& ctx, uint32_t id, uint64_t now,
 }
 
 bool AudioProvider::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
-  if (id < BROWSER_AUDIO_FIRST_ID || (id > BROWSER_AUDIO_LAST_ID && (id < BROWSER_AUDIO_EXTRA_FIRST_ID || id > BROWSER_AUDIO_EXTRA_LAST_ID))) {
+  if (id < BROWSER_AUDIO_FIRST_ID || id > BROWSER_AUDIO_LAST_ID) {
     throw Fault(ctx, ctx.esp, 0, "audio dispatch outside its id range");
   }
   Require(ctx, base);

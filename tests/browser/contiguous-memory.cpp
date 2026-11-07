@@ -102,7 +102,7 @@ int main() {
         runtime.Invoke(current, memory.Base(), runtime.KernelTarget(ordinal));
         result = current;
       });
-      check(result.esp == context.esp + (ordinal == 166 ? 24 : ordinal == 178 ? 16 : ordinal == 167 || ordinal == 172 ? 12 : 8) &&
+      check(result.esp == context.esp + (ordinal == 166 ? 24 : ordinal == 178 ? 16 : 8) &&
         result.ebx == context.ebx && result.cf == context.cf, "extended allocation ABI changed guest state");
       std::array<uint32_t, 6> after{};
       memory.Read({}, context.esp, after.data(), sizeof(after));
@@ -134,10 +134,6 @@ int main() {
     check(snapshot().empty() && invoke(165, {0xfffffff0, 1, 0, 0, 0, 0}) == first, "shared free or reuse failed");
     release(0x80101000);
     check(allocate(1, 0x100000, 0x101fff, 0) == 0x80101000, "fragmented first fit failed");
-    const uint32_t held = pages();
-    const uint32_t system = invoke(167, {0xfffffff0, 0x1800, 4, 0, 0, 0});
-    check(system && system % 0x1000 == 0 && pages() == held + 2, "system memory is not page aligned contiguous memory");
-    check(invoke(172, {0xfffffff0, system, 0x1800, 0, 0, 0}) == 0x1800 && pages() == held, "system memory free did not return its size or release it");
     owned(runtime, memory, context, [&](X86Context& current) {
       auto lease = memory.Borrow();
       fault([&] { runtime.Invoke(current, memory.Base(), runtime.KernelTarget(166)); });

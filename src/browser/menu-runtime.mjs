@@ -27,7 +27,7 @@ const waitReady = async (ready, signal, timeoutMs) => {
 };
 
 export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRuntime, createGPU = startGPUWorker,
-  gamepad = true, createGamepad = createGamepadInput, createInput = createMenuInput, createKeyboard = createKeyboardInput, createMotion = createMissionControls, createAudio = createBrowserAudio, onPresented = () => {}, onAdapter = () => {}, onDiagnostic = () => {},
+  gamepad = true, virtualPads, createGamepad = createGamepadInput, createInput = createMenuInput, createKeyboard = createKeyboardInput, createMotion = createMissionControls, createAudio = createBrowserAudio, onPresented = () => {}, onAdapter = () => {}, onDiagnostic = () => {},
   onKeyboard = () => {}, onHostMessage, onHostMessages = () => {}, hostComputed = () => ({}), onHostSettings = () => {},
   readyTimeoutMs = 20000, settings, ...runtimeOptions } = {}) => {
   if (typeof acquireCanvas !== 'function') { throw new TypeError('A fresh owned canvas is required for each menu runtime.'); }
@@ -142,7 +142,7 @@ export const createMenuRuntime = ({ acquireCanvas, createRuntime = createBootRun
           try {
             if (producer || data.words !== 2) { throw new Error('Unexpected menu input storage publication.'); }
             if (gamepad && !data.gamepadOffset) { throw new Error('Missing shared gamepad input storage.'); }
-            if (gamepad) { controller = createGamepad({ buffer: data.buffer, byteOffset: data.gamepadOffset, signal }); }
+            if (gamepad) { controller = createGamepad({ buffer: data.buffer, byteOffset: data.gamepadOffset, signal, ...(virtualPads ? { virtualPads } : {}) }); }
             producer = data.keyboardOffset ? createKeyboard({ buffer: data.buffer, byteOffset: data.keyboardOffset, signal }) :
               createInput({ buffer: data.buffer, byteOffset: data.byteOffset, signal });
             if (data.keyboardOffset) { onKeyboard(producer); }

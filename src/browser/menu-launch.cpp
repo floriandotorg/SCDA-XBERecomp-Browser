@@ -99,8 +99,15 @@ bool MenuLaunch::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
         request.path.push_back(value);
       }
     }
-    request.image = LaunchImage(request.path);
-    if (!request.image) {
+    std::string lower = request.path;
+    for (char& value : lower) {
+      if (value >= 'A' && value <= 'Z') { value = char(value + ('a' - 'A')); }
+    }
+    constexpr std::string_view executable = "default.xbe";
+    const size_t offset = lower.size() >= executable.size() ? lower.size() - executable.size() : std::string::npos;
+    const bool supported = offset != std::string::npos && lower.compare(offset, executable.size(), executable) == 0 &&
+      (offset == 0 || lower[offset - 1] == '\\' || lower[offset - 1] == ';');
+    if (!supported) {
       ctx.eax = 2;
       ctx.esp += 12;
       return false;
@@ -113,18 +120,6 @@ bool MenuLaunch::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
   runtime_.Checkpoint(ctx);
   if (originalLaunch_) { return true; }
   throw request;
-}
-
-int LaunchImage(std::string_view path) {
-  std::string lower(path);
-  for (char& value : lower) {
-    if (value >= 'A' && value <= 'Z') { value = char(value + ('a' - 'A')); }
-  }
-  for (const auto& [executable, image] : {std::pair<std::string_view, int>{"default.xbe", kStoryImage}, {"sc4_adv.xbe", kVersusImage}}) {
-    if (lower.ends_with(executable) && (lower.size() == executable.size() || lower[lower.size() - executable.size() - 1] == '\\' ||
-        lower[lower.size() - executable.size() - 1] == ';')) { return image; }
-  }
-  return 0;
 }
 
 void MenuLaunch::InstallFirmware(uint32_t launchCell) {
@@ -157,8 +152,13 @@ void MenuLaunch::InstallFirmware(uint32_t launchCell) {
         if (value < 32 || value > 126 || n == 527) { throw Fault(ctx, address + 8, 520, "invalid firmware image path"); }
         request.path.push_back(char(value));
       }
-      request.image = LaunchImage(request.path);
-      if (!request.image) {
+      auto lower = request.path;
+      for (char& value : lower) {
+        if (value >= 'A' && value <= 'Z') { value = char(value + ('a' - 'A')); }
+      }
+      constexpr std::string_view executable = "default.xbe";
+      if (!lower.ends_with(executable) || (lower.size() > executable.size() &&
+          lower[lower.size() - executable.size() - 1] != '\\' && lower[lower.size() - executable.size() - 1] != ';')) {
         throw Fault(ctx, address + 8, 520, "unsupported firmware executable; return to the single player shell");
       }
       request.hasData = true;

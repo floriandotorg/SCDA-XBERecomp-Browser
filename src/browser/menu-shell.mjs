@@ -10,6 +10,7 @@ import { createWheelAccumulator } from './keyboard-input.mjs';
 import { frameShape } from './frame-shape.mjs';
 import { applyHostMessage, HOST_MESSAGES } from './host-messages.mjs';
 import { createConsoleModel, routeHostMessage } from './console-model.mjs';
+import { createTouchControls } from './touch-controls.mjs';
 
 const onOff = Object.freeze({ true: 'On', false: 'Off' });
 // the render size a scale gives in Match window: the frame's 640 x 480 times the window's device rows over 480
@@ -65,6 +66,14 @@ const TABS = Object.freeze([
     ...PAD_ACTIONS.filter(action => !action.hidden).map(action => ({ padBind: action.id, label: sentence(action.label) })),
     { reset: 'padButtons', label: 'Restore defaults' },
   ] },
+  { id: 'touch', label: 'Touch', rows: [
+    { setting: 'touchControls', label: 'On-screen controls', values: { auto: 'Automatic', on: 'On', off: 'Off' } },
+    { setting: 'touchOpacity', label: 'Opacity', format: value => `${value}%` },
+    { setting: 'touchSize', label: 'Size', format: value => `${value}%` },
+    { setting: 'touchLook', label: 'Look sensitivity', format: value => value.toFixed(1) },
+    { setting: 'touchHaptics', label: 'Vibration' },
+    { setting: 'touchFullscreen', label: 'Full screen on touch' },
+  ] },
   { id: 'game', label: 'Game', rows: [
     { setting: 'language', label: 'Language', restart: true, values: { auto: 'Automatic', int: 'English', fra: 'Français', deu: 'Deutsch', ita: 'Italiano', esp: 'Español' } },
     { setting: 'skipIntros', label: 'Skip intros' },
@@ -72,7 +81,6 @@ const TABS = Object.freeze([
   ] },
   { id: 'developer', label: 'Developer', rows: [
     { setting: 'developmentStart', label: 'Skip to first mission' },
-    { setting: 'startInVersus', label: 'Start in Versus' },
     { setting: 'showFps', label: 'Frame rate' },
     { setting: 'showDiagnostics', label: 'Diagnostics' },
     { setting: 'console', label: 'Console' },
@@ -112,10 +120,26 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const stage = find('#stage'), input = find('#iso'), boot = find('#boot');
   const detail = find('#detail'), diagnostic = find('#gpu'), fps = find('#fps'), gear = find('#gear');
   const front = find('#front'), mainMenu = find('#main-menu'), loadingLayer = find('#loading'), errorLayer = find('#error');
-  const loadingText = loadingLayer.querySelector('p'), loadingDefault = loadingText?.textContent ?? 'Loading';
   const pauseLayer = find('#pause'), settingsLayer = find('#settings'), consoleLayer = find('#console');
   const consoleLog = consoleLayer.querySelector('.log'), consoleLine = consoleLayer.querySelector('.line');
   const tabList = settingsLayer.querySelector('.tabs'), rowList = settingsLayer.querySelector('.rows');
+  const touch = createTouchControls({ root, window, container: find('#touch'), settings, onMenu: () => { setPanel('pause'); } });
+  // phones and tablets: any file in the picker (it cannot always tell an ISO by type, validation checks the image) and
+  // a guest thread pool of 64 workers, still twice the mission's peak of about 25, not 129 at about 8 MB each
+  const touchDevice = Boolean(window.matchMedia?.('(any-pointer: coarse)')?.matches) || (window.navigator?.maxTouchPoints ?? 0) > 1;
+  if (touchDevice) { input.removeAttribute('accept'); }
+  // iOS plays page audio with the ringer switch on silent only as a playback session
+  try { if (window.navigator?.audioSession) { window.navigator.audioSession.type = 'playback'; } } catch {}
+  let wakeLock;
+  const keepAwake = async () => {
+    if (screen !== 'game' || root.hidden || wakeLock || !window.navigator?.wakeLock) { return; }
+    wakeLock = window.navigator.wakeLock.request('screen').then(lock => {
+      lock.addEventListener('release', () => { wakeLock = undefined; });
+      if (screen !== 'game') { void lock.release(); }
+      return lock;
+    }).catch(() => { wakeLock = undefined; });
+  };
+  const letSleep = () => { void wakeLock?.then(lock => lock?.release()).catch(() => {}); };
   let canvas = find('#game');
   let screen = 'title', panel = 'none', settingsReturn = 'none', tab = TABS[0].id;
   let presented = false, dismissed = false, quitting = false, pickToStart = false;
@@ -174,9 +198,10 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     deviceRows = size.deviceHeight;
     return size;
   };
+  // the stage keeps out of a phone's notch and rounded corners (menu.html insets it by the safe area)
   const layout = () => {
-    shape = frameShape({ aspect: settings.get('aspect'), scaling: settings.get('scaling'), width: window.innerWidth,
-      height: window.innerHeight, ratio: window.devicePixelRatio || 1 });
+    shape = frameShape({ aspect: settings.get('aspect'), scaling: settings.get('scaling'), width: stage.clientWidth || window.innerWidth,
+      height: stage.clientHeight || window.innerHeight, ratio: window.devicePixelRatio || 1 });
     stage.style.setProperty('--frame-width', `${shape.width}px`);
     stage.style.setProperty('--frame-height', `${shape.height}px`);
     stage.dataset.filter = settings.get('filter');
@@ -321,7 +346,12 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
         next.textContent = '›';
         previous.dataset.direction = '-1';
         cycler.append(previous, value, next);
-        cycler.addEventListener('click', event => { step(row, event.target.closest?.('[data-direction]') ? -1 : 1); });
+        // a tap on the left third steps back, as the arrow there shows
+        cycler.addEventListener('click', event => {
+          const box = cycler.getBoundingClientRect();
+          const left = event.detail > 0 && event.clientX < box.left + box.width / 3;
+          step(row, left || event.target.closest?.('[data-direction]') ? -1 : 1);
+        });
         line.append(name, cycler);
       }
       return line;
@@ -450,6 +480,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     keyboard?.setHost({ panel: panel !== 'none', console: consoleOpen });
     keyboard?.setActive(screen === 'game' && panel === 'none' && !consoleOpen);
     motion?.setSuspended(screen === 'game' && panel !== 'none');
+    touch.setGame(screen === 'game' && panel === 'none' && !consoleOpen);
+    if (screen === 'game') { void keepAwake(); } else { letSleep(); }
     if (activeLayer() && padFrame === undefined) { padFrame = window.requestAnimationFrame(pollPad); }
   };
   const setPanel = next => {
@@ -486,7 +518,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   };
 
   const render = state => {
-    const active = ['validating', 'booting', 'running', 'switching'].includes(state.phase);
+    const active = ['validating', 'booting', 'running'].includes(state.phase);
     boot.disabled = active || state.stopping || state.code === 'TEARDOWN';
     boot.setAttribute('aria-busy', String(active || state.stopping));
     if (!active && !state.stopping) { quitting = false; }
@@ -509,17 +541,10 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     audio = createBrowserAudio({ ...options, volume: settings.get('volume') / 100, output: settings.get('audioOutput') });
     return audio;
   };
-  // the guest launched the other image (Versus, or back to story): its module starts with this one's hand over
-  const switchImage = state => {
-    if (state.phase !== 'switching' || state.stopping || !state.next) { return; }
-    loadingText.textContent = state.next.image === 'versus' ? 'Switching to Versus' : 'Returning to story';
-    const next = state.next;
-    presented = false;
-    queueMicrotask(() => { void controller.start(next); });
-  };
-  const controller = createShellController({ onChange: state => { render(state); switchImage(state); }, createRuntime: (options = {}) => createMenuRuntime({ ...options,
-    developmentStart: settings.get('developmentStart') && options.image !== 'versus', settings, createMotion, createAudio,
-    onKeyboard: value => { keyboard = value; show(); },
+  const controller = createShellController({ onChange: state => render(state), createRuntime: () => createMenuRuntime({
+    developmentStart: settings.get('developmentStart'), settings, createMotion, createAudio, ...(touchDevice ? { pthreadPool: 64 } : {}),
+    onKeyboard: value => { keyboard = value; touch.setKeyboard(value); show(); },
+    virtualPads: () => { const pad = touch.pad(); return pad ? [pad] : []; },
     onHostMessages: value => { hostMessages = value; },
     onHostMessage: message => routeHostMessage(message, {
       quit: () => { if (screen === 'game') { quit(); } },
@@ -582,7 +607,21 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     await controller.select(file);
     if (start) { await begin(); }
   };
+  // what this browser lacks, said before the picker: a phone may copy a whole disc image for it first
+  const missingCapability = () => {
+    if (!window.isSecureContext) { return 'Open this page over HTTPS or from localhost. Browsers allow shared memory and WebGPU only in a secure context.'; }
+    if (!window.crossOriginIsolated || typeof SharedArrayBuffer !== 'function') { return 'The server must send the cross origin isolation headers that tools/browser/serve.mjs sends.'; }
+    if (!window.navigator?.gpu) { return 'This browser has no WebGPU. Use Chrome 121 or newer on Android or a desktop, or Safari on iOS 26, iPadOS 26 or macOS 26 or newer.'; }
+    return '';
+  };
+  const notify = message => {
+    dismissed = false;
+    setScreen('error');
+    detail.textContent = message;
+  };
   const choose = async () => {
+    const missing = missingCapability();
+    if (missing) { notify(`CAPABILITY: ${missing}`); return; }
     if (typeof window.showOpenFilePicker !== 'function') {
       pickToStart = true;
       input.click();
@@ -598,8 +637,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const begin = async () => {
     dismissed = false;
     presented = false;
-    loadingText.textContent = loadingDefault;
-    void controller.start(settings.get('startInVersus') ? { image: 'versus' } : {});
+    void controller.start();
   };
   const start = async () => {
     if (controller.state.source) { await begin(); return; }
@@ -698,6 +736,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     idleTimer = setTimeout(() => { body.dataset.cursor = 'idle'; }, 2500);
   };
   const fullscreen = () => { layout(); if (panel === 'settings') { refreshRows(); } };
+  const visibility = () => { if (!root.hidden) { void keepAwake(); } };
   const startClick = () => { void start(); };
   const picked = () => {
     const file = input.files?.[0];
@@ -725,6 +764,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   root.addEventListener('mousemove', activity);
   root.addEventListener('pointerlockchange', activity);
   root.addEventListener('fullscreenchange', fullscreen);
+  root.addEventListener('visibilitychange', visibility);
   window.addEventListener('keydown', keydown, true);
   window.addEventListener('keyup', keyup, true);
   window.addEventListener('mousedown', captureMouse, true);
@@ -754,6 +794,9 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       root.removeEventListener('mousemove', activity);
       root.removeEventListener('pointerlockchange', activity);
       root.removeEventListener('fullscreenchange', fullscreen);
+      root.removeEventListener('visibilitychange', visibility);
+      touch.dispose();
+      letSleep();
       window.removeEventListener('keydown', keydown, true);
       window.removeEventListener('keyup', keyup, true);
       window.removeEventListener('mousedown', captureMouse, true);
@@ -766,6 +809,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     get measurement() { return measurement.snapshot(); },
     get evidence() { return evidence; },
     get input() { return keyboard?.snapshot(); },
+    touch,
     get audio() { return audio?.snapshot(); },
   });
 };

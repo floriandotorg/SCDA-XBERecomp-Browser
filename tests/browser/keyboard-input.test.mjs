@@ -141,3 +141,53 @@ test('the wheel over the frame counts notches and is kept from the page', () => 
   assert.equal(f.words[K.wheelUp], 2);
   f.input.dispose();
 });
+
+test('touch drags look as mouse movement without counting as keyboard use', () => {
+  const f = fixture();
+  const change = f.words[K.change];
+  f.input.look(2.5, -1);
+  f.input.look(0.5, 0);
+  assert.deepEqual([f.words[K.mouseX], f.words[K.mouseY]], [3000, -1000]);
+  assert.equal(f.words[K.change], change, 'the guest keeps showing controller prompts');
+  f.input.setActive(false);
+  f.input.look(10, 10);
+  assert.deepEqual([f.words[K.mouseX], f.words[K.mouseY]], [0, 0]);
+  f.input.dispose();
+});
+
+test('a touch on the picture is the left mouse button at the finger, a click while the guest takes the cursor', () => {
+  const f = fixture();
+  Atomics.store(f.words, K.flags, K.menuFlag);
+  const change = f.words[K.change];
+  f.input.touch('down', 110, 120);
+  assert.deepEqual([f.words[K.cursorX], f.words[K.cursorY], f.words[K.cursorW], f.words[K.cursorH]], [100, 100, 640, 480]);
+  assert.equal(f.words[K.pressing], 1);
+  assert.equal(f.words[K.keys] & (1 << 1), 0, 'no mouse button: the guest keeps the pad prompts');
+  assert.equal(f.words[K.change], change);
+  f.input.touch('move', 130, 125);
+  assert.deepEqual([f.words[K.cursorX], f.words[K.cursorY]], [120, 105]);
+  assert.deepEqual([f.words[K.mouseX], f.words[K.mouseY]], [0, 0], 'outside a map drag the cursor only moves');
+  f.input.touch('up', 130, 125);
+  assert.equal(f.words[K.clicks], 1);
+  assert.equal(f.words[K.change], change);
+  f.input.touch('down', 110, 120);
+  f.input.touch('cancel', 110, 120);
+  assert.equal(f.words[K.clicks], 1, 'a cancelled touch is no click');
+  Atomics.store(f.words, K.flags, K.menuFlag | K.mapDragFlag);
+  f.input.touch('down', 100, 100);
+  f.input.touch('move', 104, 97);
+  assert.deepEqual([f.words[K.mouseX], f.words[K.mouseY]], [4000, -3000], 'a map drag moves the map');
+  f.input.touch('up', 104, 97);
+  f.input.dispose();
+});
+
+test('typed text from the on-screen keyboard reaches the guest', () => {
+  const f = fixture();
+  f.input.type('ab');
+  assert.equal(f.words[K.charHead], 0, 'only while a name is typed');
+  Atomics.store(f.words, K.flags, K.textFlag);
+  f.input.type('ab\b');
+  assert.equal(f.words[K.charHead], 3);
+  assert.equal(f.input.flags(), K.textFlag);
+  f.input.dispose();
+});

@@ -36,7 +36,6 @@
 #include "browser/delay-provider.h"
 #include "browser/menu-launch.h"
 #include "browser/menu-route.h"
-#include "browser/image-carry.h"
 #endif
 #ifdef BROWSER_MENU
 #include "browser/menu-backend.h"
@@ -346,17 +345,14 @@ struct Session {
       if (cell == dataExports.end()) { throw std::runtime_error("story restart requires LaunchDataPage"); }
       launcher->InstallFirmware(cell->address);
     }
-#ifndef BROWSER_VERSUS
-    // story addresses: the game mode route and the mission observation
     route = std::make_shared<browser::MenuRoute>(runtime, *image);
     missionObserver = std::make_shared<browser::MenuMissionObservation>(runtime, *image);
     constexpr auto observedReturns = browser::MenuMissionObservation::ReturnAddresses();
     runtime.InstallInvocationObserver(*image->memory, [observer = missionObserver](const X86Context& ctx, uint8_t* base, uint32_t target, uint64_t workerId) {
       observer->Observe(ctx, base, target, workerId);
     }, {observedReturns.begin(), observedReturns.end()});
-#endif
     std::shared_ptr<browser::SdkGraphics> controls = input;
-#if defined(BROWSER_MISSION) && !defined(BROWSER_VERSUS)
+#ifdef BROWSER_MISSION
     missionControls = std::make_shared<browser::MissionInput>(runtime, *image, input, story->motion, [this](const auto& sample) {
       std::lock_guard lock(simulationMutex);
       if (simulationLevel != sample.level || (simulation[0] && sample.seconds < std::bit_cast<float>(simulation[1]))) {
@@ -471,7 +467,7 @@ EMSCRIPTEN_KEEPALIVE int image_prepare(uint32_t base, uint32_t end, uint32_t ent
 }
 
 EMSCRIPTEN_KEEPALIVE int image_development_boot() {
-#if defined(BROWSER_MISSION) && !defined(BROWSER_VERSUS)
+#ifdef BROWSER_MISSION
   if (!session || !session->story || session->story->launchPage || session->image->importsBound || session->runtime.ActiveWorkers()) { return 0; }
   try {
     session->missionControls->ConfigureDevelopmentStart();
@@ -511,7 +507,7 @@ EMSCRIPTEN_KEEPALIVE int image_execute() {
     session->audioTrace = session->silentAudio->Snapshot();
     session->audioProviderTrace = session->audioProvider->Snapshot();
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
-    if (session->missionObserver) { session->missionTrace = session->missionObserver->Snapshot(); }
+    session->missionTrace = session->missionObserver->Snapshot();
 #endif
     return 1;
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
@@ -546,7 +542,7 @@ EMSCRIPTEN_KEEPALIVE int image_execute() {
   session->audioTrace = session->silentAudio->Snapshot();
   session->audioProviderTrace = session->audioProvider->Snapshot();
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
-  if (session->missionObserver) { session->missionTrace = session->missionObserver->Snapshot(); }
+  session->missionTrace = session->missionObserver->Snapshot();
 #endif
   return 0;
 }
@@ -557,62 +553,7 @@ EMSCRIPTEN_KEEPALIVE uint32_t image_restart_count() {
 
 EMSCRIPTEN_KEEPALIVE int image_can_restart() {
 #if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
-  return session && session->story && session->launchRequest && session->launchRequest->page &&
-    session->launchRequest->image == browser::kThisImage ? 1 : 0;
-#else
-  return 0;
-#endif
-}
-
-// the other image a launch asked for (1 story, 2 versus), 0 for none: the page then hands this session over to it
-EMSCRIPTEN_KEEPALIVE int image_switch_target() {
-#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
-  return session && session->story && session->launchRequest && session->launchRequest->page &&
-    session->launchRequest->image != browser::kThisImage ? session->launchRequest->image : 0;
-#else
-  return 0;
-#endif
-}
-EMSCRIPTEN_KEEPALIVE int image_id() { return browser::kThisImage; }
-
-namespace {
-std::vector<uint8_t> carryBytes;
-}
-// the switch's launch page, kept display and profile, packed for the next module (image-carry.h)
-EMSCRIPTEN_KEEPALIVE uintptr_t image_carry_out() {
-#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
-  if (!image_switch_target() || session->runtime.ActiveWorkers()) { return 0; }
-  browser::image_carry::Carry carry;
-  carry.page = session->launchRequest->page;
-  if (const auto display = session->graphics->PersistedDisplaySnapshot()) {
-    carry.display = browser::image_carry::Display{display->common, display->format, display->size, display->pixels};
-  }
-  carryBytes = browser::image_carry::Pack(carry, *session->story->profile);
-  return reinterpret_cast<uintptr_t>(carryBytes.data());
-#else
-  return 0;
-#endif
-}
-EMSCRIPTEN_KEEPALIVE uint32_t image_carry_size() { return uint32_t(carryBytes.size()); }
-EMSCRIPTEN_KEEPALIVE uintptr_t image_carry_allocate(uint32_t size) {
-  if (size > (64u << 20)) { return 0; }
-  carryBytes.assign(size, 0);
-  return reinterpret_cast<uintptr_t>(carryBytes.data());
-}
-// after image_prepare, before image_bind: the previous image's carry becomes this session's launch page, display and
-// profile
-EMSCRIPTEN_KEEPALIVE int image_carry_in() {
-#if defined(BROWSER_MENU) || defined(BROWSER_MENU_CAPTURE)
-  if (!session || !session->story || session->image->importsBound || session->runtime.ActiveWorkers()) { return 0; }
-  browser::image_carry::Carry carry;
-  const bool unpacked = browser::image_carry::Unpack(carryBytes, carry, *session->story->profile);
-  carryBytes = {};
-  if (!unpacked) { return 0; }
-  session->story->launchPage = carry.page;
-  if (carry.display) {
-    session->story->display = browser::DiagnosticGraphics::PersistedDisplay{carry.display->common, carry.display->format, carry.display->size, std::move(carry.display->pixels)};
-  }
-  return 1;
+  return session && session->story && session->launchRequest && session->launchRequest->page ? 1 : 0;
 #else
   return 0;
 #endif

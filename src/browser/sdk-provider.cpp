@@ -43,8 +43,6 @@ struct SignatureObservation {
 
 }
 
-// the story image's XCalculateSignatureBegin and End; versus does not observe them
-#ifndef BROWSER_VERSUS
 X86_FUNC(sub_000534B8) {
   SignatureObservation observation(ctx, base, 69);
   browser::Runtime::ObserveSdkEntry(ctx, base, observation.id);
@@ -58,7 +56,6 @@ X86_FUNC(sub_0005351A) {
   __imp__sub_0005351A(ctx, base);
   observation.returned(ctx.eax);
 }
-#endif
 
 X86_FUNC(SDK_GUEST(XNetStartup)) {
   if (browser::Runtime::ObserveSdkEntry(ctx, base, 1)) {
@@ -103,17 +100,12 @@ SdkTrace::SnapshotData SdkTrace::Snapshot() const {
 std::shared_ptr<const SdkTrace> InstallSdkProvider(Runtime& runtime, PreparedImage& image, SdkPolicy policy,
   std::shared_ptr<SdkGraphics> graphics, std::shared_ptr<SdkGraphics> input, std::shared_ptr<SdkGraphics> launch,
   std::shared_ptr<SdkGraphics> route, std::shared_ptr<SdkGraphics> audio) {
-#ifdef BROWSER_VERSUS
-  constexpr bool signatures = false;
-  const bool signatureMismatch = false;
-#else
   const auto signatureBegin = runtime.Find(kSignatureBeginAddress);
   const auto signatureEnd = runtime.Find(kSignatureEndAddress);
   const bool signatures = signatureBegin || signatureEnd;
-  const bool signatureMismatch = signatures && (signatureBegin != sub_000534B8 || signatureEnd != sub_0005351A ||
-    !__imp__sub_000534B8 || !__imp__sub_0005351A || image.image.entry == kSignatureBeginAddress || image.image.entry == kSignatureEndAddress);
-#endif
-  if (signatureMismatch ||
+  if ((signatures && (signatureBegin != sub_000534B8 || signatureEnd != sub_0005351A ||
+        !__imp__sub_000534B8 || !__imp__sub_0005351A ||
+        image.image.entry == kSignatureBeginAddress || image.image.entry == kSignatureEndAddress)) ||
       (route && !route->BelongsTo(runtime, image)) || (launch && !launch->BelongsTo(runtime, image)) || (input && !input->BelongsTo(runtime, image)) || (graphics && !graphics->BelongsTo(runtime, image)) ||
       (audio && !audio->BelongsTo(runtime, image)) || !image.memory || image.importsBound || image.boundRuntime || Memory::HasBorrow() ||
       (image.diagnosticRuntime && image.diagnosticRuntime != &runtime) ||
@@ -129,14 +121,12 @@ std::shared_ptr<const SdkTrace> InstallSdkProvider(Runtime& runtime, PreparedIma
   auto sharedAudio = std::move(audio);
   runtime.InstallSdkObserver(*memory, [trace, memory, &image, &runtime, policy, graphics, input, launch, route, signatures, sharedAudio](X86Context& ctx, uint32_t id, uint64_t workerId) {
     if (image.memory.get() != memory || !image.importsBound || image.boundRuntime != &runtime || id == 0 || id == 70 ||
-        (id != 136 && (id < 132 || id > 135) && id > (sharedAudio ? BROWSER_AUDIO_LAST_ID : 71) &&
-          !(sharedAudio && id >= BROWSER_AUDIO_EXTRA_FIRST_ID && id <= BROWSER_AUDIO_EXTRA_LAST_ID) && id != 139) ||
+        (id != 136 && (id < 132 || id > 135) && id > (sharedAudio ? BROWSER_AUDIO_LAST_ID : 71)) ||
         (id >= 132 && id <= 135 && !input) || (id == 136 && !launch)) {
       throw Fault(ctx, ctx.esp, 0, "SDK observer belongs to a stale or unpublished image");
     }
     if (id >= 132 && id <= 135) { return input->Dispatch(ctx, memory->Base(), id); }
     if (id == 136) { return launch->Dispatch(ctx, memory->Base(), id); }
-    if (id == 139) { return graphics ? graphics->Dispatch(ctx, memory->Base(), id) : true; }
     if (id >= BROWSER_AUDIO_FIRST_ID) {
       if (!sharedAudio) {
         throw Fault(ctx, ctx.esp, 0, "audio entry observed without the installed audio provider");

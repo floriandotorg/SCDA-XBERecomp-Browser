@@ -9,16 +9,11 @@ namespace browser::exit_menu {
 __attribute__((weak)) bool Press(X86Context&) { return false; }
 }
 
-// story addresses: the versus module links the classes only, it never installs them
-#ifndef BROWSER_VERSUS
 BROWSER_GAME_CHAIN(0018697A)
 X86_FUNC(sub_0018697A) {
   if (browser::exit_menu::Press(ctx)) { return; }
   if (browser::Runtime::ObserveSdkEntry(ctx, base, 65)) { game_sub_0018697A(ctx, base); }
 }
-#else
-X86_FUNC(sub_0018697A) __attribute__((weak));
-#endif
 
 namespace browser {
 namespace {
@@ -260,9 +255,7 @@ bool MenuRoute::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) {
     auto lease = memory_->Borrow();
     memory_->Read(ctx, list + selectionOffset, &selection, sizeof(selection));
   }
-  // Versus (2) goes through to its launch of sc4_adv.xbe, which the page answers by switching modules; Coop (1) waits
-  // for the network
-  if (selection != 1) { return true; }
+  if (selection != 1 && selection != 2) { return true; }
   runtime_.Checkpoint(ctx);
   {
     std::lock_guard lock(lock_);

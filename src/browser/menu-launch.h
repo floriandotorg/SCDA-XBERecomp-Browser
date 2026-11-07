@@ -1,25 +1,14 @@
 #pragma once
 #include "browser/sdk-provider.h"
 #include <optional>
-#include <string_view>
 
 namespace browser {
 
 std::array<uint8_t, 4096> DevelopmentIcelandLaunchPage();
 
-// the image a launch path names, as native's ImageExe: default.xbe or sc4_adv.xbe at the end, after nothing, \ or ;
-inline constexpr int kStoryImage = 1, kVersusImage = 2;
-#ifdef BROWSER_VERSUS
-inline constexpr int kThisImage = kVersusImage;
-#else
-inline constexpr int kThisImage = kStoryImage;
-#endif
-int LaunchImage(std::string_view path);
-
 class MenuLaunchRequested final : public std::exception {
 public:
   std::string path;
-  int image = kStoryImage;
   bool hasData = false;
   std::array<uint8_t, 3072> data{};
   std::optional<std::array<uint8_t, 4096>> page;

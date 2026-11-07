@@ -206,6 +206,25 @@ int main() {
   std::array<uint8_t, 18> sample{};
   check(browser::input_core::Sample(0, sample) && sample[2] == 0xFF, "XInput sample");
   check(!browser::input_core::Sample(2, sample), "port 2 has nothing");
+  gamepad[7] = 0;
+  Key(W, true);
+  input::Poll(0);
+  Key(W, false);
+  input::Poll(0);
+  check(input::KeyboardActive(), "a key after the pad shows keyboard prompts");
+  gamepad[1] = 2;
+  input::Poll(0);
+  check(!input::KeyboardActive(), "the on-screen pad of a touch screen shows the pad's prompts");
+  Key(W, true);
+  input::Poll(0);
+  Key(W, false);
+  input::Poll(0);
+  check(!input::KeyboardActive(), "while it is shown even after a key");
+  gamepad[1] = 0;
+  Key(W, true);
+  input::Poll(0);
+  Key(W, false);
+  check(input::KeyboardActive(), "without it keys show keyboard prompts again");
   browser::input_core::BindGamepad(nullptr);
   std::puts("input-core-contracts-ok");
 }

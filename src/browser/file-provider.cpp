@@ -126,11 +126,7 @@ public:
     constexpr uint32_t address = 0xc0001000;
     constexpr uint32_t descriptorAddress = address + 4;
     constexpr uint32_t nameAddress = descriptorAddress + 8;
-#ifdef BROWSER_VERSUS
-    constexpr char name[] = "\\Device\\CdRom0\\sc4_adv.xbe";
-#else
     constexpr char name[] = "\\Device\\CdRom0\\default.xbe";
-#endif
     constexpr std::array<uint32_t, 2> descriptor = {
       uint32_t(sizeof(name) - 1) | (uint32_t(sizeof(name)) << 16), nameAddress
     };
@@ -223,14 +219,7 @@ public:
     bool createEntry = false;
     bool overwriteEntry = false;
     const bool streamingWrite = create && disposition == 5 && options == 0x48 && access == 0x40100080 && frame[6] == 0;
-#ifdef BROWSER_VERSUS
-    // versus copies its sound banks to the utility drive with write access alone and the file's size as allocation
-    constexpr bool sizedOverwrite = true;
-    const bool overwrite = create && disposition == 5 && (options == 0x60 || options == 0x64 || streamingWrite) && (access == 0x40100080 || access == 0x40100000);
-#else
-    constexpr bool sizedOverwrite = false;
     const bool overwrite = create && disposition == 5 && (options == 0x60 || options == 0x64 || streamingWrite) && access == 0x40100080;
-#endif
     const bool noReadCache = create && disposition == 1 && options == 0x6c && access == 0x80100080 && frame[6] == 0x80;
     const bool readMetadata = create && disposition == 3 && options == 0x60 && access == 0x80100080 && frame[6] == 4;
     const bool writableOpenIf = create && disposition == 3 && options == 0x60 &&
@@ -238,7 +227,7 @@ public:
     const bool deleteOpen = create && disposition == 1 && (options == 0x60 || options == 0x64) && access == 0x110080;
     const bool readonlyOpen = create && disposition == 1 && (options == 0x60 || options == 0x64) && access == 0x80100080 && frame[6] == 1;
     const bool streamingRead = create && disposition == 1 && options == 0x48 && access == 0x80100080 && frame[6] == 0;
-    if (!status && create && ((allocation && !(overwrite && sizedOverwrite) && (options != 0x22 || (disposition != 2 && disposition != 3))) ||
+    if (!status && create && ((allocation && (options != 0x22 || (disposition != 2 && disposition != 3))) ||
         (!readonlyOpen && (frame[6] & ~0x94u)) || disposition < 1 || (disposition > 3 && !overwrite))) { status = 0xc00000bb; }
     if (!status && create && !overwrite && !noReadCache && !readMetadata && !writableOpenIf && !deleteOpen && !streamingRead && !(options & 1) && options != 0x22 &&
         (disposition != 1 || (options != 0x60 && options != 0x64) || !(access & 0x80000001u) || (access & ~0x80120089u))) { status = 0xc00000bb; }

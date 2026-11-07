@@ -99,8 +99,6 @@ private:
   uint32_t decodedWords_ = 0;
   std::vector<uint32_t> commands_;
   std::optional<PersistedDisplay> persistedDisplay_;
-  uint32_t userStream_ = 0;  // the vertex buffer header a user pointer draw binds as stream 0
-  bool released_ = false;    // the guest released its device; its next CreateDevice gets it back
   bool initialized_ = false;
   bool creating_ = false;
   bool unsubmitted_ = false;

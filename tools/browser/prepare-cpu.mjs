@@ -4,14 +4,13 @@ import { resolve } from 'node:path';
 import { adaptMemory } from './adapt-memory.mjs';
 import { adaptArithmetic } from './adapt-arithmetic.mjs';
 
-const [root, output, mode, generated = 'generated/game', partitions = '128'] = process.argv.slice(2);
+const [root, output, mode] = process.argv.slice(2);
 if (!root || !output) { throw new Error('Expected repository and output directory'); }
 mkdirSync(output, { recursive: true });
 const inputs = {};
-const count = Number(partitions);
-for (let n = 0; n <= count; ++n) {
-  const name = n === count ? 'x86_func_mapping.cpp' : `x86_recomp.${n}.cpp`;
-  const source = readFileSync(resolve(root, generated, name), 'utf8');
+for (let n = 0; n < 129; ++n) {
+  const name = n === 128 ? 'x86_func_mapping.cpp' : `x86_recomp.${n}.cpp`;
+  const source = readFileSync(resolve(root, 'generated/game', name), 'utf8');
   const adapted = adaptArithmetic(adaptMemory(source, { blocks: mode === 'mission-blocks', flat: mode === 'mission-flat' }));
   const path = resolve(output, name);
   const previous = existsSync(path) ? readFileSync(path, 'utf8') : null;

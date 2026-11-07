@@ -241,10 +241,6 @@ DG_BOUNDARY(D3DDevice_LightEnable, 62)
 #ifdef SYM_D3DDevice_SetShaderConstantMode
 DG_BOUNDARY(D3DDevice_SetShaderConstantMode, 63)
 #endif
-// versus draws user pointer vertices; the story image has no such entry
-#if HAS_D3DDevice_DrawVerticesUP
-DG_BOUNDARY(D3DDevice_DrawVerticesUP, 139)
-#endif
 
 namespace browser {
 namespace {
@@ -852,18 +848,6 @@ void DiagnosticGraphics::CreateDevice(X86Context& ctx, uint8_t* base) {
   Require(ctx, base);
   std::lock_guard lock(lock_);
   if (failed_) { throw Fault(ctx, device, 0, "genuine renderer initialization failure is terminal"); }
-  // versus releases its device after the intro and creates it again: the live device comes back as it was
-  if (initialized_ && released_ && (mode_ == GraphicsMode::Rendering || mode_ == GraphicsMode::StateCapture)) {
-    if (ctx.esp > UINT32_MAX - 28) { throw Fault(ctx, ctx.esp, 28, "diagnostic graphics stdcall cleanup overflow"); }
-    std::array<uint32_t, 7> frame;
-    memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
-    released_ = false;
-    memory_->CheckRange(ctx, frame[6], 4);
-    memory_->Write(ctx, frame[6], &device, 4);
-    ctx.eax = 0;
-    ctx.esp += 28;
-    return;
-  }
   if (initialized_ || creating_) { throw Fault(ctx, device, 0, "diagnostic graphics device already exists"); }
   if (ctx.esp > UINT32_MAX - 28) { throw Fault(ctx, ctx.esp, 28, "diagnostic graphics stdcall cleanup overflow"); }
   std::array<uint32_t, 7> frame;
@@ -886,11 +870,8 @@ void DiagnosticGraphics::CreateDevice(X86Context& ctx, uint8_t* base) {
     memory_->Read(ctx, devicePointer, &savedPointer, 4);
   }
   const bool capture = mode_ == GraphicsMode::StateCapture || mode_ == GraphicsMode::Rendering;
-  // story: linear A8R8G8B8 with an automatic linear D24S8; versus (sc4_adv.xbe): linear X8R8G8B8 at 60 Hz, its depth
-  // created by the game
   const bool presentation = capture
-    ? (frame[4] == 0x50 && pp == std::array<uint32_t, 13>{640, 480, 18, 1, 0, 1, 0, 0, 1, 46, 320, 0, 0x80000002}) ||
-      (frame[4] == 0x40 && pp == std::array<uint32_t, 13>{640, 480, 0x1e, 1, 0, 1, 0, 0, 0, 0x2a, 0x101, 60, 0x80000000})
+    ? frame[4] == 0x50 && pp == std::array<uint32_t, 13>{640, 480, 18, 1, 0, 1, 0, 0, 1, 46, 320, 0, 0x80000002}
     : frame[4] == 0x40 && pp[0] && pp[0] <= 2048 && pp[1] && pp[1] <= 2048 && pp[2] == 18 && pp[3] == 1 &&
       !pp[4] && !pp[5] && !pp[6] && !pp[7] && !pp[8] && !pp[9] && !pp[10] && !pp[11] && !pp[12];
   if (frame[1] != 0 || frame[2] != 1 || frame[3] != 0 || !frame[6] || !presentation) {
@@ -906,10 +887,6 @@ void DiagnosticGraphics::CreateDevice(X86Context& ctx, uint8_t* base) {
         cursor = caller[0];
       } catch (const Fault&) { break; }
     }
-    diagnostic << " frame=";
-    for (const auto value : frame) { diagnostic << value << ','; }
-    diagnostic << " parameters=";
-    for (const auto value : pp) { diagnostic << value << ','; }
     throw Fault(ctx, frame[5], sizeof(pp), diagnostic.str().c_str());
   }
   const auto overlaps = [](uint32_t left, uint32_t leftBytes, uint32_t right, uint32_t rightBytes) {
@@ -932,8 +909,8 @@ void DiagnosticGraphics::CreateDevice(X86Context& ctx, uint8_t* base) {
   try {
     push_ = Allocate(ctx, captureBytes);
     pushBytes_ = captureBytes;
-    const auto front = NewSurface(ctx, pp[0], pp[1], pp[2], 4);
-    const auto back = NewSurface(ctx, pp[0], pp[1], pp[2], 4);
+    const auto front = NewSurface(ctx, pp[0], pp[1], 18, 4);
+    const auto back = NewSurface(ctx, pp[0], pp[1], 18, 4);
     gpu::Surface depth{};
     if (pp[8]) { depth = NewSurface(ctx, pp[0], pp[1], 46, 4); }
     std::vector<uint8_t> metadata(deviceBytes);
@@ -1101,7 +1078,7 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
   if (id >= 29 && mode_ != GraphicsMode::Rendering && mode_ != GraphicsMode::StateCapture) { return true; }
   Capture(ctx);
   if (initialized_ && (mode_ == GraphicsMode::Rendering || mode_ == GraphicsMode::StateCapture) && TypedState(ctx, base, id)) { return false; }
-  if (initialized_ && id >= 29 && id != 139) {
+  if (initialized_ && id >= 29) {
     Unavailable(Request::Unsupported, id, "graphics typed frontend state operation is not implemented");
   }
   if (initialized_ && (mode_ == GraphicsMode::Rendering || mode_ == GraphicsMode::StateCapture) && (id == 8 || id == 10 || id == 11)) {
@@ -1256,30 +1233,6 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
       ctx.esp += 24;
       return false;
     }
-    // DrawVerticesUP(type, count, data, stride): stream 0 is a vertex buffer header over the guest's data for the call
-    if (id == 139) {
-      if (ctx.esp > UINT32_MAX - 20) { throw Fault(ctx, ctx.esp, 20, "graphics draw cleanup overflow"); }
-      std::array<uint32_t, 5> frame;
-      memory_->Read(ctx, ctx.esp, frame.data(), sizeof(frame));
-      if (frame[2] > 0x100000 || !frame[3] || !frame[4] || frame[4] > 2048) { throw Fault(ctx, ctx.esp, frame[2], "invalid user pointer draw"); }
-      if (!userStream_) { userStream_ = Allocate(ctx, 16); }
-      const std::array<uint32_t, 3> header{1, frame[3], 0};
-      memory_->Write(ctx, userStream_, header.data(), sizeof(header));
-      const auto stream = state_.streams[0];
-      state_.streams[0].vb = userStream_;
-      state_.streams[0].stride = frame[4];
-      renderer_->IndexSource(0);
-      hooks_.SplashDraw();
-      try { renderer_->Draw(state_, frame[1], 0, frame[2], nullptr); }
-      catch (...) { state_.streams[0] = stream; throw; }
-      state_.streams[0] = stream;
-      if (state_.rt.header) { gpuWritten_.insert(0x80000000 | (state_.rt.data & 0x3ffffff)); }
-      if (state_.zs.header) { gpuWritten_.insert(0x80000000 | (state_.zs.data & 0x3ffffff)); }
-      Record(Request::Draw, {frame[1], 0, frame[2], state_.rt.header, state_.zs.header, 0});
-      ctx.eax = 0;
-      ctx.esp += 20;
-      return false;
-    }
     if (id == 19 || id == 20) {
       if (ctx.esp > UINT32_MAX - 16) { throw Fault(ctx, ctx.esp, 16, "graphics draw cleanup overflow"); }
       std::array<uint32_t, 4> frame;
@@ -1349,14 +1302,6 @@ bool DiagnosticGraphics::Dispatch(X86Context& ctx, uint8_t* base, uint32_t id) t
       ctx.esp += 8;
       ++completedPresents_;
       if (presentCheckpoint_ && completedPresents_ == presentCheckpoint_) { throw GraphicsPresentCheckpoint(ctx, completedPresents_); }
-      return false;
-    }
-    // D3DDevice_Release (versus, before it persists the display and launches the story image): the device lives
-    // until the session ends, one reference stays
-    if (id == 27) {
-      released_ = true;
-      ctx.eax = 0;
-      ctx.esp += 4;
       return false;
     }
     stopSdk("rendering SDK operation is not implemented");
