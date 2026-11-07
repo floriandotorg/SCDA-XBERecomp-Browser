@@ -2,6 +2,8 @@
 A fork of [SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp), the native PC port of the original Xbox version of Splinter Cell: Double Agent, that makes the game run in a web browser. The original project translates the game's x86 code to C++ ahead of time with the [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp) tool and implements the Xbox kernel, Direct3D and DirectSound on Windows. This fork compiles the same generated C++ to WebAssembly with Emscripten, draws with WebGPU and plays sound through Web Audio. The game reads its files straight from your own ISO; nothing is uploaded or downloaded.
 
 > [!NOTE]
+> This is an unofficial fan project. It is not affiliated with, endorsed, sponsored or approved by Ubisoft, Microsoft or the developers of the original game; see [Legal](#legal).
+>
 > This project does not include any game assets or generated game code. You need your own legally acquired copy of the game, both to build and to play. There is no hosted version: you build and serve the page yourself.
 
 > [!IMPORTANT]
@@ -135,3 +137,14 @@ The full suite takes a long time. Run single files from `tests/browser/` while w
 
 ## Windows Version
 The native Windows build of the original project (`build.bat`, `CMakePresets.json`, `src/app`, `src/gpu/d3d12.cpp`) is still part of this repository, but this fork does not test it. For the Windows version, its features and online play, see the [original repository](https://github.com/TGP482/SCDA-XBERecomp).
+
+## Legal
+This is an unofficial, non-commercial fan project, made for game preservation and interoperability. It is not affiliated with, endorsed, sponsored or approved by Ubisoft Entertainment, Microsoft or any studio, developer or publisher of the original game, and none of them is responsible for it or provides support for it.
+
+The repository contains only source code written for this project and the project it is forked from. It contains no code or assets from the game and no code from Microsoft's software, and it does not provide the game, any part of it, any way to obtain it or any way to bypass copy protection. To use it you need your own legally obtained copy of the game, which is read locally on your device. Please do not ask for or share game files, disc images or generated code in this repository.
+
+The MIT license in [LICENSE](LICENSE) applies only to this project's source code. It grants no rights to the game, its code, its assets or its trademarks, which remain the property of Ubisoft Entertainment and its licensors.
+
+Tom Clancy's, Splinter Cell, Splinter Cell Double Agent and Ubisoft are trademarks of Ubisoft Entertainment in the U.S. and/or other countries. Xbox is a trademark of the Microsoft group of companies. All other trademarks are the property of their respective owners. They are mentioned only to identify the game and the platform this software is compatible with.
+
+If you hold rights to the game and have a concern about this project, please open an issue in this repository. It will be answered promptly and in good faith.

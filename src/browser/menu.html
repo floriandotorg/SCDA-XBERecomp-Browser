@@ -63,6 +63,9 @@
       filter: drop-shadow(0 2px 0 #000) drop-shadow(0 0 1px #000); }
     .logo span { padding: .12rem .7rem .08rem; font: 900 .95rem/1.1 "Arial Black", Arial, sans-serif; letter-spacing: .06em; text-transform: uppercase;
       color: #c8e26a; background: #1f2a10; border: 2px solid #8fae3a; box-shadow: inset 0 0 0 1px #000; }
+    .legal { position: absolute; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 1.5vh); margin: 0 auto; padding: 0 1rem; max-width: 48rem;
+      font: 400 max(.6rem, 10px)/1.4 var(--face); text-align: center; color: var(--item-dim); pointer-events: none; }
+    .legal p { margin: 0; }
 
     .box { position: relative; width: min(29rem, calc(100vw - 2rem)); max-height: calc(100vh - 2rem); max-height: calc(100dvh - 2rem); overflow: auto;
       padding: .9rem 1.1rem 1.1rem; background: rgba(4, 6, 5, .86); border: 1px solid var(--frame); box-shadow: inset 0 0 0 1px #000, 0 0 0 1px #000; }
@@ -258,6 +261,10 @@
         </nav>
       </section>
     </main>
+    <footer class="legal">
+      <p>Unofficial fan project. Not affiliated with, endorsed, sponsored or approved by Ubisoft, Microsoft or the developers of the original game.</p>
+      <p>Contains no game code or assets and requires your own legally obtained copy. All trademarks belong to their respective owners.</p>
+    </footer>
   </div>
 
   <div id="loading" class="layer" role="status" aria-label="Loading">
