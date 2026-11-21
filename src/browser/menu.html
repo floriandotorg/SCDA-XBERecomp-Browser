@@ -97,6 +97,7 @@
     .loading p { margin: 0; font: italic 700 1rem/1 var(--face); text-transform: uppercase; color: var(--head); }
     .bar { position: relative; width: 12rem; height: 4px; background: #1b1f1b; border: 1px solid var(--frame); overflow: hidden; }
     .bar::after { content: ""; position: absolute; top: 0; bottom: 0; width: 30%; background: #6f8f6a; animation: seek 1.4s ease-in-out infinite alternate; }
+    .bar[data-progress]::after { left: 0; width: calc(var(--progress) * 1%); animation: none; }
 
     .shade { z-index: 3; background: rgba(0, 0, 0, .6); }
     body[data-screen="title"] #settings { background: transparent; }
@@ -264,6 +265,7 @@
         <h2>Main menu</h2>
         <nav class="menu" id="main-menu" aria-label="Main menu">
           <button id="boot" type="button" data-nav>Start game</button>
+          <button id="choose" type="button" data-nav hidden>Choose another disc</button>
           <button type="button" data-nav data-action="settings">Options</button>
         </nav>
       </section>
@@ -275,7 +277,7 @@
   </div>
 
   <div id="loading" class="layer" role="status" aria-label="Loading">
-    <div class="loading"><p>Loading</p><div class="bar"></div></div>
+    <div class="loading"><p id="loading-text">Loading</p><div class="bar" id="loading-bar"></div></div>
   </div>
 
   <div id="error" class="layer center shade" role="alertdialog" aria-labelledby="error-title">

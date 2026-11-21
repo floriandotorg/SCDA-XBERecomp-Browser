@@ -189,7 +189,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         'src/browser/menu-shaders.h', 'src/browser/menu-shaders.cpp', 'src/browser/menu-pixel-shaders.h', 'src/browser/menu-pixel-shaders.cpp', 'src/browser/menu-texture.h', 'src/browser/menu-texture.cpp',
         'src/browser/menu-input.mjs', 'src/browser/gamepad-input.mjs', 'src/browser/input-bindings.mjs', 'src/browser/frame-shape.mjs', 'src/browser/console-model.mjs', 'src/browser/browser-audio.mjs', 'src/browser/audio-worklet.mjs', 'src/browser/webgpu-transport.h', 'src/browser/webgpu-transport.cpp', 'src/browser/webgpu-transport.mjs',
         'src/browser/webgpu-service.cpp', 'src/browser/webgpu-service.mjs', 'src/gpu/smaa_wgsl.h', 'src/gpu/smaa_textures.h', 'src/browser/menu-runtime.mjs', 'src/browser/menu-shell.mjs', 'src/browser/settings.mjs',
-        'src/browser/touch-controls.mjs', 'src/browser/save-format.mjs', 'src/browser/save-store.mjs', 'src/browser/save-store-worker.mjs', 'src/browser/save-service.mjs', 'src/browser/manifest.webmanifest', 'src/browser/icon.svg', 'src/browser/icon-180.png', 'src/browser/icon-192.png',
+        'src/browser/touch-controls.mjs', 'src/browser/save-format.mjs', 'src/browser/save-store.mjs', 'src/browser/save-store-worker.mjs', 'src/browser/save-service.mjs', 'src/browser/disc-cache.mjs', 'src/browser/manifest.webmanifest', 'src/browser/icon.svg', 'src/browser/icon-180.png', 'src/browser/icon-192.png',
         'src/browser/icon-512.png', 'src/browser/menu.html', 'src/gpu/shaders.h', 'src/gpu/shaders.cpp', 'src/gpu/vertex.h');
     }
     paths.push('src/browser/virtual-memory.cpp', 'src/browser/virtual-memory.h');

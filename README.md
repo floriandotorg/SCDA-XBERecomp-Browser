@@ -12,7 +12,7 @@ A fork of [SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp), the native
 ## Playing
 - Build the page and start the local server as described in [Building](#building).
 - Open the printed address in a supported browser.
-- Click **Start game** and select your game ISO. The first launch validates the image; Chrome remembers the file for the next visit.
+- Click **Start game** and select your game ISO. The first time, the page copies the whole image into the browser's private storage, which takes a minute, and asks the browser to keep that storage. Later visits start from that copy and need neither the original file nor permission to read it. **Choose another disc** replaces the copy.
 - Settings are in **Options** on the main menu, in the pause menu (<kbd>Esc</kbd>), or in the settings panel (<kbd>F10</kbd>). They are stored in the browser.
 - Profiles and saves are stored in the browser and survive closing the page. The top of the screen shows when progress is saved; the page asks before closing while a save is still being written. **Options**, **Progress** exports your progress to a `.scdasave` file and imports it again, for example into another browser. Clearing the site's data in the browser deletes the progress, so export it first. A profile takes about 30 MB, and only one fits for now.
 

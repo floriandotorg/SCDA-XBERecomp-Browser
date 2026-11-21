@@ -13,6 +13,7 @@ import { createConsoleModel, routeHostMessage } from './console-model.mjs';
 import { createTouchControls } from './touch-controls.mjs';
 import { createSaveService } from './save-service.mjs';
 import { SAVE_FORMAT } from './save-format.mjs';
+import { createDiscCache } from './disc-cache.mjs';
 
 const onOff = Object.freeze({ true: 'On', false: 'Off' });
 // the render size a scale gives in Match window: the frame's 640 x 480 times the window's device rows over 480
@@ -112,30 +113,7 @@ const TABS = Object.freeze([
   ] },
 ]);
 
-const createDiscStore = (indexedDB = globalThis.indexedDB) => {
-  const run = async (mode, action) => {
-    if (!indexedDB) { return undefined; }
-    const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open('scda-front-end', 1);
-      request.onupgradeneeded = () => { request.result.createObjectStore('disc'); };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    try {
-      return await new Promise((resolve, reject) => {
-        const request = action(database.transaction('disc', mode).objectStore('disc'));
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-      });
-    } finally { database.close(); }
-  };
-  return Object.freeze({
-    load: () => run('readonly', store => store.get('handle')),
-    save: handle => run('readwrite', store => store.put(handle, 'handle')),
-  });
-};
-
-export const mountMenuShell = ({ root = document, window = globalThis.window, settings = createSettings(), discs = createDiscStore(), createSaves = createSaveService } = {}) => {
+export const mountMenuShell = ({ root = document, window = globalThis.window, settings = createSettings(), discs = createDiscCache(), createSaves = createSaveService } = {}) => {
   const find = selector => {
     const element = root.querySelector(selector);
     if (!element) { throw new Error(`Menu shell element ${selector} is missing.`); }
@@ -143,6 +121,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   };
   const body = root.body;
   const stage = find('#stage'), input = find('#iso'), boot = find('#boot'), progressFile = find('#progress-file');
+  const chooseButton = find('#choose'), loadingText = find('#loading-text'), loadingBar = find('#loading-bar');
   const detail = find('#detail'), diagnostic = find('#gpu'), fps = find('#fps'), gear = find('#gear');
   const front = find('#front'), mainMenu = find('#main-menu'), loadingLayer = find('#loading'), errorLayer = find('#error');
   const pauseLayer = find('#pause'), settingsLayer = find('#settings'), consoleLayer = find('#console'), savingLayer = find('#saving');
@@ -169,8 +148,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const letSleep = () => { void wakeLock?.then(lock => lock?.release()).catch(() => {}); };
   let canvas = find('#game');
   let screen = 'title', panel = 'none', settingsReturn = 'none', tab = TABS[0].id;
-  let presented = false, dismissed = false, quitting = false, pickToStart = false;
-  let handle, motion, audio, keyboard, idleTimer, padFrame, padPrevious = new Set();
+  let presented = false, dismissed = false, quitting = false, pickToStart = false, copying = false;
+  let motion, audio, keyboard, idleTimer, padFrame, padPrevious = new Set();
   let capture, layoutMap, hostMessages, consoleOpen = false;
   const consoleModel = createConsoleModel({ send: line => hostMessages?.post(HOST_MESSAGES.console, line) ?? false });
   const showConsoleLog = () => {
@@ -579,8 +558,9 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   };
 
   const render = state => {
-    const active = ['validating', 'booting', 'running'].includes(state.phase);
-    boot.disabled = active || state.stopping || state.code === 'TEARDOWN';
+    const active = copying || ['validating', 'booting', 'running'].includes(state.phase);
+    boot.disabled = chooseButton.disabled = active || state.stopping || state.code === 'TEARDOWN';
+    chooseButton.hidden = !state.source;
     boot.setAttribute('aria-busy', String(active || state.stopping));
     if (!active && !state.stopping) {
       quitting = false;
@@ -588,7 +568,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     }
     let next;
     if (state.stopping) { next = quitting ? 'title' : screen; }
-    else if (active) { next = presented ? 'game' : 'loading'; }
+    else if (active) { next = presented && !copying ? 'game' : 'loading'; }
     else if (!dismissed && (state.phase === 'error' || (state.phase === 'stopped' && state.code !== 'CANCELLED'))) { next = 'error'; }
     else { next = 'title'; }
     detail.textContent = next === 'error' && state.message ? `${state.code}: ${state.message}` : '';
@@ -751,10 +731,34 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     },
   }) });
 
+  const showCopy = (copied, total) => {
+    const percent = Math.floor(copied / total * 100);
+    loadingText.textContent = `Copying disc ${percent}%`;
+    loadingBar.dataset.progress = '';
+    loadingBar.style.setProperty('--progress', String(percent));
+  };
+  // the disc is copied into this browser once, so later starts need neither the file nor permission to read it
+  const keep = async file => {
+    try { return await discs.store(file, showCopy); }
+    catch (error) {
+      console.warn(`The disc could not be kept in this browser: ${error.message}`);
+      return file;
+    } finally {
+      loadingText.textContent = 'Loading';
+      delete loadingBar.dataset.progress;
+    }
+  };
   const select = async (file, start) => {
-    if (!file) { return; }
-    await controller.select(file);
-    if (start) { await begin(); }
+    if (!file || copying) { return; }
+    copying = true;
+    render(controller.state);
+    try {
+      await controller.select(await keep(file));
+      if (start) { await begin(); }
+    } finally {
+      copying = false;
+      render(controller.state);
+    }
   };
   // what this browser lacks, said before the picker: a phone may copy a whole disc image for it first
   const missingCapability = () => {
@@ -769,6 +773,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     detail.textContent = message;
   };
   const choose = async () => {
+    if (copying) { return; }
     const missing = missingCapability();
     if (missing) { notify(`CAPABILITY: ${missing}`); return; }
     if (typeof window.showOpenFilePicker !== 'function') {
@@ -779,8 +784,6 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     let picked;
     try { [picked] = await window.showOpenFilePicker({ id: 'disc', types: [{ description: 'Disc image', accept: { 'application/x-iso9660-image': ['.iso'] } }] }); }
     catch { return; }
-    handle = picked;
-    void discs.save(picked).catch(() => {});
     await select(await picked.getFile(), true);
   };
   // a new runtime starts from the newest progress in storage, so a write still in flight finishes first
@@ -792,13 +795,8 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     void controller.start();
   };
   const start = async () => {
+    if (copying) { return; }
     if (controller.state.source) { await begin(); return; }
-    if (handle) {
-      try {
-        const granted = await handle.queryPermission({ mode: 'read' }) === 'granted' || await handle.requestPermission({ mode: 'read' }) === 'granted';
-        if (granted) { await select(await handle.getFile(), true); return; }
-      } catch { handle = undefined; }
-    }
     await choose();
   };
 
@@ -890,6 +888,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   const fullscreen = () => { layout(); if (panel === 'settings') { refreshRows(); } };
   const visibility = () => { if (!root.hidden) { void keepAwake(); } };
   const startClick = () => { void start(); };
+  const chooseClick = () => { void choose(); };
   const unload = event => {
     if (!saves.unsaved) { return; }
     event.preventDefault();
@@ -905,7 +904,6 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
     const startAfter = pickToStart;
     pickToStart = false;
     input.value = '';
-    handle = undefined;
     void select(file, startAfter);
   };
   const stopSettings = settings.subscribe(name => {
@@ -920,6 +918,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   });
 
   boot.addEventListener('click', startClick);
+  chooseButton.addEventListener('click', chooseClick);
   gear.addEventListener('click', () => { setPanel('pause'); });
   input.addEventListener('change', picked);
   progressFile.addEventListener('change', pickedProgress);
@@ -942,9 +941,9 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
   render(controller.state);
   show();
   focusDefault();
-  void discs.load().then(stored => {
-    if (stored && !controller.state.source && !handle) { handle = stored; }
-  }).catch(() => {});
+  void discs.cached().then(file => {
+    if (file && !controller.state.source && !copying) { void controller.select(file); }
+  }).catch(error => { console.warn(`The disc kept in this browser is unavailable: ${error.message}`); });
 
   return Object.freeze({
     controller,
@@ -954,6 +953,7 @@ export const mountMenuShell = ({ root = document, window = globalThis.window, se
       clearTimeout(idleTimer);
       if (padFrame !== undefined) { window.cancelAnimationFrame(padFrame); }
       boot.removeEventListener('click', startClick);
+      chooseButton.removeEventListener('click', chooseClick);
       input.removeEventListener('change', picked);
       progressFile.removeEventListener('change', pickedProgress);
       root.removeEventListener('click', clicks);
