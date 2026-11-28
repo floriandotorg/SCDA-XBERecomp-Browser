@@ -1051,12 +1051,13 @@ struct MenuBackend::Impl {
     require(feedbackSequence != UINT64_MAX, "menu backend feedback cache sequence exhausted");
     if (!item.feedback) {
       const size_t bytes = feedbackBytes(item);
-      require(bytes <= limits.maxResourceBytes && bytes <= limits.maxResidentBytes, "menu backend feedback resident byte budget exceeded");
       trimFeedback(1, bytes, &item);
       requireBuilt(resourceCount() < limits.maxResources, [&] { return "menu backend feedback resource count budget exceeded: originals=" + std::to_string(resources.size()) +
         " feedback=" + std::to_string(resourceCount() - resources.size() - size_t(white != 0)) + " pinned=" + std::to_string(feedbackPins.size()) +
         " limit=" + std::to_string(limits.maxResources); });
-      require(bytes <= limits.maxResourceBytes && bytes <= limits.maxResidentBytes && resident <= limits.maxResidentBytes - bytes, "menu backend feedback resident byte budget exceeded");
+      requireBuilt(bytes <= limits.maxResidentBytes && resident <= limits.maxResidentBytes - bytes, [&] { return "menu backend feedback resident byte budget exceeded: resident=" + std::to_string(resident) +
+        " request=" + std::to_string(bytes) + " size=" + std::to_string(item.hostWidth) + "x" + std::to_string(item.hostHeight) + (item.hdrTarget ? " hdr" : "") +
+        " pinned=" + std::to_string(feedbackPins.size()) + " limit=" + std::to_string(limits.maxResidentBytes); });
       std::vector<uint8_t> payload;
       append(payload, webgpu::TexturePacket{item.hostWidth, item.hostHeight, item.hdrTarget ? webgpu::HdrTexture : 0u});
       const uint32_t id = newId();
